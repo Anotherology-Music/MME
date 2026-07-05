@@ -194,7 +194,12 @@
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
         <button id="recordBtn" title="Record incoming MIDI notes (R)">⏺</button>
+        <button id="metroBtn" title="Metronome click during playback (C)">&#x1F514;</button>
       </div>
+    </div>
+    <div class="group">
+      <span class="lbl">Play</span>
+      <b id="stPlay" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt);min-width:80px;display:inline-block;">1.1.1.0</b>
     </div>
     <div class="sep"></div>
     <div class="group">
@@ -628,7 +633,6 @@
   </div>
 
   <div class="statusbar">
-    <span class="sf">Play: <b id="stPlay">1.1.0</b></span>
     <span class="sf">Loop: <b id="stLoop" style="min-width:140px;">whole track</b></span>
     <span class="sf">Cursor: <b id="stPos">1.1.0</b></span>
     <span class="sf"><b id="stCtx" style="min-width:120px;">—</b></span>
@@ -644,7 +648,7 @@
     bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4,
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
-    recCh:0, recCountIn:1, recording:false, recArmed:false,
+    recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false,
     tool:'select', snap:'16', genCycles:1, genLen:'1/4', viewCh:null,
     genLo:0, genHi:127, genTension:0, genPhase:0, genDuty:50, genSteps:4, genOutputMode:'replace', genBlend:50,
     sweepOn:false, sweepFreqStart:'1/8', sweepFreqEnd:'2 bars',
@@ -1065,7 +1069,9 @@
           if(!state.selection.has(n.id)){ state.selection.clear(); state.selection.add(n.id); }
         }
         if(state.selection.has(n.id)){
-          const edgeX=tickToX(n.start+n.length); const mode=(Math.abs(x-edgeX)<7)?'resize':'move';
+          const endX=tickToX(n.start+n.length), startXpx=tickToX(n.start);
+          let mode='move';
+          if(Math.abs(x-endX)<7) mode='resize'; else if(Math.abs(x-startXpx)<7) mode='resizeLeft';
           prDrag={mode,note:n,startX:x,startY:y,altCopy:e.altKey,group:[...state.selection].map(id=>{const nn=byId(id);return{n:nn,start:nn.start,pitch:nn.pitch,length:nn.length};})}; }
       } else {
         if(!e.shiftKey) state.selection.clear();
@@ -1075,8 +1081,9 @@
     }
     // Draw mode: click existing note = select/move/resize; click empty = add note
     if(n){ armUndo(); if(!state.selection.has(n.id)){ state.selection.clear(); state.selection.add(n.id); }
-      const edgeX=tickToX(n.start+n.length);
-      if(Math.abs(x-edgeX)<7) prDrag={mode:'resize',note:n,startX:x,altCopy:e.altKey,group:[...state.selection].map(id=>{const nn=byId(id);return{n:nn,length:nn.length};})};
+      const endX=tickToX(n.start+n.length), startXpx=tickToX(n.start);
+      if(Math.abs(x-endX)<7) prDrag={mode:'resize',note:n,startX:x,altCopy:e.altKey,group:[...state.selection].map(id=>{const nn=byId(id);return{n:nn,start:nn.start,pitch:nn.pitch,length:nn.length};})};
+      else if(Math.abs(x-startXpx)<7) prDrag={mode:'resizeLeft',note:n,startX:x,altCopy:e.altKey,group:[...state.selection].map(id=>{const nn=byId(id);return{n:nn,start:nn.start,pitch:nn.pitch,length:nn.length};})};
       else prDrag={mode:'move',note:n,startX:x,startY:y,altCopy:e.altKey,group:[...state.selection].map(id=>{const nn=byId(id);return{n:nn,start:nn.start,pitch:nn.pitch,length:nn.length};})};
       requestDraw(); return; }
     armUndo();
@@ -1091,6 +1098,16 @@
       if(prDrag.group&&prDrag.group.length>1){ const delta=anchorLen-origLen; prDrag.group.forEach(g=>{ g.n.length=Math.max(1,g.length+delta); }); }
       else prDrag.note.length=anchorLen;
       state.lastNoteLen=prDrag.note.length; }
+    else if(prDrag.mode==='resizeLeft'){ const t=xToTick(x);
+      const rawStart=(e.shiftKey||state.snap==='off')?t:snapT(t);
+      const gSelf=(prDrag.group&&prDrag.group.find(g=>g.n===prDrag.note))||{start:prDrag.note.start,length:prDrag.note.length};
+      const anchorEnd=gSelf.start+gSelf.length;
+      const newStart=clamp(rawStart,0,anchorEnd-1);
+      const delta=newStart-gSelf.start;
+      if(prDrag.group&&prDrag.group.length>1){
+        prDrag.group.forEach(g=>{ const gEnd=g.start+g.length; const gNewStart=clamp(g.start+delta,0,gEnd-1); g.n.start=gNewStart; g.n.length=Math.max(1,gEnd-gNewStart); });
+      } else { prDrag.note.start=newStart; prDrag.note.length=Math.max(1,anchorEnd-newStart); }
+      state.lastNoteLen=prDrag.note.length; }
     else if(prDrag.mode==='move'){ const rawDt=xToTick(x)-xToTick(prDrag.startX); const dp=yToPitch(y)-yToPitch(prDrag.startY);
       prDrag.group.forEach(g=>{ const raw=g.start+rawDt; g.n.start=Math.max(0,e.shiftKey?Math.round(raw):snapT(raw)); g.n.pitch=clamp(g.pitch+dp,0,127); }); }
     else if(prDrag.mode==='marquee'){ prDrag.x2=x; prDrag.y2=y; }
@@ -1102,7 +1119,7 @@
       state.notes.forEach(n=>{
         if(state.viewCh!==null&&n.ch!==state.viewCh) return;
         if(n.start<=t2&&n.start+n.length>=t1&&n.pitch>=p1&&n.pitch<=p2) state.selection.add(n.id); });
-    } else if(prDrag.altCopy&&(prDrag.mode==='move'||prDrag.mode==='resize')){
+    } else if(prDrag.altCopy&&(prDrag.mode==='move'||prDrag.mode==='resize'||prDrag.mode==='resizeLeft')){
       // Alt+drag: restore originals, paste copies at new positions
       const newNotes=prDrag.group.map(g=>({id:state.nextId++,pitch:g.n.pitch,start:g.n.start,length:g.n.length,vel:g.n.vel,ch:g.n.ch}));
       prDrag.group.forEach(g=>{ g.n.start=g.start; g.n.pitch=g.pitch; if(g.length!==undefined) g.n.length=g.length; });
@@ -2270,8 +2287,27 @@
     followScheduleBeat(tick, wallMs);
   }
 
+  // ---------- Metronome click (shared by count-in and playback) ----------
+  let clickCtx=null, clickTimeOffset=0;
+  function ensureClickCtx(){
+    if(!clickCtx){ clickCtx=new (window.AudioContext||window.webkitAudioContext)(); clickTimeOffset=clickCtx.currentTime-performance.now()/1000; }
+    if(clickCtx.state==='suspended') clickCtx.resume();
+    return clickCtx;
+  }
+  function playClickTone(ctx,when,accent){
+    const osc=ctx.createOscillator(), gain=ctx.createGain();
+    osc.frequency.value=accent?1600:1000;
+    gain.gain.setValueAtTime(0.0001,when);
+    gain.gain.exponentialRampToValueAtTime(0.25,when+0.001);
+    gain.gain.exponentialRampToValueAtTime(0.0001,when+0.08);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(when); osc.stop(when+0.09);
+  }
+  function recClick(accent){ try{ const ctx=ensureClickCtx(); playClickTone(ctx,ctx.currentTime+0.001,accent); }catch(err){} }
+  function scheduleClickAt(wallMs,accent){ try{ const ctx=ensureClickCtx(); const when=Math.max(ctx.currentTime+0.001, wallMs/1000+clickTimeOffset); playClickTone(ctx,when,accent); }catch(err){} }
+
   // ---------- MIDI recording ----------
-  let recOpenNotes=new Map(), recStartedPlayback=false, recCountInTimer=null, recClickCtx=null;
+  let recOpenNotes=new Map(), recStartedPlayback=false, recCountInTimer=null;
   function wallTimeToTick(wallMs){
     if(!sched) return state.playhead;
     const s=sched;
@@ -2302,18 +2338,6 @@
     }
     recOpenNotes.clear();
     requestDraw();
-  }
-  function recClick(accent){
-    try{
-      if(!recClickCtx) recClickCtx=new (window.AudioContext||window.webkitAudioContext)();
-      if(recClickCtx.state==='suspended') recClickCtx.resume();
-      const osc=recClickCtx.createOscillator(), gain=recClickCtx.createGain();
-      osc.frequency.value=accent?1600:1000;
-      gain.gain.setValueAtTime(0.25,recClickCtx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001,recClickCtx.currentTime+0.08);
-      osc.connect(gain); gain.connect(recClickCtx.destination);
-      osc.start(); osc.stop(recClickCtx.currentTime+0.08);
-    }catch(err){}
   }
   function beginRecording(){
     state.recArmed=false; state.recording=true; recOpenNotes.clear();
@@ -2385,6 +2409,13 @@
         for(let t=a;t<b;t+=step){ const v=clamp(Math.round(laneValueAt(lane,t)),0,127); if(v!==last){ evs.push({tick:t,o:3,msg:[0xB0|(lane.ch&15),lane.cc&127,v]}); last=v; } }
       }
     }
+    if(state.metronomeOn){
+      const tpb=ticksPerBeat();
+      for(let t=Math.ceil(a/tpb)*tpb; t<b; t+=tpb){
+        const beatIdx=Math.round(t/tpb);
+        evs.push({tick:t, o:0, click:true, accent:wrapv(beatIdx,state.tsNum)===0});
+      }
+    }
     evs.sort((x,y)=> x.tick-y.tick || x.o-y.o); return evs;
   }
   function play(){ if(state.playing) return; const {a,b}=getLoop(); if(b<=a) return;
@@ -2434,7 +2465,8 @@
       if(s.idx>=s.evs.length){ s.passIndex++; s.idx=0; s.evs=buildPassEvents(s.a,s.b); if(s.span<=0||!s.evs.length) break; }
       const ev=s.evs[s.idx]; const t=s.t0+(s.passIndex*s.span + ev.tick - s.startTick)*s.mpt;
       if(t<=now+LOOKAHEAD){
-        if(state.midiOut){
+        if(ev.click){ scheduleClickAt(t, ev.accent); }
+        else if(state.midiOut){
           // MMV Smooth: send Note Offs 10ms early so adjacent Note On never races Note Off
           const isOff=(ev.msg[0]&0xF0)===0x80;
           state.midiOut.send(ev.msg, state.mmvSmooth&&isOff ? t-10 : t);
@@ -2457,6 +2489,7 @@
   function updateTransportBtns(){ $('playBtn').textContent=state.playing?'⏸':'▶'; $('playBtn').classList.toggle('on',state.playing);
     const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
   }
+  function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn); }
   function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); }
   function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
@@ -2582,6 +2615,7 @@
   $('clearBtn').onclick=()=>{ if(confirm('Clear all notes and CC curves?')){ pushUndo(); state.notes=[]; state.selection.clear(); state.ccLanes.forEach(l=>l.points=[{t:0,v:0}]); requestDraw(); } };
   $('playBtn').onclick=togglePlay; $('stopBtn').onclick=stop;
   $('recordBtn').onclick=toggleRecord;
+  $('metroBtn').onclick=toggleMetronome;
   $('recCh').addEventListener('change',e=>{ state.recCh=+e.target.value||0; });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
@@ -2598,6 +2632,7 @@
     if(ctrl && e.key.toLowerCase()==='a'){ e.preventDefault(); const {a,b}=getLoop(); state.selection.clear(); state.notes.forEach(n=>{ if(n.start>=a&&n.start<b) state.selection.add(n.id); }); state.focus='piano'; updateNoteInfo(); requestDraw(); return; }
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
     if(!ctrl && e.key.toLowerCase()==='r'){ e.preventDefault(); toggleRecord(); return; }
+    if(!ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); toggleMetronome(); return; }
     if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
       else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); }
