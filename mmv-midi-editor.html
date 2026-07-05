@@ -67,6 +67,9 @@
   button:hover{border-color:var(--accent);}
   button.on{background:var(--accent);color:#06223f;border-color:var(--accent);font-weight:600;}
   button.warn:hover{border-color:#ff6b6b;}
+  button.rec-armed{background:#7a4a1f;color:#ffd9a0;border-color:#c98a3a;font-weight:600;animation:recPulse 1s step-start infinite;}
+  button.rec-on{background:#ff3b3b;color:#fff;border-color:#ff3b3b;font-weight:600;}
+  @keyframes recPulse{50%{opacity:.4;}}
   button:disabled{opacity:.4;cursor:default;}
   .btnrow{display:flex;gap:4px;}
   .btnrow button{padding:5px 8px;}
@@ -190,6 +193,7 @@
       <div class="btnrow">
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
+        <button id="recordBtn" title="Record incoming MIDI notes (R)">⏺</button>
       </div>
     </div>
     <div class="sep"></div>
@@ -211,7 +215,7 @@
         <input type="number" id="bpm" value="120" min="20" max="400" title="BPM — changing this requires a new Export Sync Track for MMV sync">
         <span class="pill">BPM</span>
       </div>
-      <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="4" min="1" max="999"></div>
+      <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="100" min="1" max="999"></div>
       <div class="group">
         <span class="lbl">Sig</span>
         <input type="number" id="tsNum" value="4" min="1" max="32">
@@ -256,6 +260,17 @@
           <div class="setup-row">
             <button id="mmvSmooth" class="on" title="Trims Note Offs 10ms early — prevents dropout when notes touch. Turn off for audio-accurate MIDI.">MMV Smooth</button>
             <span style="font-size:11px;color:var(--txt2);">Trims Note Offs 10ms early to prevent dropout on adjacent notes.</span>
+          </div>
+          <div class="setup-row">
+            <span class="lbl">Rec Ch</span>
+            <select id="recCh" style="width:88px;" title="MIDI channel that recorded notes are written to"></select>
+            <span class="lbl">Count-in</span>
+            <select id="recCountIn" style="width:70px;" title="Bars of metronome count-in before recording starts">
+              <option value="0">Off</option>
+              <option value="1" selected>1 bar</option>
+              <option value="2">2 bars</option>
+              <option value="4">4 bars</option>
+            </select>
           </div>
         </div>
         <div class="setup-section">
@@ -626,9 +641,10 @@
   "use strict";
 
   const state = {
-    bpm:120, ppq:480, bars:4, tsNum:4, tsDen:4,
+    bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4,
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
+    recCh:0, recCountIn:1, recording:false, recArmed:false,
     tool:'select', snap:'16', genCycles:1, genLen:'1/4', viewCh:null,
     genLo:0, genHi:127, genTension:0, genPhase:0, genDuty:50, genSteps:4, genOutputMode:'replace', genBlend:50,
     sweepOn:false, sweepFreqStart:'1/8', sweepFreqEnd:'2 bars',
@@ -2228,7 +2244,8 @@
     }
     if(state.syncFollow&&!state.playing) syncRaf=requestAnimationFrame(syncFrame);
   }
-  function onMidiIn(e){
+  function onMidiIn(e){ handleFollowIn(e); handleRecordIn(e); }
+  function handleFollowIn(e){
     if(!state.syncFollow) return;
     const data=e.data; if(!data||!data.length) return;
     // Handle MIDI system real-time messages (1 byte)
@@ -2251,6 +2268,87 @@
     if(!syncRaf&&state.syncFollow&&!state.playing) syncRaf=requestAnimationFrame(syncFrame);
     if(state.playing) armSyncHeartbeat();
     followScheduleBeat(tick, wallMs);
+  }
+
+  // ---------- MIDI recording ----------
+  let recOpenNotes=new Map(), recStartedPlayback=false, recCountInTimer=null, recClickCtx=null;
+  function wallTimeToTick(wallMs){
+    if(!sched) return state.playhead;
+    const s=sched;
+    return (wallMs<s.t0) ? s.startTick : s.a + wrapv((wallMs-s.t0)/s.mpt + (s.startTick-s.a), s.span);
+  }
+  function handleRecordIn(e){
+    if(!state.recording) return;
+    const data=e.data; if(!data||data.length<2) return;
+    const status=data[0], d1=data[1], d2=data.length>2?data[2]:0;
+    const type=status&0xF0, ch=status&0x0F;
+    if(ch===15) return; // reserved for the Follow MMV sync-track protocol
+    if(type!==0x90 && type!==0x80) return;
+    const wallMs=e.timeStamp||performance.now();
+    const tick=clamp(Math.round(wallTimeToTick(wallMs)),0,totalTicks());
+    if(type===0x90 && d2>0){ recOpenNotes.set(d1,{start:tick,vel:d2}); return; }
+    const o=recOpenNotes.get(d1); if(!o) return;
+    recOpenNotes.delete(d1);
+    let length=tick-o.start; if(length<=0 && sched) length+=sched.span; length=Math.max(1,Math.round(length));
+    state.notes.push({id:state.nextId++,pitch:d1,start:o.start,length,vel:o.vel,ch:state.recCh});
+    requestDraw();
+  }
+  function finalizeOpenRecNotes(){
+    if(!recOpenNotes.size) return;
+    const tick=state.playhead;
+    for(const [pitch,o] of recOpenNotes){
+      let length=tick-o.start; if(length<=0 && sched) length+=sched.span; length=Math.max(1,Math.round(length));
+      state.notes.push({id:state.nextId++,pitch,start:o.start,length,vel:o.vel,ch:state.recCh});
+    }
+    recOpenNotes.clear();
+    requestDraw();
+  }
+  function recClick(accent){
+    try{
+      if(!recClickCtx) recClickCtx=new (window.AudioContext||window.webkitAudioContext)();
+      if(recClickCtx.state==='suspended') recClickCtx.resume();
+      const osc=recClickCtx.createOscillator(), gain=recClickCtx.createGain();
+      osc.frequency.value=accent?1600:1000;
+      gain.gain.setValueAtTime(0.25,recClickCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001,recClickCtx.currentTime+0.08);
+      osc.connect(gain); gain.connect(recClickCtx.destination);
+      osc.start(); osc.stop(recClickCtx.currentTime+0.08);
+    }catch(err){}
+  }
+  function beginRecording(){
+    state.recArmed=false; state.recording=true; recOpenNotes.clear();
+    recStartedPlayback=!state.playing;
+    if(recStartedPlayback) play();
+    updateTransportBtns(); flash('Recording…');
+  }
+  // Ends the recording session's bookkeeping (timers, flag, finalizing any held
+  // notes) without touching transport playback — callers decide whether to stop().
+  function endRecordingSession(){
+    if(recCountInTimer){ clearInterval(recCountInTimer); recCountInTimer=null; }
+    state.recArmed=false;
+    if(state.recording){ state.recording=false; finalizeOpenRecNotes(); }
+  }
+  function toggleRecord(){
+    if(state.recording||state.recArmed){
+      const wasStartedByRec=recStartedPlayback;
+      endRecordingSession(); updateTransportBtns();
+      if(wasStartedByRec) stop();
+      flash('Recording stopped');
+      return;
+    }
+    pushUndo();
+    const bars=+$('recCountIn').value||0;
+    if(bars<=0){ beginRecording(); return; }
+    state.recArmed=true; updateTransportBtns();
+    const beatsTotal=bars*state.tsNum, mspb=60000/state.bpm;
+    let beat=0;
+    flash('Count-in: '+bars+' bar'+(bars>1?'s':'')+'…');
+    recClick(true);
+    recCountInTimer=setInterval(()=>{
+      beat++;
+      if(beat>=beatsTotal){ clearInterval(recCountInTimer); recCountInTimer=null; beginRecording(); }
+      else recClick(beat%state.tsNum===0);
+    },mspb);
   }
   function setMidiStatus(t){ $('midiStatus').textContent=t; }
   function mSend(arr,ts){
@@ -2353,10 +2451,12 @@
     clearSyncHeartbeat();
     if(state.midiOut){ if(!state.syncFollow) mSend([0xFC]); try{ state.midiOut.clear && state.midiOut.clear(); }catch(e){} } allNotesOff(); sched=null;
     if(audioSrc){ try{audioSrc.stop();}catch(e){} audioSrc=null; } audioGain=null; }
-  function pause(){ if(!state.playing) return; state.playing=false; stopTransport(); updateTransportBtns(); }
-  function stop(){ state.playing=false; stopTransport(); state.playhead=getLoop().a; updatePlayPos(); updatePlayheadEl(); updateTransportBtns(); }
+  function pause(){ if(!state.playing) return; if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); updateTransportBtns(); }
+  function stop(){ if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); state.playhead=getLoop().a; updatePlayPos(); updatePlayheadEl(); updateTransportBtns(); }
   function togglePlay(){ state.playing?pause():play(); }
-  function updateTransportBtns(){ $('playBtn').textContent=state.playing?'⏸':'▶'; $('playBtn').classList.toggle('on',state.playing); }
+  function updateTransportBtns(){ $('playBtn').textContent=state.playing?'⏸':'▶'; $('playBtn').classList.toggle('on',state.playing);
+    const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
+  }
   function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); }
   function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
@@ -2372,6 +2472,21 @@
       sel.appendChild(op);
     }
     sel.value=cur;
+    populateRecCh();
+  }
+
+  function populateRecCh(){
+    const sel=$('recCh'); if(!sel) return;
+    const cur=sel.value!==''?sel.value:String(state.recCh);
+    sel.innerHTML='';
+    for(let ch=0;ch<16;ch++){
+      const name=state.channelNames[ch];
+      const label=(ch+1)+(name?' ('+name+')':'');
+      const op=document.createElement('option'); op.value=ch; op.textContent=label;
+      sel.appendChild(op);
+    }
+    sel.value=cur;
+    state.recCh=+sel.value||0;
   }
 
   // ---------- Inputs ----------
@@ -2466,6 +2581,8 @@
       document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up); }); }
   $('clearBtn').onclick=()=>{ if(confirm('Clear all notes and CC curves?')){ pushUndo(); state.notes=[]; state.selection.clear(); state.ccLanes.forEach(l=>l.points=[{t:0,v:0}]); requestDraw(); } };
   $('playBtn').onclick=togglePlay; $('stopBtn').onclick=stop;
+  $('recordBtn').onclick=toggleRecord;
+  $('recCh').addEventListener('change',e=>{ state.recCh=+e.target.value||0; });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
   $('midiEnable').onclick=initMidi; $('midiOut').addEventListener('change',e=>setMidiOutById(e.target.value));
@@ -2480,6 +2597,7 @@
     if(ctrl && e.key.toLowerCase()==='v'){ e.preventDefault(); paste(); return; }
     if(ctrl && e.key.toLowerCase()==='a'){ e.preventDefault(); const {a,b}=getLoop(); state.selection.clear(); state.notes.forEach(n=>{ if(n.start>=a&&n.start<b) state.selection.add(n.id); }); state.focus='piano'; updateNoteInfo(); requestDraw(); return; }
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
+    if(!ctrl && e.key.toLowerCase()==='r'){ e.preventDefault(); toggleRecord(); return; }
     if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
       else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); }
