@@ -2302,12 +2302,12 @@
     gain.gain.exponentialRampToValueAtTime(0.0001,when+0.08);
     osc.connect(gain); gain.connect(ctx.destination);
     osc.start(when); osc.stop(when+0.09);
+    return osc;
   }
-  function recClick(accent){ try{ const ctx=ensureClickCtx(); playClickTone(ctx,ctx.currentTime+0.001,accent); }catch(err){} }
-  function scheduleClickAt(wallMs,accent){ try{ const ctx=ensureClickCtx(); const when=Math.max(ctx.currentTime+0.001, wallMs/1000+clickTimeOffset); playClickTone(ctx,when,accent); }catch(err){} }
+  function scheduleClickAt(wallMs,accent){ try{ const ctx=ensureClickCtx(); const when=Math.max(ctx.currentTime+0.001, wallMs/1000+clickTimeOffset); return playClickTone(ctx,when,accent); }catch(err){ return null; } }
 
   // ---------- MIDI recording ----------
-  let recOpenNotes=new Map(), recStartedPlayback=false, recCountInTimer=null;
+  let recOpenNotes=new Map(), recStartedPlayback=false, recCountInTimer=null, recCountInNodes=null;
   function wallTimeToTick(wallMs){
     if(!sched) return state.playhead;
     const s=sched;
@@ -2339,16 +2339,16 @@
     recOpenNotes.clear();
     requestDraw();
   }
-  function beginRecording(){
+  function beginRecording(explicitT0){
     state.recArmed=false; state.recording=true; recOpenNotes.clear();
-    recStartedPlayback=!state.playing;
-    if(recStartedPlayback) play();
+    if(recStartedPlayback) play(explicitT0);
     updateTransportBtns(); flash('Recording…');
   }
   // Ends the recording session's bookkeeping (timers, flag, finalizing any held
   // notes) without touching transport playback — callers decide whether to stop().
   function endRecordingSession(){
-    if(recCountInTimer){ clearInterval(recCountInTimer); recCountInTimer=null; }
+    if(recCountInTimer){ clearTimeout(recCountInTimer); recCountInTimer=null; }
+    if(recCountInNodes){ const now=clickCtx?clickCtx.currentTime:0; recCountInNodes.forEach(o=>{ try{ o.stop(now); }catch(e){} }); recCountInNodes=null; }
     state.recArmed=false;
     if(state.recording){ state.recording=false; finalizeOpenRecNotes(); }
   }
@@ -2361,18 +2361,24 @@
       return;
     }
     pushUndo();
+    recStartedPlayback=!state.playing;
     const bars=+$('recCountIn').value||0;
     if(bars<=0){ beginRecording(); return; }
     state.recArmed=true; updateTransportBtns();
     const beatsTotal=bars*state.tsNum, mspb=60000/state.bpm;
-    let beat=0;
     flash('Count-in: '+bars+' bar'+(bars>1?'s':'')+'…');
-    recClick(true);
-    recCountInTimer=setInterval(()=>{
-      beat++;
-      if(beat>=beatsTotal){ clearInterval(recCountInTimer); recCountInTimer=null; beginRecording(); }
-      else recClick(beat%state.tsNum===0);
-    },mspb);
+    // Schedule every count-in click up front against one fixed future timestamp
+    // (recordStartWall) instead of firing them live off a drifting setInterval —
+    // this way the last click and the actual recording start stay exactly one
+    // beat apart, with no extra gap and no accumulated timer jitter.
+    const recordStartWall=performance.now()+START_DELAY+beatsTotal*mspb;
+    recCountInNodes=[];
+    for(let i=0;i<beatsTotal;i++){
+      const beatWall=recordStartWall-(beatsTotal-i)*mspb;
+      const node=scheduleClickAt(beatWall, i%state.tsNum===0);
+      if(node) recCountInNodes.push(node);
+    }
+    recCountInTimer=setTimeout(()=>{ recCountInTimer=null; recCountInNodes=null; beginRecording(recordStartWall); }, Math.max(0,recordStartWall-performance.now()));
   }
   function setMidiStatus(t){ $('midiStatus').textContent=t; }
   function mSend(arr,ts){
@@ -2418,10 +2424,10 @@
     }
     evs.sort((x,y)=> x.tick-y.tick || x.o-y.o); return evs;
   }
-  function play(){ if(state.playing) return; const {a,b}=getLoop(); if(b<=a) return;
+  function play(explicitT0){ if(state.playing) return; const {a,b}=getLoop(); if(b<=a) return;
     let startTick=state.playhead; if(startTick<a||startTick>=b) startTick=a;
     state.playing=true; updateTransportBtns();
-    const mpt=(60000/state.bpm)/ticksPerBeat(), span=b-a, t0=performance.now()+START_DELAY;
+    const mpt=(60000/state.bpm)/ticksPerBeat(), span=b-a, t0=explicitT0!=null?explicitT0:(performance.now()+START_DELAY);
     const evs=buildPassEvents(a,b); let idx=0; while(idx<evs.length && evs[idx].tick<startTick) idx++;
     const msPerClock=60000/(state.bpm*24);
     sched={a,b,mpt,span,t0,startTick,evs,idx,passIndex:0,msPerClock,clockIdx:0};
