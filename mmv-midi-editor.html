@@ -2261,6 +2261,7 @@
   });
   $('viewCh').addEventListener('change',e=>{
     state.viewCh=e.target.value===''?null:+e.target.value; state.selection.clear();
+    if(state.viewCh!==null){ state.defCh=state.viewCh; $('defCh').value=state.viewCh+1; }
     applyChFilter(); requestDraw();
   });
   function applyChFilter(){
