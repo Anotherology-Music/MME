@@ -276,6 +276,9 @@
               <option value="2">2 bars</option>
               <option value="4">4 bars</option>
             </select>
+            <span class="lbl">Rec Offset</span>
+            <input type="number" id="recOffsetMs" value="0" step="5" style="width:56px;" title="Shifts recorded note timing to compensate for MIDI/audio latency. Positive = notes recorded later (use this if notes land too early); negative = notes recorded earlier.">
+            <span class="pill">ms</span>
           </div>
         </div>
         <div class="setup-section">
@@ -648,7 +651,7 @@
     bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4,
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
-    recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false,
+    recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false, recOffsetMs:0,
     tool:'select', snap:'16', genCycles:1, genLen:'1/4', viewCh:null,
     genLo:0, genHi:127, genTension:0, genPhase:0, genDuty:50, genSteps:4, genOutputMode:'replace', genBlend:50,
     sweepOn:false, sweepFreqStart:'1/8', sweepFreqEnd:'2 bars',
@@ -2320,20 +2323,25 @@
     const type=status&0xF0, ch=status&0x0F;
     if(ch===15) return; // reserved for the Follow MMV sync-track protocol
     if(type!==0x90 && type!==0x80) return;
-    const wallMs=e.timeStamp||performance.now();
+    const wallMs=(e.timeStamp||performance.now())+state.recOffsetMs;
     const tick=clamp(Math.round(wallTimeToTick(wallMs)),0,totalTicks());
-    if(type===0x90 && d2>0){ recOpenNotes.set(d1,{start:tick,vel:d2}); return; }
+    if(type===0x90 && d2>0){ recOpenNotes.set(d1,{start:tick,vel:d2,wallMs}); return; }
     const o=recOpenNotes.get(d1); if(!o) return;
     recOpenNotes.delete(d1);
-    let length=tick-o.start; if(length<=0 && sched) length+=sched.span; length=Math.max(1,Math.round(length));
+    // Length comes from elapsed wall-clock time, not (tick - o.start): subtracting
+    // two independently loop-wrapped/clamped ticks can land on the same value for
+    // a short note played right at the recording boundary, which used to read as
+    // a zero-length note and get "corrected" by adding a full loop span — turning
+    // a quick tap into a note almost as long as the whole timeline.
+    const length=sched ? Math.max(1,Math.round((wallMs-o.wallMs)/sched.mpt)) : Math.max(1,tick-o.start);
     state.notes.push({id:state.nextId++,pitch:d1,start:o.start,length,vel:o.vel,ch:state.recCh});
     requestDraw();
   }
   function finalizeOpenRecNotes(){
     if(!recOpenNotes.size) return;
-    const tick=state.playhead;
+    const nowWall=performance.now(), tick=state.playhead;
     for(const [pitch,o] of recOpenNotes){
-      let length=tick-o.start; if(length<=0 && sched) length+=sched.span; length=Math.max(1,Math.round(length));
+      const length=sched ? Math.max(1,Math.round((nowWall-o.wallMs)/sched.mpt)) : Math.max(1,tick-o.start);
       state.notes.push({id:state.nextId++,pitch,start:o.start,length,vel:o.vel,ch:state.recCh});
     }
     recOpenNotes.clear();
@@ -2623,6 +2631,7 @@
   $('recordBtn').onclick=toggleRecord;
   $('metroBtn').onclick=toggleMetronome;
   $('recCh').addEventListener('change',e=>{ state.recCh=+e.target.value||0; });
+  $('recOffsetMs').addEventListener('input',e=>{ state.recOffsetMs=+e.target.value||0; });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
   $('midiEnable').onclick=initMidi; $('midiOut').addEventListener('change',e=>setMidiOutById(e.target.value));
