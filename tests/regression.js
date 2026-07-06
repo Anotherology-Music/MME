@@ -360,7 +360,7 @@ async function run() {
       stPlaySec: document.getElementById('stPlaySec').textContent,
       stPosSec: document.getElementById('stPosSec').textContent,
     }));
-    check('MM:SS fields exist next to Play and Cursor', initial.stPlaySec === '0:00' && initial.stPosSec === '0:00', initial);
+    check('MM:SS(.t) fields exist next to Play and Cursor', initial.stPlaySec === '0:00.0' && initial.stPosSec === '0:00.0', initial);
   });
 
   await withPage(browser, async (page) => {
@@ -375,7 +375,7 @@ async function run() {
       stPlay: document.getElementById('stPlay').textContent,
       stPlaySec: document.getElementById('stPlaySec').textContent,
     }));
-    check('clicking the ruler updates Play BBT and MM:SS together', afterClick.stPlay === '3.1.1.0' && afterClick.stPlaySec === '0:04', afterClick);
+    check('clicking the ruler updates Play BBT and MM:SS together', afterClick.stPlay === '3.1.1.0' && afterClick.stPlaySec === '0:04.0', afterClick);
   });
 
   await withPage(browser, async (page) => {
@@ -390,7 +390,49 @@ async function run() {
       stPos: document.getElementById('stPos').textContent,
       stPosSec: document.getElementById('stPosSec').textContent,
     }));
-    check('hovering the ruler live-updates the Cursor BBT and MM:SS', hover.stPos.startsWith('2.') && hover.stPosSec === '0:02', hover);
+    check('hovering the ruler live-updates the Cursor BBT and MM:SS', hover.stPos.startsWith('2.') && hover.stPosSec.startsWith('0:02'), hover);
+  });
+
+  await withPage(browser, async (page) => {
+    // Time-signature change indicator: the bar line at the change draws
+    // thicker (accent color), and once bars are wide enough for per-bar
+    // labels, the new signature is spelled out to the left of that line.
+    await page.click('#setupBtn');
+    await page.fill('#tsMapBar', '2');
+    await page.fill('#tsMapNum', '3');
+    await page.selectOption('#tsMapDen', '4');
+    await page.click('#tsMapAddBtn');
+    await page.click('#setupBtn');
+    const draws = await page.evaluate(() => {
+      const ctx = document.getElementById('rulerCanvas').getContext('2d');
+      const strokeWidths = [], texts = [];
+      const origStroke = ctx.stroke.bind(ctx), origFillText = ctx.fillText.bind(ctx);
+      ctx.stroke = (...a) => { strokeWidths.push(ctx.lineWidth); return origStroke(...a); };
+      ctx.fillText = (text, x, y) => { texts.push({ text, x: Math.round(x) }); return origFillText(text, x, y); };
+      window.dispatchEvent(new Event('resize'));
+      return new Promise(resolve => setTimeout(() => resolve({ strokeWidths, texts }), 200));
+    });
+    const px = await page.evaluate(() => window._TEST_state.pxPerTick);
+    const changeX = Math.round(1920 * px); // bar 2 starts at tick 1920
+    const thickLineDrawn = draws.strokeWidths.includes(2);
+    const label = draws.texts.find(t => t.text === '3/4');
+    check('ruler draws a thicker line at the time-signature change', thickLineDrawn, draws.strokeWidths);
+    check('ruler labels the new signature "3/4" to the left of the change', !!label && label.x < changeX, { label, changeX });
+  });
+
+  await withPage(browser, async (page) => {
+    // Zooming in should populate more position markers: beat numbers fill in
+    // once there's enough room per beat, beyond just the bar numbers.
+    await page.evaluate(() => { window._TEST_state.pxPerTick = 0.5; });
+    const texts = await page.evaluate(() => {
+      const ctx = document.getElementById('rulerCanvas').getContext('2d');
+      const out = [];
+      const origFillText = ctx.fillText.bind(ctx);
+      ctx.fillText = (text, x, y) => { out.push(text); return origFillText(text, x, y); };
+      window.dispatchEvent(new Event('resize'));
+      return new Promise(resolve => setTimeout(() => resolve(out), 200));
+    });
+    check('zoomed in, beat-number labels (2/3/4) appear on the ruler', ['2', '3', '4'].every(n => texts.includes(n)), texts);
   });
 
   await withPage(browser, async (page) => {

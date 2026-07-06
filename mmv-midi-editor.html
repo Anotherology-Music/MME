@@ -201,7 +201,7 @@
     <div class="group">
       <span class="lbl">Play</span>
       <b id="stPlay" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt);min-width:80px;display:inline-block;">1.1.1.0</b>
-      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:44px;display:inline-block;">0:00</b>
+      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:52px;display:inline-block;">0:00.0</b>
     </div>
     <div class="sep"></div>
     <div class="group">
@@ -658,7 +658,7 @@
 
   <div class="statusbar">
     <span class="sf">Loop: <b id="stLoop" style="min-width:140px;">whole track</b></span>
-    <span class="sf">Cursor: <b id="stPos">1.1.0</b> <b id="stPosSec" style="color:var(--txt2);">0:00</b></span>
+    <span class="sf">Cursor: <b id="stPos">1.1.0</b> <b id="stPosSec" style="color:var(--txt2);">0:00.0</b></span>
     <span class="sf"><b id="stCtx" style="min-width:120px;">—</b></span>
     <span class="hint" style="margin-left:auto;">Select: click · Shift+click=add · dbl-click=add/del note · Alt=erase · Ctrl+wheel=X zoom · Alt+wheel=Y zoom</span>
   </div>
@@ -791,6 +791,7 @@
   function fmtHMS(sec){ const cs=Math.floor((sec*100)%100), s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return p2(h)+':'+p2(m)+':'+p2(s)+':'+p2(cs); }
   function fmtSecs(sec){ return String(Math.floor(sec)).padStart(4,'0')+':'+p2(Math.floor((sec*100)%100)); }
   function fmtClock(sec){ const s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return (h>0?h+':'+p2(m):m)+':'+p2(s); }
+  function fmtClockTenths(sec){ const t=Math.floor(sec*10)%10, s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return (h>0?h+':'+p2(m):m)+':'+p2(s)+'.'+t; }
   function getLoop(){ let a=state.locStart,b=state.locEnd; if(a==null||b==null||b<=a) return {a:0,b:totalTicks()}; return {a,b}; }
   function activeLane(){ return state.ccLanes.find(l=>l.id===state.activeLaneId); }
   function effTool(e){ if(e.altKey) return 'erase'; if(e.shiftKey) return 'select'; return state.tool; }
@@ -960,19 +961,40 @@
     ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h); drawLocators(ctx,h);
     const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
     const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
+    const changeAt=new Map(tsMapSorted().filter(s=>s.tick>0).map(s=>[s.tick,s]));
     ctx.strokeStyle=getCss('--gridBeat'); ctx.beginPath();
     bars.forEach(b=>{ for(let t=b.startTick;t<b.startTick+b.tpb-1e-6;t+=b.tpe){ if(t<t0||t>t1) continue; const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,h-7); ctx.lineTo(x,h); } });
     ctx.stroke();
-    ctx.fillStyle=getCss('--txt'); ctx.font='11px system-ui'; ctx.textBaseline='middle';
+    ctx.fillStyle=getCss('--txt'); ctx.font='11px system-ui'; ctx.textBaseline='middle'; ctx.textAlign='left';
     const barPx=(bars[0]?bars[0].tpb:ticksPerBar())*state.pxPerTick, every=Math.max(1,Math.ceil(36/Math.max(1,barPx)));
-    bars.forEach(b=>{ const t=b.startTick, x=tickToX(t);
-      ctx.strokeStyle=getCss('--gridBar'); ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
+    const tsColor=getCss('--accent2');
+    bars.forEach(b=>{ const t=b.startTick, x=tickToX(t), change=changeAt.get(t);
+      ctx.lineWidth=change?2:1; ctx.strokeStyle=change?tsColor:getCss('--gridBar');
+      ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
+      ctx.lineWidth=1;
       if(b.barIdx%every===0){ const sec=tickToSeconds(t); let lbl;
         if(state.rulerMode==='bars') lbl=String(b.barIdx+1);
         else if(state.rulerMode==='mmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60); lbl=m+':'+p2(s); }
         else if(state.rulerMode==='hhmmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60)%60,h2=Math.floor(sec/3600); lbl=p2(h2)+':'+p2(m)+':'+p2(s); }
         else{ lbl=sec.toFixed(2); }
-        ctx.fillText(lbl,x+4,h/2); } });
+        ctx.fillStyle=getCss('--txt'); ctx.fillText(lbl,x+4,h/2); }
+      // Time-signature change marker: the bar line itself turns orange (visible
+      // at any zoom), and once bars are wide enough for per-bar labels, the new
+      // signature is also spelled out to the LEFT of the line — the opposite
+      // side from the bar number, so the two never collide.
+      if(change && b.tpb*state.pxPerTick>40 && every===1){
+        ctx.fillStyle=tsColor; ctx.textAlign='right';
+        ctx.fillText(change.num+'/'+change.den, x-4, h/2);
+        ctx.textAlign='left';
+      }
+      // Beat-number labels fill in once there's enough room per beat, giving
+      // more populated position markers as you zoom further in.
+      if(every===1 && b.tpe*state.pxPerTick>24){
+        ctx.fillStyle=getCss('--txt2'); ctx.font='9px system-ui';
+        for(let i=1,tt=t+b.tpe; tt<t+b.tpb-1e-6; tt+=b.tpe,i++){ if(tt<t0||tt>t1) continue; ctx.fillText(String(i+1),tickToX(tt)+2,h/2); }
+        ctx.font='11px system-ui';
+      }
+    });
   }
   function drawAudioWave(){
     const cv=audioCanvas, ctx=actx, w=cv.width, h=cv.height; beginPane(ctx,cv);
@@ -2654,7 +2676,7 @@
     const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
   }
   function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn); }
-  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClock(tickToSeconds(state.playhead)); }
+  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockTenths(tickToSeconds(state.playhead)); }
   function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
 
@@ -2848,8 +2870,8 @@
 
   // ---------- Status ----------
   function updateStatus(x,y){ const p=yToPitch(y); const cn=pitchName(p,state.viewCh??state.defCh); const t=Math.max(0,xToTick(x));
-    $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClock(tickToSeconds(t)); $('stCtx').textContent=noteName(p)+(cn?' – '+cn:''); }
-  function updateStatusPos(x){ const t=clamp(xToTick(x),0,totalTicks()); $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClock(tickToSeconds(t)); }
+    $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClockTenths(tickToSeconds(t)); $('stCtx').textContent=noteName(p)+(cn?' – '+cn:''); }
+  function updateStatusPos(x){ const t=clamp(xToTick(x),0,totalTicks()); $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClockTenths(tickToSeconds(t)); }
   function updateStatusCC(lane,x,y){ $('stPos').textContent=tickToBBT(Math.max(0,xToTick(x))); $('stCtx').textContent='CC'+lane.cc+' = '+clamp(Math.round((1-y/lane._canvas.height)*127),0,127); }
   function flash(msg){ $('stCtx').textContent=msg; }
 
