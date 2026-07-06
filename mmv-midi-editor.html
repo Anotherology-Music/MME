@@ -2323,7 +2323,13 @@
     const type=status&0xF0, ch=status&0x0F;
     if(ch===15) return; // reserved for the Follow MMV sync-track protocol
     if(type!==0x90 && type!==0x80) return;
-    const wallMs=(e.timeStamp||performance.now())+state.recOffsetMs;
+    // Deliberately ignore e.timeStamp: some browser/OS/driver combinations
+    // coalesce rapid successive MIDI messages and report timestamps that don't
+    // reflect when each one actually arrived (fast runs collapse toward the
+    // first note). performance.now() captured fresh when the callback actually
+    // fires is the reliable clock here, at the cost of a little constant
+    // input latency the Rec Offset control can compensate for.
+    const wallMs=performance.now()+state.recOffsetMs;
     const tick=clamp(Math.round(wallTimeToTick(wallMs)),0,totalTicks());
     if(type===0x90 && d2>0){ recOpenNotes.set(d1,{start:tick,vel:d2,wallMs}); return; }
     const o=recOpenNotes.get(d1); if(!o) return;
