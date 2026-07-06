@@ -48,6 +48,7 @@
   .ni-col{display:flex;flex-direction:column;align-items:center;gap:2px;}
   .ni-lbl{font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em;}
   .ni-input{width:100%;padding:2px 3px;font-size:10px;text-align:center;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
+  .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
   .ni-disp{font-size:10px;color:var(--txt);background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:2px 1px;width:100%;text-align:center;overflow:hidden;white-space:nowrap;}
   /* ── Lane ch-filter: auto-collapse when View Ch doesn't match ── */
   .lane.lane-ch-filtered .grip{display:none!important;}
@@ -354,6 +355,9 @@
         <option value="32">1/32</option><option value="32T">1/32T</option>
         <option value="off">Off</option>
       </select>
+      <button id="quantStartBtn" title="Quantise start (Q) — snaps note start to the nearest Snap grid point, keeps length. Hold Alt for iterative (10% nudge).">|-Q</button>
+      <button id="quantEndBtn" title="Quantise end (Shift+Q) — keeps note start, snaps note end to the nearest Snap grid point. Hold Alt for iterative (10% nudge).">Q-|</button>
+      <button id="quantIterBtn" title="Iterative mode — quantise actions nudge notes 10% closer to the grid instead of snapping fully.">i</button>
     </div>
     <div class="sep"></div>
     <div class="newnote-grp">
@@ -404,12 +408,16 @@
         <span class="ni-title">Note Info</span>
         <div class="note-info-grid">
           <div class="ni-col">
+            <span class="ni-lbl">Note</span>
+            <span id="noteInfoNote" class="ni-disp" title="Pitch of selected note(s)">—</span>
+          </div>
+          <div class="ni-col">
             <span class="ni-lbl">Vel</span>
             <input type="number" id="velValInput" class="ni-input" min="1" max="127" placeholder="—" title="Velocity — applies to all selected notes">
           </div>
           <div class="ni-col">
-            <span class="ni-lbl">Note</span>
-            <span id="noteInfoNote" class="ni-disp" title="Pitch of selected note(s)">—</span>
+            <span class="ni-lbl">Pos</span>
+            <input type="text" id="noteInfoPos" class="ni-input mono" placeholder="—" title="Position (Bar.Beat.16th.Tick) — shown when selected notes share the same start. Editing shifts all selected notes together.&#10;Scroll or ↑↓ = ±1 tick, Shift = ±1/16th, Ctrl = ±1 beat, Alt = ±1 bar">
           </div>
           <div class="ni-col">
             <span class="ni-lbl">Ch</span>
@@ -651,7 +659,7 @@
     bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4,
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
-    recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false, recOffsetMs:0,
+    recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false, recOffsetMs:0, quantIterative:false,
     tool:'select', snap:'16', genCycles:1, genLen:'1/4', viewCh:null,
     genLo:0, genHi:127, genTension:0, genPhase:0, genDuty:50, genSteps:4, genOutputMode:'replace', genBlend:50,
     sweepOn:false, sweepFreqStart:'1/8', sweepFreqEnd:'2 bars',
@@ -1153,6 +1161,26 @@
   function byId(id){ return state.notes.find(n=>n.id===id); }
   function removeNote(n){ const i=state.notes.indexOf(n); if(i>=0) state.notes.splice(i,1); state.selection.delete(n.id); }
 
+  // ---------- Quantise ----------
+  function quantizeSelection(mode, iterative){
+    if(!state.selection.size) return;
+    const sel=[...state.selection].map(byId).filter(Boolean); if(!sel.length) return;
+    pushUndo();
+    sel.forEach(n=>{
+      if(mode==='start'){
+        const target=snapT(n.start);
+        const newStart=iterative?Math.round(n.start+(target-n.start)*0.1):target;
+        n.start=Math.max(0,newStart);
+      } else {
+        const end=n.start+n.length;
+        const target=snapT(end);
+        const newEnd=iterative?Math.round(end+(target-end)*0.1):target;
+        n.length=Math.max(1,newEnd-n.start);
+      }
+    });
+    updateNoteInfo(); requestDraw();
+  }
+
   // ---------- Velocity lane ----------
   function velCoords(e){ const r=velScroll.getBoundingClientRect(); return {x:e.clientX-r.left+state.scrollLeft,y:e.clientY-r.top}; }
   let velDrag=false;
@@ -1164,6 +1192,9 @@
     // Note pitch display
     const nn=$('noteInfoNote');
     if(nn){ nn.textContent=(!sel.length)?'—':sel.every(n=>n.pitch===sel[0].pitch)?(noteLabel(sel[0].pitch)+':'+sel[0].pitch):'—'; }
+    // Position (only shown when all selected notes share the same start)
+    const np=$('noteInfoPos');
+    if(np && document.activeElement!==np){ np.value=(!sel.length)?'':sel.every(n=>n.start===sel[0].start)?tickToBBT(sel[0].start):''; }
     // Channel
     const nc=$('noteInfoCh');
     if(nc){ nc.value=(!sel.length)?'':sel.every(n=>n.ch===sel[0].ch)?(sel[0].ch+1):''; }
@@ -1205,6 +1236,39 @@
       updateNoteInfo(); requestDraw();
     });
     nc.addEventListener('keydown',e=>{ if(e.key==='Enter') nc.blur(); });
+    // Position — shifts all selected notes by the same delta, preserving their
+    // relative offsets (rather than collapsing them onto one absolute tick).
+    const np=$('noteInfoPos');
+    function nudgeSelPosBy(delta){
+      if(!state.selection.size) return;
+      const sel=[...state.selection].map(byId).filter(Boolean); if(!sel.length) return;
+      pushUndo();
+      sel.forEach(n=>{ n.start=Math.max(0,n.start+delta); });
+      updateNoteInfo(); requestDraw();
+    }
+    np.addEventListener('change',()=>{
+      if(!state.selection.size){ np.value=''; return; }
+      const sel=[...state.selection].map(byId).filter(Boolean); if(!sel.length) return;
+      const newT=bbtToTick(np.value.trim());
+      if(isNaN(newT)||newT<0){ updateNoteInfo(); return; }
+      const delta=newT-sel[0].start;
+      if(delta!==0){ pushUndo(); sel.forEach(n=>{ n.start=Math.max(0,n.start+delta); }); }
+      updateNoteInfo(); requestDraw();
+    });
+    np.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){ np.blur(); return; }
+      const tpe=ticksPerBeat(), tps=Math.round(tpe/4);
+      const step=e.altKey?ticksPerBar():e.ctrlKey?tpe:e.shiftKey?tps:1;
+      if(e.key==='ArrowUp'){ e.preventDefault(); nudgeSelPosBy(+step); }
+      else if(e.key==='ArrowDown'){ e.preventDefault(); nudgeSelPosBy(-step); }
+    });
+    np.addEventListener('wheel',e=>{
+      if(document.activeElement!==np) return;
+      e.preventDefault(); e.stopPropagation();
+      const tpe=ticksPerBeat(), tps=Math.round(tpe/4);
+      const step=e.altKey?ticksPerBar():e.ctrlKey?tpe:e.shiftKey?tps:1;
+      nudgeSelPosBy(e.deltaY<0?+step:-step);
+    },{passive:false});
   })();
 
   // ---------- CC lanes ----------
@@ -2546,6 +2610,9 @@
   function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; }
   $('tools').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; state.tool=b.dataset.tool; [...$('tools').children].forEach(x=>x.classList.toggle('on',x===b)); });
   $('snap').addEventListener('change',e=>{ state.snap=e.target.value; requestDraw(); });
+  $('quantStartBtn').addEventListener('click',e=>{ quantizeSelection('start', state.quantIterative||e.altKey); });
+  $('quantEndBtn').addEventListener('click',e=>{ quantizeSelection('end', state.quantIterative||e.altKey); });
+  $('quantIterBtn').addEventListener('click',()=>{ state.quantIterative=!state.quantIterative; $('quantIterBtn').classList.toggle('on',state.quantIterative); });
   $('bpm').addEventListener('input',e=>{ state.bpm=clamp(+e.target.value||120,20,400); updateDuration(); requestDraw(); flash('Tempo changed — re-export Sync Track if using Follow MMV'); });
   $('bars').addEventListener('change',e=>{ state.bars=clamp(+e.target.value||4,1,999); updateDuration(); resizeCanvases(); });
   $('tsNum').addEventListener('change',e=>{ state.tsNum=clamp(+e.target.value||4,1,32); updateDuration(); resizeCanvases(); });
@@ -2654,6 +2721,7 @@
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
     if(!ctrl && e.key.toLowerCase()==='r'){ e.preventDefault(); toggleRecord(); return; }
     if(!ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); toggleMetronome(); return; }
+    if(!ctrl && e.key.toLowerCase()==='q'){ e.preventDefault(); quantizeSelection(e.shiftKey?'end':'start', state.quantIterative||e.altKey); return; }
     if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
       else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); }
