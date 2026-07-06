@@ -40,6 +40,7 @@ function buildTestHtml() {
       '  window._TEST_bbtToTick = (s) => bbtToTick(s);',
       '  window._TEST_barToTick = (b) => barToTick(b);',
       '  window._TEST_totalTicks = () => totalTicks();',
+      '  window._TEST_tickToSeconds = (t) => tickToSeconds(t);',
       '  init();',
     ].join('\n')
   );
@@ -308,7 +309,89 @@ async function run() {
     check('MIDI export writes one Time Signature event per map entry', hasInitial && hasChange, parsed.tsEvents);
   });
 
+  await withPage(browser, async (page) => {
+    // Inserting a meter change must not move existing notes: their tick (and
+    // therefore their real-world seconds position) stays fixed — only the
+    // bar/beat label recomputed against them can change.
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 60, start: 3840, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      return n;
+    });
+    const before = await page.evaluate((t) => ({ seconds: window._TEST_tickToSeconds(t), bbt: window._TEST_tickToBBT(t) }), note.start);
+    await page.click('#setupBtn');
+    await page.fill('#tsMapBar', '2');
+    await page.fill('#tsMapNum', '3');
+    await page.selectOption('#tsMapDen', '4');
+    await page.click('#tsMapAddBtn');
+    await page.waitForTimeout(50);
+    const noteAfter = await page.evaluate((id) => window._TEST_state.notes.find(n => n.id === id), note.id);
+    const after = await page.evaluate((t) => ({ seconds: window._TEST_tickToSeconds(t), bbt: window._TEST_tickToBBT(t) }), noteAfter.start);
+    check('adding a meter change does not move existing note ticks',
+      noteAfter.start === note.start && before.seconds === after.seconds, { before, after, tickUnchanged: noteAfter.start === note.start });
+  });
+
   // ---------------- Metronome / transport UI ----------------
+
+  await withPage(browser, async (page) => {
+    // metronome click generation must follow the time-signature map: bar 1 in
+    // 4/4 (4 beats, downbeat accented), then a meter change to 3/4 partway
+    // through must switch to 3 beats per bar with the accent on each new
+    // bar's downbeat — no drift, no leftover 4/4-shaped grouping.
+    await page.click('#setupBtn');
+    await page.fill('#tsMapBar', '2');
+    await page.fill('#tsMapNum', '3');
+    await page.selectOption('#tsMapDen', '4');
+    await page.click('#tsMapAddBtn');
+    await page.click('#setupBtn');
+    await page.click('#metroBtn');
+    await page.click('#playBtn');
+    await page.waitForTimeout(150);
+    const clicks = await page.evaluate(() => window._TEST_sched().evs.filter(e => e.click).map(e => ({ tick: e.tick, accent: e.accent })));
+    await page.click('#stopBtn');
+    const bar1ok = [0, 480, 960, 1440].every((t, i) => clicks.some(c => c.tick === t && c.accent === (i === 0)));
+    const bar2ok = [1920, 2400, 2880].every((t, i) => clicks.some(c => c.tick === t && c.accent === (i === 0)));
+    const bar3DownbeatAccented = clicks.some(c => c.tick === 3360 && c.accent === true); // next 3/4 bar's downbeat
+    check('metronome follows a meter change (4/4 -> 3/4) with correct accents', bar1ok && bar2ok && bar3DownbeatAccented, clicks.slice(0, 8));
+  });
+
+  await withPage(browser, async (page) => {
+    const initial = await page.evaluate(() => ({
+      stPlaySec: document.getElementById('stPlaySec').textContent,
+      stPosSec: document.getElementById('stPosSec').textContent,
+    }));
+    check('MM:SS fields exist next to Play and Cursor', initial.stPlaySec === '0:00' && initial.stPosSec === '0:00', initial);
+  });
+
+  await withPage(browser, async (page) => {
+    // clicking the ruler moves the playhead; its BBT and MM:SS readouts must agree
+    const r = await page.evaluate(() => {
+      const rr = document.getElementById('rulerScroll').getBoundingClientRect();
+      return { left: rr.left, top: rr.top, height: rr.height, px: window._TEST_state.pxPerTick, scrollLeft: window._TEST_state.scrollLeft };
+    });
+    await page.mouse.click(r.left + 3840 * r.px - r.scrollLeft, r.top + r.height / 2);
+    await page.waitForTimeout(50);
+    const afterClick = await page.evaluate(() => ({
+      stPlay: document.getElementById('stPlay').textContent,
+      stPlaySec: document.getElementById('stPlaySec').textContent,
+    }));
+    check('clicking the ruler updates Play BBT and MM:SS together', afterClick.stPlay === '3.1.1.0' && afterClick.stPlaySec === '0:04', afterClick);
+  });
+
+  await withPage(browser, async (page) => {
+    // hovering the ruler (no click/drag) must live-update the Cursor readout
+    const r = await page.evaluate(() => {
+      const rr = document.getElementById('rulerScroll').getBoundingClientRect();
+      return { left: rr.left, top: rr.top, height: rr.height, px: window._TEST_state.pxPerTick, scrollLeft: window._TEST_state.scrollLeft };
+    });
+    await page.mouse.move(r.left + 2000 * r.px - r.scrollLeft + 20, r.top + r.height / 2);
+    await page.waitForTimeout(50);
+    const hover = await page.evaluate(() => ({
+      stPos: document.getElementById('stPos').textContent,
+      stPosSec: document.getElementById('stPosSec').textContent,
+    }));
+    check('hovering the ruler live-updates the Cursor BBT and MM:SS', hover.stPos.startsWith('2.') && hover.stPosSec === '0:02', hover);
+  });
 
   await withPage(browser, async (page) => {
     const inToolbar = await page.evaluate(() => document.querySelector('.toolbar-r1').contains(document.getElementById('stPlay')));

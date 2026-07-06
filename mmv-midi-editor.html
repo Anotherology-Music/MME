@@ -201,6 +201,7 @@
     <div class="group">
       <span class="lbl">Play</span>
       <b id="stPlay" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt);min-width:80px;display:inline-block;">1.1.1.0</b>
+      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:44px;display:inline-block;">0:00</b>
     </div>
     <div class="sep"></div>
     <div class="group">
@@ -657,7 +658,7 @@
 
   <div class="statusbar">
     <span class="sf">Loop: <b id="stLoop" style="min-width:140px;">whole track</b></span>
-    <span class="sf">Cursor: <b id="stPos">1.1.0</b></span>
+    <span class="sf">Cursor: <b id="stPos">1.1.0</b> <b id="stPosSec" style="color:var(--txt2);">0:00</b></span>
     <span class="sf"><b id="stCtx" style="min-width:120px;">—</b></span>
     <span class="hint" style="margin-left:auto;">Select: click · Shift+click=add · dbl-click=add/del note · Alt=erase · Ctrl+wheel=X zoom · Alt+wheel=Y zoom</span>
   </div>
@@ -1117,6 +1118,7 @@
   window.addEventListener('mouseup',()=>{ if(!rulerDrag) return;
     if(!rulerDrag.moved){ state.playhead=clamp(rulerDrag.startT,0,totalTicks()); updatePlayPos(); updatePlayheadEl(); }
     rulerDrag=null; });
+  rulerCanvas.addEventListener('mousemove',e=>{ updateStatusPos(rulerX(e)); });
   rulerCanvas.addEventListener('dblclick',()=>{ state.locStart=state.locEnd=null; updateLoopStatus(); requestDraw(); });
 
   // ---------- Piano roll interaction ----------
@@ -2519,7 +2521,7 @@
     const bars=+$('recCountIn').value||0;
     if(bars<=0){ beginRecording(); return; }
     state.recArmed=true; updateTransportBtns();
-    const beatsTotal=bars*state.tsNum, mspb=60000/state.bpm;
+    const localNum=tsSegAt(state.playhead).num, beatsTotal=bars*localNum, mspb=60000/state.bpm;
     flash('Count-in: '+bars+' bar'+(bars>1?'s':'')+'…');
     // Schedule every count-in click up front against one fixed future timestamp
     // (recordStartWall) instead of firing them live off a drifting setInterval —
@@ -2529,7 +2531,7 @@
     recCountInNodes=[];
     for(let i=0;i<beatsTotal;i++){
       const beatWall=recordStartWall-(beatsTotal-i)*mspb;
-      const node=scheduleClickAt(beatWall, i%state.tsNum===0);
+      const node=scheduleClickAt(beatWall, i%localNum===0);
       if(node) recCountInNodes.push(node);
     }
     recCountInTimer=setTimeout(()=>{ recCountInTimer=null; recCountInNodes=null; beginRecording(recordStartWall); }, Math.max(0,recordStartWall-performance.now()));
@@ -2570,11 +2572,13 @@
       }
     }
     if(state.metronomeOn){
-      const tpb=ticksPerBeat();
-      for(let t=Math.ceil(a/tpb)*tpb; t<b; t+=tpb){
-        const beatIdx=Math.round(t/tpb);
-        evs.push({tick:t, o:0, click:true, accent:wrapv(beatIdx,state.tsNum)===0});
-      }
+      barsInView(a,b).forEach(bar=>{
+        let i=0;
+        for(let t=bar.startTick; t<bar.startTick+bar.tpb-1e-6 && t<b; t+=bar.tpe, i++){
+          if(t<a) continue;
+          evs.push({tick:t, o:0, click:true, accent:i===0});
+        }
+      });
     }
     evs.sort((x,y)=> x.tick-y.tick || x.o-y.o); return evs;
   }
@@ -2650,7 +2654,7 @@
     const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
   }
   function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn); }
-  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); }
+  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClock(tickToSeconds(state.playhead)); }
   function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
 
@@ -2843,7 +2847,9 @@
   });
 
   // ---------- Status ----------
-  function updateStatus(x,y){ const p=yToPitch(y); const cn=pitchName(p,state.viewCh??state.defCh); $('stPos').textContent=tickToBBT(Math.max(0,xToTick(x))); $('stCtx').textContent=noteName(p)+(cn?' – '+cn:''); }
+  function updateStatus(x,y){ const p=yToPitch(y); const cn=pitchName(p,state.viewCh??state.defCh); const t=Math.max(0,xToTick(x));
+    $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClock(tickToSeconds(t)); $('stCtx').textContent=noteName(p)+(cn?' – '+cn:''); }
+  function updateStatusPos(x){ const t=clamp(xToTick(x),0,totalTicks()); $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClock(tickToSeconds(t)); }
   function updateStatusCC(lane,x,y){ $('stPos').textContent=tickToBBT(Math.max(0,xToTick(x))); $('stCtx').textContent='CC'+lane.cc+' = '+clamp(Math.round((1-y/lane._canvas.height)*127),0,127); }
   function flash(msg){ $('stCtx').textContent=msg; }
 
