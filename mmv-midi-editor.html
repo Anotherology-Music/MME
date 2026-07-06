@@ -310,6 +310,18 @@
             </select>
           </div>
         </div>
+        <div class="setup-section">
+          <div class="setup-title">Time Signature Changes</div>
+          <div id="tsMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
+          <div class="setup-row">
+            <span class="lbl">At bar</span><input type="number" id="tsMapBar" value="1" min="1" style="width:56px;">
+            <span class="lbl">Sig</span>
+            <input type="number" id="tsMapNum" value="4" min="1" max="32" style="width:44px;">
+            <span class="pill">/</span>
+            <select id="tsMapDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
+            <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
+          </div>
+        </div>
         <div class="setup-section" id="chNamesSection">
           <div class="setup-title">Channel Names</div>
           <div id="chNamesGrid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:4px;"></div>
@@ -656,7 +668,7 @@
   "use strict";
 
   const state = {
-    bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4,
+    bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4, tsMap:[{tick:0,num:4,den:4}],
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
     recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false, recOffsetMs:0, quantIterative:false,
@@ -709,7 +721,36 @@
   const clamp=(v,a,b)=>v<a?a:v>b?b:v;
   function ticksPerBeat(){ return state.ppq * 4 / state.tsDen; }
   function ticksPerBar(){ return ticksPerBeat() * state.tsNum; }
-  function totalTicks(){ return Math.round(ticksPerBar() * state.bars); }
+
+  // ---------- Time signature map ----------
+  // state.tsMap: [{tick, num, den}, ...] sorted by tick, always starts at tick 0.
+  // Changes are assumed to land on bar boundaries (the UI enforces this), so bar
+  // counts accumulate exactly across segments with no fractional-bar remainders.
+  function tsMapSorted(){ return state.tsMap.slice().sort((a,b)=>a.tick-b.tick); }
+  function segTicksPerBar(seg){ return state.ppq*4/seg.den*seg.num; }
+  function tsSegAt(tick){ const m=tsMapSorted(); let seg=m[0]; for(const s of m){ if(s.tick<=tick) seg=s; else break; } return seg; }
+  // Walks the map up to `tick`, returning the 0-indexed bar it falls in, the
+  // segment governing that bar, and how many ticks into that bar it is.
+  function walkToTick(tick){
+    const m=tsMapSorted(); let bar=0;
+    for(let i=0;i<m.length;i++){
+      const segStart=m[i].tick, segEnd=(i+1<m.length)?m[i+1].tick:Infinity, tpb=segTicksPerBar(m[i]);
+      if(tick<segEnd){ const tickInSeg=Math.max(0,tick-segStart); const barInSeg=Math.floor(tickInSeg/tpb);
+        return {bar:bar+barInSeg, seg:m[i], tickInBar:tickInSeg-barInSeg*tpb}; }
+      bar+=Math.round((segEnd-segStart)/tpb);
+    }
+  }
+  // Inverse: start tick of the given 0-indexed bar number.
+  function barToTick(barIdx){
+    const m=tsMapSorted(); let bar=0;
+    for(let i=0;i<m.length;i++){
+      const segStart=m[i].tick, segEnd=(i+1<m.length)?m[i+1].tick:Infinity, tpb=segTicksPerBar(m[i]);
+      const barsAvail=segEnd===Infinity?Infinity:Math.round((segEnd-segStart)/tpb);
+      if(barIdx<bar+barsAvail||segEnd===Infinity) return segStart+(barIdx-bar)*tpb;
+      bar+=barsAvail;
+    }
+  }
+  function totalTicks(){ return Math.round(barToTick(state.bars)); }
   function contentW(){ return Math.max(200, Math.round(totalTicks()*state.pxPerTick)); }
   function prContentH(){ return NPITCH*state.noteHeight; }
   function tickToX(t){ return t*state.pxPerTick; }
@@ -728,19 +769,21 @@
     return n[((p%12)+12)%12]+(Math.floor(p/12)-2); } // note 36 = C1
   function pitchName(p,ch){ return state.pitchNames[ch+'_'+p]||state.pitchNames[p]||null; }
   function noteLabel(p,ch){ const cn=pitchName(p,ch??state.viewCh??state.defCh); return cn||noteName(p); }
-  function tickToBBT(t){ const tpb=ticksPerBar(), tpe=ticksPerBeat(), tps=Math.round(tpe/4);
-    const bar=Math.floor(t/tpb), rem=t-bar*tpb; const beat=Math.floor(rem/tpe), remB=rem-beat*tpe;
+  function tickToBBT(t){ const {bar,seg,tickInBar}=walkToTick(t);
+    const tpe=state.ppq*4/seg.den, tps=Math.round(tpe/4);
+    const beat=Math.floor(tickInBar/tpe), remB=tickInBar-beat*tpe;
     const sub=Math.floor(remB/tps), tk=Math.round(remB-sub*tps);
     return `${bar+1}.${beat+1}.${sub+1}.${tk}`; }
   function bbtToTick(str){ const p=str.split('.').map(s=>parseInt(s)||0);
-    const tpe=ticksPerBeat(), tps=Math.round(tpe/4);
+    const barIdx=Math.max(0,(p[0]||1)-1), barStart=barToTick(barIdx), seg=tsSegAt(barStart);
+    const tpe=state.ppq*4/seg.den, tps=Math.round(tpe/4);
     if(p.length>=4){
-      const bar=Math.max(0,(p[0]||1)-1),beat=Math.max(0,(p[1]||1)-1),sub=Math.max(0,(p[2]||1)-1),tk=Math.max(0,p[3]||0);
-      return bar*ticksPerBar()+beat*tpe+sub*tps+tk;
+      const beat=Math.max(0,(p[1]||1)-1),sub=Math.max(0,(p[2]||1)-1),tk=Math.max(0,p[3]||0);
+      return barStart+beat*tpe+sub*tps+tk;
     }
     // 3-part fallback (Bar.Beat.FineTick)
-    const bar=Math.max(0,(p[0]||1)-1),beat=Math.max(0,(p[1]||1)-1),tk=Math.max(0,p[2]||0);
-    return bar*ticksPerBar()+beat*tpe+tk; }
+    const beat=Math.max(0,(p[1]||1)-1),tk=Math.max(0,p[2]||0);
+    return barStart+beat*tpe+tk; }
   function tickToSeconds(t){ return t/ticksPerBeat()*(60/state.bpm); }
   function songSeconds(){ return tickToSeconds(totalTicks()); }
   function p2(n){ return String(n).padStart(2,'0'); }
@@ -812,7 +855,7 @@
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
     lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,points:l.points})),
-    bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,
+    bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
     genLen:state.genLen,channelNames:state.channelNames,
     genLo:state.genLo,genHi:state.genHi,genTension:state.genTension,genPhase:state.genPhase,
@@ -826,6 +869,7 @@
   function commitUndo(){ if(pending){ if(snapshot()!==pending){ undoStack.push(pending); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); } pending=null; } }
   function applyState(s){ const o=JSON.parse(s);
     state.notes=o.notes; state.bars=o.bars; state.bpm=o.bpm; state.ppq=o.ppq; state.tsNum=o.tsNum; state.tsDen=o.tsDen;
+    state.tsMap=o.tsMap||[{tick:0,num:o.tsNum,den:o.tsDen}];
     state.locStart=o.locS; state.locEnd=o.locE; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
     state.projectName=o.projectName||''; if($('projectName')) $('projectName').value=state.projectName;
     if(o.genLen){ state.genLen=o.genLen; if($('genLen')) $('genLen').value=state.genLen; }
@@ -881,12 +925,29 @@
   let cssCache={};
   function getCss(v){ if(cssCache[v]) return cssCache[v]; return cssCache[v]=getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
+  // Bars overlapping [t0,t1], each carrying its own segment's bar/beat length —
+  // used so the grid/ruler draw correctly across a time-signature change.
+  function barsInView(t0,t1){
+    const out=[]; const info=walkToTick(Math.max(0,t0));
+    let barIdx=info.bar, tick=t0-info.tickInBar;
+    while(tick<=t1){ const seg=tsSegAt(tick); const tpb=segTicksPerBar(seg), tpe=state.ppq*4/seg.den;
+      out.push({barIdx,startTick:tick,tpb,tpe}); tick+=tpb; barIdx++; }
+    return out;
+  }
   function gridLinesX(ctx,y0,y1,vw){ const sx=state.scrollLeft; const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
-    const tpb=ticksPerBar(),tbe=ticksPerBeat(),sub=snapTicks();
-    function lines(step,color){ ctx.strokeStyle=color; ctx.lineWidth=1; ctx.beginPath();
-      for(let t=Math.floor(t0/step)*step;t<=t1;t+=step){ const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,y0); ctx.lineTo(x,y1); } ctx.stroke(); }
-    if(state.snap!=='off'&&state.snap!=='bar'&&sub*state.pxPerTick>5) lines(sub,getCss('--grid'));
-    lines(tbe,getCss('--gridBeat')); lines(tpb,getCss('--gridBar')); }
+    const sub=snapTicks(); const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
+    if(state.snap!=='off'&&state.snap!=='bar'&&sub*state.pxPerTick>5){
+      ctx.strokeStyle=getCss('--grid'); ctx.lineWidth=1; ctx.beginPath();
+      for(let t=Math.floor(t0/sub)*sub;t<=t1;t+=sub){ const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,y0); ctx.lineTo(x,y1); }
+      ctx.stroke();
+    }
+    ctx.strokeStyle=getCss('--gridBeat'); ctx.lineWidth=1; ctx.beginPath();
+    bars.forEach(b=>{ for(let t=b.startTick;t<b.startTick+b.tpb-1e-6;t+=b.tpe){ if(t<t0||t>t1) continue; const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,y0); ctx.lineTo(x,y1); } });
+    ctx.stroke();
+    ctx.strokeStyle=getCss('--gridBar'); ctx.lineWidth=1; ctx.beginPath();
+    bars.forEach(b=>{ const x=Math.round(tickToX(b.startTick))+0.5; ctx.moveTo(x,y0); ctx.lineTo(x,y1); });
+    ctx.stroke();
+  }
   function drawLocators(ctx,h){ if(state.locStart==null||state.locEnd==null||state.locEnd<=state.locStart) return;
     const x0=tickToX(state.locStart), x1=tickToX(state.locEnd);
     ctx.fillStyle='rgba(255,180,84,0.10)'; ctx.fillRect(x0,0,x1-x0,h);
@@ -896,18 +957,21 @@
 
   function drawRuler(){ const cv=rulerCanvas,ctx=rctx,vw=cv.width,h=cv.height; beginPane(ctx,cv); const sx=state.scrollLeft;
     ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h); drawLocators(ctx,h);
-    const tpb=ticksPerBar(),tbe=ticksPerBeat(); const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
-    ctx.strokeStyle=getCss('--gridBeat'); ctx.beginPath(); for(let t=Math.floor(t0/tbe)*tbe;t<=t1;t+=tbe){ const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,h-7); ctx.lineTo(x,h);} ctx.stroke();
+    const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
+    const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
+    ctx.strokeStyle=getCss('--gridBeat'); ctx.beginPath();
+    bars.forEach(b=>{ for(let t=b.startTick;t<b.startTick+b.tpb-1e-6;t+=b.tpe){ if(t<t0||t>t1) continue; const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,h-7); ctx.lineTo(x,h); } });
+    ctx.stroke();
     ctx.fillStyle=getCss('--txt'); ctx.font='11px system-ui'; ctx.textBaseline='middle';
-    const barPx=tpb*state.pxPerTick, every=Math.max(1,Math.ceil(36/Math.max(1,barPx)));
-    for(let bar=Math.floor(t0/tpb); ; bar++){ const t=bar*tpb; if(t>t1+tpb) break; if(t<0) continue; const x=tickToX(t);
+    const barPx=(bars[0]?bars[0].tpb:ticksPerBar())*state.pxPerTick, every=Math.max(1,Math.ceil(36/Math.max(1,barPx)));
+    bars.forEach(b=>{ const t=b.startTick, x=tickToX(t);
       ctx.strokeStyle=getCss('--gridBar'); ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
-      if(bar%every===0){ const sec=tickToSeconds(t); let lbl;
-        if(state.rulerMode==='bars') lbl=String(bar+1);
+      if(b.barIdx%every===0){ const sec=tickToSeconds(t); let lbl;
+        if(state.rulerMode==='bars') lbl=String(b.barIdx+1);
         else if(state.rulerMode==='mmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60); lbl=m+':'+p2(s); }
         else if(state.rulerMode==='hhmmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60)%60,h2=Math.floor(sec/3600); lbl=p2(h2)+':'+p2(m)+':'+p2(s); }
         else{ lbl=sec.toFixed(2); }
-        ctx.fillText(lbl,x+4,h/2); } }
+        ctx.fillText(lbl,x+4,h/2); } });
   }
   function drawAudioWave(){
     const cv=audioCanvas, ctx=actx, w=cv.width, h=cv.height; beginPane(ctx,cv);
@@ -1978,7 +2042,7 @@
   }
   function buildMidi(){ const ev=[]; const mpqn=Math.round(60000000/state.bpm);
     ev.push({tick:0,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]});
-    const dd=Math.round(Math.log2(state.tsDen)); ev.push({tick:0,o:0,d:[0xFF,0x58,0x04,state.tsNum,dd,24,8]});
+    tsMapSorted().forEach(s=>{ const dd=Math.round(Math.log2(s.den)); ev.push({tick:s.tick,o:0,d:[0xFF,0x58,0x04,s.num,dd,24,8]}); });
     ev.push({tick:0,o:0,d:buildMmvMeta()});
     for(const n of state.notes){ const ch=n.ch&15; ev.push({tick:Math.round(n.start),o:2,d:[0x90|ch,n.pitch&127,clamp(n.vel,1,127)]}); ev.push({tick:Math.round(n.start+Math.max(1,n.length)),o:1,d:[0x80|ch,n.pitch&127,0]}); }
     const end=totalTicks(), step=Math.max(1,Math.round(state.ppq/state.ccRes));
@@ -2050,13 +2114,13 @@
 
   function parseMidi(buf){ const dv=new DataView(buf); let p=0; const rd=n=>{let v=0;for(let i=0;i<n;i++){v=(v<<8)|dv.getUint8(p++);}return v;};
     if(rd(4)!==0x4D546864) throw new Error('Not a MIDI file'); rd(4); const fmt=rd(2), ntrk=rd(2), div=rd(2);
-    const notes=[], ccMap={}, pbMap={}; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
+    const notes=[], ccMap={}, pbMap={}, tsEvents=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
     for(let ti=0;ti<ntrk;ti++){ if(rd(4)!==0x4D54726B) break; const len=rd(4); const end=p+len; let abs=0, status=0; const open={};
       while(p<end){ let delta=0,b; do{ b=dv.getUint8(p++); delta=(delta<<7)|(b&0x7F);}while(b&0x80); abs+=delta;
         let s=dv.getUint8(p); if(s&0x80){ status=s; p++; } else { s=status; } const type=s&0xF0, ch=s&0x0F;
         if(s===0xFF){ const meta=dv.getUint8(p++); let l=0,bb; do{bb=dv.getUint8(p++);l=(l<<7)|(bb&0x7F);}while(bb&0x80);
           if(meta===0x51 && l===3){ const t=(dv.getUint8(p)<<16)|(dv.getUint8(p+1)<<8)|dv.getUint8(p+2); bpm=Math.round(60000000/t); }
-          if(meta===0x58 && l>=2){ tsN=dv.getUint8(p); tsD=Math.pow(2,dv.getUint8(p+1)); }
+          if(meta===0x58 && l>=2){ tsN=dv.getUint8(p); tsD=Math.pow(2,dv.getUint8(p+1)); tsEvents.push({tick:abs,num:tsN,den:tsD}); }
           if(meta===0x7F && l>3 && dv.getUint8(p)===0x4D && dv.getUint8(p+1)===0x4D && dv.getUint8(p+2)===0x56){
             try{ mmvMeta=JSON.parse(new TextDecoder().decode(dv.buffer.slice(p+3,p+l))); }catch(e){} }
           p+=l; continue; }
@@ -2067,7 +2131,7 @@
         else if(type===0xA0){ p+=2; }
         else if(type===0xE0){ const lsb=dv.getUint8(p++),msb=dv.getUint8(p++); const pv=(lsb|(msb<<7))-8192; const k='pb_'+ch; (pbMap[k]=pbMap[k]||{ch,points:[]}).points.push({t:abs,v:pv}); }
         else if(type===0xC0||type===0xD0){ p+=1; } else { p++; } } p=end; }
-    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,mmvMeta}; }
+    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,mmvMeta,tsEvents}; }
   function closeNote(open,ch,pitch,abs,notes){ const arr=open[ch+'_'+pitch]; if(arr&&arr.length){ const o=arr.shift(); notes.push({start:o.start,length:Math.max(1,abs-o.start),pitch,vel:o.vel,ch}); } }
   function importMidi(buf, filename){ let r; try{ r=parseMidi(buf); }catch(err){ alert('Could not read file: '+err.message); return; }
     if(!projectHasContent()){ applyMidiImport(r,'replace'); return; }
@@ -2165,10 +2229,22 @@
     mergeBtn.addEventListener('click',()=>{ const remap=canRemap&&$('midiRemapCb').checked; dlg.close(); dlg.remove(); applyMidiImport(r,'merge',remap); });
   }
 
+  // Builds a tsMap from a parsed MIDI file's time-signature meta events,
+  // rescaled to the project's ppq. Falls back to a single tick-0 entry if the
+  // file had none, and backdates the first event to tick 0 if it wasn't
+  // already there (so the map's "always starts at tick 0" invariant holds).
+  function tsMapFromEvents(tsEvents, num, den, scale){
+    const evs=(tsEvents||[]).map(e=>({tick:Math.round(e.tick*scale),num:e.num,den:e.den})).sort((a,b)=>a.tick-b.tick);
+    if(!evs.length) return [{tick:0,num,den}];
+    if(evs[0].tick!==0) evs.unshift({tick:0,num:evs[0].num,den:evs[0].den});
+    const out=[]; evs.forEach(e=>{ if(out.length&&out[out.length-1].tick===e.tick) out[out.length-1]=e; else out.push(e); });
+    return out;
+  }
   function applyMidiImport(r, mode, remapChannels){
     pushUndo();
     if(mode==='replace'){
       state.ppq=midiDiv(r); state.bpm=clamp(r.bpm,20,400); state.tsNum=r.tsN; state.tsDen=r.tsD;
+      state.tsMap=tsMapFromEvents(r.tsEvents,r.tsN,r.tsD,1);
       state.notes=r.notes.map(n=>({id:state.nextId++,...n}));
       let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+n.length)); Object.values(r.ccMap).forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,pt.t)));
       state.bars=Math.max(1,Math.ceil(maxT/ticksPerBar())+1);
@@ -2606,8 +2682,45 @@
     state.recCh=+sel.value||0;
   }
 
+  function renderTsMapUI(){
+    const list=$('tsMapList'); if(!list) return;
+    list.innerHTML='';
+    tsMapSorted().forEach(s=>{
+      const {bar}=walkToTick(s.tick);
+      const row=document.createElement('div'); row.style.cssText='display:flex;align-items:center;gap:6px;';
+      const lbl=document.createElement('span'); lbl.textContent='Bar '+(bar+1)+': '+s.num+'/'+s.den;
+      lbl.style.cssText='flex:1;color:var(--txt2);';
+      row.appendChild(lbl);
+      if(s.tick!==0){
+        const del=document.createElement('button'); del.textContent='×'; del.title='Remove this time signature change';
+        del.style.cssText='font-size:10px;padding:1px 5px;';
+        del.addEventListener('click',()=>removeTsMapChange(s.tick));
+        row.appendChild(del);
+      }
+      list.appendChild(row);
+    });
+  }
+  function addTsMapChange(){
+    const bar=Math.max(1,Math.round(+$('tsMapBar').value||1))-1;
+    const num=clamp(Math.round(+$('tsMapNum').value||4),1,32);
+    const den=+$('tsMapDen').value||4;
+    pushUndo();
+    const tick=bar===0?0:Math.round(barToTick(bar));
+    const idx=state.tsMap.findIndex(s=>s.tick===tick);
+    if(idx>=0) state.tsMap[idx]={tick,num,den}; else state.tsMap.push({tick,num,den});
+    state.tsMap.sort((a,b)=>a.tick-b.tick);
+    if(bar===0){ state.tsNum=num; state.tsDen=den; syncInputs(); }
+    updateDuration(); resizeCanvases(); renderTsMapUI(); requestDraw();
+  }
+  function removeTsMapChange(tick){
+    if(tick===0) return;
+    pushUndo();
+    state.tsMap=state.tsMap.filter(s=>s.tick!==tick);
+    updateDuration(); resizeCanvases(); renderTsMapUI(); requestDraw();
+  }
+
   // ---------- Inputs ----------
-  function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; }
+  function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; renderTsMapUI(); }
   $('tools').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; state.tool=b.dataset.tool; [...$('tools').children].forEach(x=>x.classList.toggle('on',x===b)); });
   $('snap').addEventListener('change',e=>{ state.snap=e.target.value; requestDraw(); });
   $('quantStartBtn').addEventListener('click',e=>{ quantizeSelection('start', state.quantIterative||e.altKey); });
@@ -2615,8 +2728,8 @@
   $('quantIterBtn').addEventListener('click',()=>{ state.quantIterative=!state.quantIterative; $('quantIterBtn').classList.toggle('on',state.quantIterative); });
   $('bpm').addEventListener('input',e=>{ state.bpm=clamp(+e.target.value||120,20,400); updateDuration(); requestDraw(); flash('Tempo changed — re-export Sync Track if using Follow MMV'); });
   $('bars').addEventListener('change',e=>{ state.bars=clamp(+e.target.value||4,1,999); updateDuration(); resizeCanvases(); });
-  $('tsNum').addEventListener('change',e=>{ state.tsNum=clamp(+e.target.value||4,1,32); updateDuration(); resizeCanvases(); });
-  $('tsDen').addEventListener('change',e=>{ state.tsDen=+e.target.value||4; updateDuration(); resizeCanvases(); });
+  $('tsNum').addEventListener('change',e=>{ state.tsNum=clamp(+e.target.value||4,1,32); state.tsMap[0].num=state.tsNum; updateDuration(); resizeCanvases(); renderTsMapUI(); });
+  $('tsDen').addEventListener('change',e=>{ state.tsDen=+e.target.value||4; state.tsMap[0].den=state.tsDen; updateDuration(); resizeCanvases(); renderTsMapUI(); });
   $('ppq').addEventListener('change',e=>{ state.ppq=clamp(+e.target.value||480,24,1920); updateDuration(); resizeCanvases(); });
   $('projectName').addEventListener('input',e=>{ state.projectName=e.target.value; });
   $('defVel').addEventListener('input',e=>{ state.defVel=clamp(+e.target.value||100,1,127); });
@@ -2704,6 +2817,7 @@
   $('recordBtn').onclick=toggleRecord;
   $('metroBtn').onclick=toggleMetronome;
   $('recCh').addEventListener('change',e=>{ state.recCh=+e.target.value||0; });
+  $('tsMapAddBtn').addEventListener('click',addTsMapChange);
   $('recOffsetMs').addEventListener('input',e=>{ state.recOffsetMs=+e.target.value||0; });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
@@ -3399,7 +3513,7 @@
   function init(){
     schedWorker=makeWorker();
     // Setup panel toggle
-    $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
+    $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; if(open) renderTsMapUI(); });
     // ── Advanced Generate panel ──
     (()=>{
       const btn=$('genAdvBtn'), panel=$('genAdvPanel');

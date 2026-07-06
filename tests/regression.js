@@ -33,9 +33,13 @@ function buildTestHtml() {
       '  window._TEST_snapshot = snapshot;',
       '  window._TEST_applyState = applyState;',
       '  window._TEST_buildMidi = () => Array.from(buildMidi());',
-      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div }; };',
+      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents }; };',
       '  window._TEST_addLane = (cc, ch) => { const l = addLane(cc, ch); return l.id; };',
       '  window._TEST_upsertPoint = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); upsertPoint(l, t, v); };',
+      '  window._TEST_tickToBBT = (t) => tickToBBT(t);',
+      '  window._TEST_bbtToTick = (s) => bbtToTick(s);',
+      '  window._TEST_barToTick = (b) => barToTick(b);',
+      '  window._TEST_totalTicks = () => totalTicks();',
       '  init();',
     ].join('\n')
   );
@@ -250,6 +254,58 @@ async function run() {
     await page.click('#recordBtn');
     const separated = notes.length === 3 && (notes[1] - notes[0]) > 50 && (notes[2] - notes[1]) > 50;
     check('recording ignores stale/coalesced e.timeStamp', separated, notes);
+  });
+
+  // ---------------- Time signature map ----------------
+
+  await withPage(browser, async (page) => {
+    const bbt = await page.evaluate(() => window._TEST_tickToBBT(1920));
+    check('default 4/4 project: bar 2 starts at tick 1920', bbt === '2.1.1.0', bbt);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.click('#setupBtn');
+    await page.fill('#tsMapBar', '3');
+    await page.fill('#tsMapNum', '3');
+    await page.selectOption('#tsMapDen', '4');
+    await page.click('#tsMapAddBtn');
+    await page.waitForTimeout(50);
+
+    const bar3Tick = await page.evaluate(() => window._TEST_barToTick(2)); // 0-indexed bar 3
+    const bar3Bbt = await page.evaluate((t) => window._TEST_tickToBBT(t), bar3Tick);
+    const beat2InBar3 = await page.evaluate((t) => window._TEST_tickToBBT(t + 480), bar3Tick); // 1 beat later in 3/4
+    const bar4Tick = await page.evaluate(() => window._TEST_barToTick(3)); // bar 4 should start 3 beats (1440 ticks) after bar3Tick
+    check('meter change: bar 3 starts at 2 bars of 4/4 (tick 3840)', bar3Tick === 3840, bar3Tick);
+    check('meter change: BBT at bar 3 start is 3.1.1.0', bar3Bbt === '3.1.1.0', bar3Bbt);
+    check('meter change: beat 2 of bar 3 (3/4) is 3.2.1.0', beat2InBar3 === '3.2.1.0', beat2InBar3);
+    check('meter change: bar 4 starts 3 beats after bar 3 (5280), not 4', bar4Tick === 5280, bar4Tick);
+
+    const listText = await page.evaluate(() => document.getElementById('tsMapList').textContent);
+    check('Time Signature Changes list shows the new entry', listText.includes('Bar 3: 3/4'), listText);
+
+    // remove it, bar 4 (0-indexed 3) should revert to plain 4/4: 3 * 1920 = 5760
+    await page.click('#tsMapList button');
+    await page.waitForTimeout(50);
+    const bar4TickAfterRemove = await page.evaluate(() => window._TEST_barToTick(3));
+    check('removing the change reverts later bars to 4/4 (bar 4 = 5760)', bar4TickAfterRemove === 5760, bar4TickAfterRemove);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => { window._TEST_state.tsMap.push({ tick: 3840, num: 3, den: 4 }); });
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    await page.evaluate(() => { window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }]; });
+    await page.evaluate((snap) => window._TEST_applyState(snap), snap);
+    const tsMap = await page.evaluate(() => window._TEST_state.tsMap);
+    check('snapshot/applyState preserves the time-signature map', tsMap.length === 2 && tsMap[1].tick === 3840 && tsMap[1].num === 3, tsMap);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => { window._TEST_state.tsMap.push({ tick: 3840, num: 3, den: 4 }); });
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    const parsed = await page.evaluate((bytes) => window._TEST_parseMidi(bytes), bytes);
+    const hasInitial = parsed.tsEvents.some(e => e.tick === 0 && e.num === 4 && e.den === 4);
+    const hasChange = parsed.tsEvents.some(e => e.tick === 3840 && e.num === 3 && e.den === 4);
+    check('MIDI export writes one Time Signature event per map entry', hasInitial && hasChange, parsed.tsEvents);
   });
 
   // ---------------- Metronome / transport UI ----------------
