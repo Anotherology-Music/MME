@@ -1,8 +1,11 @@
 <!--
-  MMV MIDI & CC Curve Editor v0.6.0
+  MMV MIDI & CC Curve Editor v0.7.0
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
+  Lane tags + filter bar: tag lanes (free-form, e.g. shader/scene names) and filter the
+  lane list by tag (OR across selected tags). Filtering is visual only — hidden lanes
+  still play. ISF import auto-tags new lanes with the shader filename + optional scene tag.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -138,6 +141,13 @@
   .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
   .lane .leftcol .name-row{padding:3px 0 1px;}
   .lane .leftcol .name-row input{flex:1;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
+  .lane .leftcol .name-row input.ltags{flex:0 0 42%;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
+  .lane.lane-filtered{display:none!important;}
+  .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
+  .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
+  .tag-chip{font-size:11px;padding:2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;cursor:pointer;}
+  .tag-chip:hover{border-color:#4fa3ff;}
+  .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
   .lane .leftcol .compact-row{gap:2px;padding-bottom:2px;flex-wrap:nowrap;}
   .lane .leftcol .compact-row .ccn{width:42px;padding:1px 3px;font-size:10px;}
   .lane .leftcol .compact-row .chn{width:34px;padding:1px 3px;font-size:10px;}
@@ -442,6 +452,7 @@
     </div>
 
     <div class="grip" id="gripVel" title="Drag to resize velocity lane"></div>
+    <div class="tag-bar" id="tagFilterBar" style="display:none;"></div>
     <div class="lanes" id="lanes"></div>
 
     <div class="add-row">
@@ -856,8 +867,9 @@
   // ---------- Undo / Redo ----------
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
-    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,points:l.points})),
+    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],points:l.points})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
+    isfHistory:state.isfHistory||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
     genLen:state.genLen,channelNames:state.channelNames,
     genLo:state.genLo,genHi:state.genHi,genTension:state.genTension,genPhase:state.genPhase,
@@ -874,6 +886,7 @@
     state.tsMap=o.tsMap||[{tick:0,num:o.tsNum,den:o.tsDen}];
     state.locStart=o.locS; state.locEnd=o.locE; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
     state.projectName=o.projectName||''; if($('projectName')) $('projectName').value=state.projectName;
+    if(o.isfHistory) state.isfHistory=o.isfHistory;
     if(o.genLen){ state.genLen=o.genLen; if($('genLen')) $('genLen').value=state.genLen; }
     if(o.channelNames) state.channelNames=o.channelNames;
     if(o.genLo!=null){ state.genLo=o.genLo; if($('advLo')){ $('advLo').value=o.genLo; $('advLoR').value=o.genLo; } }
@@ -893,7 +906,8 @@
     const _grid=$('chNamesGrid');
     if(_grid){ _grid.querySelectorAll('input[type=text]').forEach((inp,i)=>{ inp.value=state.channelNames[i]||''; }); }
     state.ccLanes.forEach(l=>l._row&&l._row.remove()); state.ccLanes=[];
-    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane); });
+    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane); });
+    refreshTagBar();
     state.activeLaneId=state.ccLanes.length?state.ccLanes[0].id:null; refreshActive();
     state.selection.clear(); syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
   function undo(){ if(!undoStack.length) return; redoStack.push(snapshot()); applyState(undoStack.pop()); updateUndoBtns(); }
@@ -1466,17 +1480,47 @@
     }
     document.body.style.cursor=''; lane._preview=null; ccDrag=null; commitUndo(); requestDraw(); });
 
+  // ---------- Lane tags / filter bar ----------
+  const tagFilter=new Set(); // empty = show all lanes
+  function laneTagList(l){ return Array.isArray(l.tags)?l.tags:[]; }
+  function laneMatchesFilter(l){ if(tagFilter.size===0) return true; return laneTagList(l).some(t=>tagFilter.has(t)); }
+  function applyTagFilter(){
+    state.ccLanes.forEach(l=>{ if(l._row) l._row.classList.toggle('lane-filtered',!laneMatchesFilter(l)); });
+    resizeCanvases(); requestDraw();
+  }
+  function refreshTagBar(){
+    const bar=$('tagFilterBar'); if(!bar) return;
+    const all=new Set(); state.ccLanes.forEach(l=>laneTagList(l).forEach(t=>all.add(t)));
+    [...tagFilter].forEach(t=>{ if(!all.has(t)) tagFilter.delete(t); });
+    bar.innerHTML='';
+    if(all.size===0){ bar.style.display='none'; applyTagFilter(); return; }
+    bar.style.display='flex';
+    const lbl=document.createElement('span'); lbl.className='tag-bar-lbl'; lbl.textContent='Show:'; bar.appendChild(lbl);
+    function chip(label,on,fn,title){
+      const b=document.createElement('button'); b.className='tag-chip'+(on?' on':''); b.textContent=label;
+      if(title) b.title=title; b.addEventListener('click',fn); bar.appendChild(b);
+    }
+    chip('All',tagFilter.size===0,()=>{ tagFilter.clear(); refreshTagBar(); },'Show every lane');
+    [...all].sort((a,b)=>a.localeCompare(b)).forEach(t=>{
+      const n=state.ccLanes.filter(l=>laneTagList(l).includes(t)).length;
+      chip(t+' ('+n+')',tagFilter.has(t),()=>{ tagFilter.has(t)?tagFilter.delete(t):tagFilter.add(t); refreshTagBar(); },
+        'Toggle lanes tagged "'+t+'" — multiple tags show the union');
+    });
+    applyTagFilter();
+  }
+
   // ---------- Lanes management ----------
   function addLane(cc, ch){ return _addLane('cc', cc, ch); }
   function addPbLane(ch){ return _addLane('pb', null, ch); }
   function _addLane(type, cc, ch){ const id=state.nextId++; const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
     const ctr=0;
     const lane={id,type,cc:cc??(state.ccLanes.length?state.ccLanes[state.ccLanes.length-1].cc+1:1),ch:ch??0,color,name:'',visible:true,
-      points:[{t:0,v:ctr}],_preview:null};
-    state.ccLanes.push(lane); buildLaneDom(lane); setActiveLane(id); resizeCanvases(); return lane; }
+      tags:[...tagFilter],points:[{t:0,v:ctr}],_preview:null};
+    state.ccLanes.push(lane); buildLaneDom(lane); setActiveLane(id); resizeCanvases(); refreshTagBar(); return lane; }
   function buildLaneDom(lane){
     const row=document.createElement('div'); row.className='lane'; row.dataset.id=lane.id;
     if(lane.visible===false) row.classList.add('lane-hidden');
+    if(!laneMatchesFilter(lane)) row.classList.add('lane-filtered');
 
     // Top bar: always visible, shown only when lane is collapsed
     const topBar=document.createElement('div'); topBar.className='lane-top-bar';
@@ -1495,7 +1539,10 @@
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
     lname.placeholder=laneIsPb(lane)?'Pitch Bend':(ccName(lane.cc)||'Lane name…');
     lname.value=lane.name; lname.title=laneIsPb(lane)?'Pitch Bend (±8192, 14-bit)':ccName(lane.cc);
-    nameRow.appendChild(lname);
+    const ltags=document.createElement('input'); ltags.type='text'; ltags.className='ltags';
+    ltags.placeholder='#tags'; ltags.value=laneTagList(lane).join(' ');
+    ltags.title='Tags (space/comma separated) — filter lanes with the Show: bar above';
+    nameRow.appendChild(lname); nameRow.appendChild(ltags);
 
     // Compact row: CC#/PB + Ch + swatch + × + ▲▼
     const compRow=document.createElement('div'); compRow.className='lr compact-row';
@@ -1551,6 +1598,14 @@
       lane.name=ev.target.value;
       tbName.textContent=lane.name||(laneIsPb(lane)?'Pitch Bend':'CC'+lane.cc);
     });
+
+    // Tags
+    ltags.addEventListener('change',()=>{
+      lane.tags=ltags.value.split(/[,\s]+/).map(s=>s.trim()).filter(Boolean);
+      ltags.value=lane.tags.join(' ');
+      pushUndo(); refreshTagBar();
+    });
+    ltags.addEventListener('keydown',e=>{ if(e.key==='Enter') ltags.blur(); });
 
     // CC number
     if(!laneIsPb(lane)){
@@ -1675,7 +1730,7 @@
   function rebuildLanesDom(scrollToId){ state.ccLanes.forEach(l=>{ if(l._row) l._row.remove(); l._row=l._scroll=l._canvas=null; }); state.ccLanes.forEach(l=>buildLaneDom(l)); setActiveLane(state.activeLaneId); resizeCanvases();
     if(scrollToId){ const tgt=state.ccLanes.find(l=>l.id===scrollToId); if(tgt&&tgt._row) tgt._row.scrollIntoView({block:'nearest',behavior:'smooth'}); } }
   function removeLane(id){ const i=state.ccLanes.findIndex(l=>l.id===id); if(i<0)return; state.ccLanes[i]._row.remove(); state.ccLanes.splice(i,1);
-    if(state.activeLaneId===id) state.activeLaneId=state.ccLanes.length?state.ccLanes[0].id:null; refreshActive(); requestDraw(); }
+    if(state.activeLaneId===id) state.activeLaneId=state.ccLanes.length?state.ccLanes[0].id:null; refreshActive(); refreshTagBar(); requestDraw(); }
   function setActiveLane(id){ state.activeLaneId=id; refreshActive(); }
   function refreshActive(){
     const hasActive=state.ccLanes.some(l=>l.id===state.activeLaneId);
@@ -2957,7 +3012,7 @@
       for(const lane of state.ccLanes){
         const pts=lane.points.filter(p=>p.t>=a&&p.t<=b).map(p=>({t:p.t-a,v:p.v}));
         if(pts.length===0) continue;
-        lanes.push({type:lane.type,cc:lane.cc,ch:lane.ch,color:lane.color,name:lane.name||'',points:pts});
+        lanes.push({type:lane.type,cc:lane.cc,ch:lane.ch,color:lane.color,name:lane.name||'',tags:lane.tags||[],points:pts});
       }
       const notes=state.notes.filter(n=>n.start>=a&&n.start<b).map(n=>({...n,id:undefined,start:n.start-a}));
       if(lanes.length===0&&notes.length===0){ flash('No data in loop range to save'); return; }
@@ -2989,7 +3044,7 @@
         if(!lane){
           const id=state.nextId++;
           const color=pl.color||LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
-          lane={id,type:pl.type,cc:pl.cc,ch:pl.ch,color,name:pl.name||'',visible:true,points:[],_preview:null};
+          lane={id,type:pl.type,cc:pl.cc,ch:pl.ch,color,name:pl.name||'',visible:true,tags:pl.tags||[],points:[],_preview:null};
           state.ccLanes.push(lane); buildLaneDom(lane);
         }
         if(!merge) lane.points=lane.points.filter(p=>p.t<targetTick||p.t>targetTick+dur);
@@ -3001,6 +3056,7 @@
         for(const n of preset.notes) state.notes.push({...n,id:state.nextId++,start:targetTick+Math.round(n.start*scale)});
         state.notes.sort((a,b)=>a.start-b.start);
       }
+      refreshTagBar();
       resizeCanvases(); forceDraw();
       const barNum=Math.round(targetTick/(state.ppq*state.tsNum))+1;
       flash('Inserted "'+preset.name+'" at bar '+barNum+(merge?' (merge)':' (replace)'));
@@ -3210,6 +3266,22 @@
         +'<div style="font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;">'+escHtml(filename)+'</div>'
         +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Tick the parameters you want to import, assign CC numbers and MIDI channels, then click Import Lanes.</div>';
       dlg.appendChild(hdr);
+
+      // ── Tag row ─────────────────────────────────────────────────
+      const shaderTag=String(filename).replace(/\.[^.]+$/,'').trim().replace(/[,\s]+/g,'-');
+      const tagRow=document.createElement('div');
+      tagRow.style.cssText='padding:8px 18px;border-bottom:1px solid #2c313b;flex-shrink:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
+      const tagInfo=document.createElement('span');
+      tagInfo.style.cssText='font-size:11px;color:#7a8099;';
+      tagInfo.textContent='Imported lanes are tagged "'+shaderTag+'" for the lane filter bar.';
+      const sceneLbl=document.createElement('span');
+      sceneLbl.style.cssText='font-size:11px;color:#7a8099;margin-left:auto;';
+      sceneLbl.textContent='Scene tag (optional)';
+      const sceneInput=document.createElement('input');
+      sceneInput.type='text'; sceneInput.placeholder='e.g. scene1';
+      sceneInput.style.cssText='width:120px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:3px 6px;font-size:12px;';
+      tagRow.appendChild(tagInfo); tagRow.appendChild(sceneLbl); tagRow.appendChild(sceneInput);
+      dlg.appendChild(tagRow);
 
       // ── Table ────────────────────────────────────────────────────
       const tableWrap=document.createElement('div');
@@ -3485,13 +3557,15 @@
       importBtn.addEventListener('click',function(){
         const toImport=rowRefs.filter(function(r){ return r.importCb.checked; });
         if(!toImport.length){ flash('No rows ticked — nothing to import.'); return; }
+        const sceneTag=sceneInput.value.trim().replace(/[,\s]+/g,'-');
+        const importTags=sceneTag?[shaderTag,sceneTag]:[shaderTag];
         const historyEntry={filename:filename, label:shaderTitle, importedAt:new Date().toISOString(), lanes:[]};
         toImport.forEach(function(ref){
           const ch=(parseInt(ref.chInput.value)||1)-1;
           const cc=Math.max(0,Math.min(127,parseInt(ref.ccInput.value)||0));
           const id=state.nextId++;
           const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
-          const lane={id, type:'cc', cc, ch, color, name:ref.row.name, visible:true,
+          const lane={id, type:'cc', cc, ch, color, name:ref.row.name, visible:true, tags:[...importTags],
             points:[{t:0, v:ref.defCCVal}], _preview:null};
           state.ccLanes.push(lane);
           buildLaneDom(lane);
@@ -3501,6 +3575,7 @@
         if(!state.isfHistory) state.isfHistory=[];
         state.isfHistory.push(historyEntry);
         setActiveLane(state.activeLaneId);
+        refreshTagBar();
         resizeCanvases();
         requestDraw();
         dlg.close();

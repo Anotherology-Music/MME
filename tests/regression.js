@@ -561,6 +561,65 @@ async function run() {
     check('Pos field shows BBT position for a single selected note', posVal === '1.2.1.0', posVal);
   });
 
+  // ---------------- Lane tags / filter bar ----------------
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => window._TEST_addLane(20, 0));
+    const display = await page.evaluate(() => document.getElementById('tagFilterBar').style.display);
+    check('tag filter bar stays hidden until a lane has a tag', display === 'none', display);
+  });
+
+  await withPage(browser, async (page) => {
+    const id = await page.evaluate(() => window._TEST_addLane(21, 0));
+    await page.fill(`.lane[data-id="${id}"] input.ltags`, 'sceneA, kaleido');
+    await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'change');
+    await page.waitForTimeout(50);
+    const tags = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('lane tags parsed from comma/space separated input', JSON.stringify(tags) === JSON.stringify(['sceneA', 'kaleido']), tags);
+    const barDisplay = await page.evaluate(() => document.getElementById('tagFilterBar').style.display);
+    const chipTexts = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].map(b => b.textContent));
+    check(
+      'tag filter bar shows chips for All + each tag once a lane is tagged',
+      barDisplay === 'flex' && chipTexts.includes('All') && chipTexts.some(t => t.startsWith('sceneA')) && chipTexts.some(t => t.startsWith('kaleido')),
+      chipTexts
+    );
+  });
+
+  await withPage(browser, async (page) => {
+    const idA = await page.evaluate(() => window._TEST_addLane(22, 0));
+    const idB = await page.evaluate(() => window._TEST_addLane(23, 0));
+    await page.fill(`.lane[data-id="${idA}"] input.ltags`, 'sceneA');
+    await page.dispatchEvent(`.lane[data-id="${idA}"] input.ltags`, 'change');
+    await page.waitForTimeout(50);
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(b => b.textContent.startsWith('sceneA'));
+      chip.click();
+    });
+    await page.waitForTimeout(50);
+    const aFiltered = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-filtered'), idA);
+    const bFiltered = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-filtered'), idB);
+    const bPointsIntact = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).points.length, idB);
+    check(
+      'filtering hides non-matching lane rows visually but keeps their data (MIDI still plays)',
+      aFiltered === false && bFiltered === true && bPointsIntact > 0,
+      { aFiltered, bFiltered, bPointsIntact }
+    );
+
+    const idC = await page.evaluate(() => window._TEST_addLane(24, 0));
+    const tagsC = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, idC);
+    check('a lane created while a filter is active inherits the selected filter tags', JSON.stringify(tagsC) === JSON.stringify(['sceneA']), tagsC);
+  });
+
+  await withPage(browser, async (page) => {
+    const id = await page.evaluate(() => window._TEST_addLane(25, 0));
+    await page.fill(`.lane[data-id="${id}"] input.ltags`, 'persistTag');
+    await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'change');
+    await page.waitForTimeout(50);
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    const roundTrip = await page.evaluate((s) => { window._TEST_applyState(s); return window._TEST_state.ccLanes.map(l => l.tags); }, snap);
+    check('lane tags survive snapshot()/applyState() roundtrip', roundTrip.some(t => Array.isArray(t) && t.includes('persistTag')), roundTrip);
+  });
+
   await browser.close();
   server.close();
 
