@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.2
+  MMV MIDI & CC Curve Editor v0.7.3
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -19,6 +19,11 @@
   keeps each note on whatever channel it actually arrived on, safe under concurrent
   same-pitch notes on different channels; a note's output channel is now locked in at
   note-on, so changing Rec Ch mid-hold can no longer retroactively reassign it.
+  v0.7.3 Axis-lock modifiers: while dragging a note or CC point with the Select tool,
+  hold Ctrl to move horizontally only (time), or Alt to move vertically only
+  (pitch/value) — checked live, so the lock can be pressed or released mid-drag.
+  With the Line tool, hold Ctrl while drawing a CC ramp to force a flat/horizontal
+  line at the origin value.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -389,8 +394,8 @@
       <span class="lbl">Tool</span>
       <div class="btnrow" id="tools">
         <button data-tool="draw" title="Draw notes (single-click to add)">Draw</button>
-        <button data-tool="select" class="on" title="Select &amp; move. Shift=add to sel, Alt=erase">Select</button>
-        <button data-tool="line" title="Straight ramp (CC) / note">Line</button>
+        <button data-tool="select" class="on" title="Select &amp; move. Shift=add to sel, Alt=erase.&#10;While dragging: hold Ctrl to move horizontally only, Alt to move vertically only.">Select</button>
+        <button data-tool="line" title="Straight ramp (CC). Hold Ctrl while dragging to force a flat/horizontal line at the origin value.">Line</button>
         <button data-tool="erase" title="Erase (or hold Alt)">Erase</button>
       </div>
     </div>
@@ -1266,14 +1271,20 @@
         prDrag.group.forEach(g=>{ const gEnd=g.start+g.length; const gNewStart=clamp(g.start+delta,0,gEnd-1); g.n.start=gNewStart; g.n.length=Math.max(1,gEnd-gNewStart); });
       } else { prDrag.note.start=newStart; prDrag.note.length=Math.max(1,anchorEnd-newStart); }
       state.lastNoteLen=prDrag.note.length; }
-    else if(prDrag.mode==='move'){ const rawDt=xToTick(x)-xToTick(prDrag.startX); const dp=yToPitch(y)-yToPitch(prDrag.startY);
+    else if(prDrag.mode==='move'){ const rawDt=xToTick(x)-xToTick(prDrag.startX); let dp=yToPitch(y)-yToPitch(prDrag.startY);
       // Snap only the dragged note itself; move the rest of the group by the same
       // delta so multi-note selections keep their relative spacing instead of each
       // note re-snapping to its own nearest grid point.
       const anchor=(prDrag.group.find(g=>g.n===prDrag.note))||{start:prDrag.note.start};
-      const anchorRaw=anchor.start+rawDt;
-      const anchorSnapped=Math.max(0,e.shiftKey?Math.round(anchorRaw):snapT(anchorRaw));
-      const delta=anchorSnapped-anchor.start;
+      // Ctrl = horizontal-only (lock pitch); Alt = vertical-only (lock start tick).
+      // Checked live so the axis lock can be pressed/released mid-drag.
+      let delta=0;
+      if(!e.altKey){
+        const anchorRaw=anchor.start+rawDt;
+        const anchorSnapped=Math.max(0,e.shiftKey?Math.round(anchorRaw):snapT(anchorRaw));
+        delta=anchorSnapped-anchor.start;
+      }
+      if(e.ctrlKey) dp=0;
       prDrag.group.forEach(g=>{ g.n.start=Math.max(0,g.start+delta); g.n.pitch=clamp(g.pitch+dp,0,127); }); }
     else if(prDrag.mode==='marquee'){ prDrag.x2=x; prDrag.y2=y; }
     updateStatus(x,y); requestDraw(); });
@@ -1467,7 +1478,7 @@
       if(tool==='erase'){ const near=nearestCCPoint(lane,x,y); if(near.p&&near.d<12) removePoint(lane,near.p); ccDrag={lane,mode:'erase'}; requestDraw(); return; }
       if(tool==='line'){ const st=(state.snap==='off'||e.shiftKey)?t:snapT(t); ccDrag={lane,mode:'line',t0:st,v0:v,t1:st,v1:v}; lane._preview={t0:st,v0:v,t1:st,v1:v}; requestDraw(); return; }
       const near=nearestCCPoint(lane,x,y);
-      if(near.p&&near.d<7){ lane._activePt=near.p; ccDrag={lane,mode:'movept',pt:near.p}; updateLaneValInput(lane); return; }
+      if(near.p&&near.d<7){ lane._activePt=near.p; ccDrag={lane,mode:'movept',pt:near.p,origT:near.p.t,origV:near.p.v}; updateLaneValInput(lane); return; }
       ccDrag={lane,mode:'pencil',lastT:t,lastV:v}; upsertPoint(lane,t,v); requestDraw(); });
     cv.addEventListener('mousemove',e=>{ const {x,y}=laneCoords(lane,e); updateStatusCC(lane,x,y); });
     cv.addEventListener('dblclick',e=>{ const {x,y}=laneCoords(lane,e); const near=nearestCCPoint(lane,x,y);
@@ -1491,10 +1502,13 @@
     } else if(ccDrag.mode==='erase') eraseRange(lane,t,t);
     else if(ccDrag.mode==='marquee'){ ccDrag.x1=x; ccDrag.y1=y; }
     else if(ccDrag.mode==='movept'){
+      // Ctrl = horizontal-only (lock value); Alt = vertical-only (lock time).
+      // Checked live so the axis lock can be pressed/released mid-drag.
       const pts=lane.points, idx=pts.indexOf(ccDrag.pt);
       const lo=idx>0?pts[idx-1].t+1:0, hi=idx<pts.length-1?pts[idx+1].t-1:totalTicks();
       const snapped=(state.snap==='off'||e.shiftKey)?Math.round(t):snapT(t);
-      ccDrag.pt.t=clamp(Math.round(snapped),lo,hi); ccDrag.pt.v=clamp(Math.round(v),r.min,r.max);
+      ccDrag.pt.t=e.altKey?ccDrag.origT:clamp(Math.round(snapped),lo,hi);
+      ccDrag.pt.v=e.ctrlKey?ccDrag.origV:clamp(Math.round(v),r.min,r.max);
       updateLaneValInput(lane); }
     else if(ccDrag.mode==='movesel'){
       const snapped=(state.snap==='off'||e.shiftKey)?Math.round(t):snapT(t);
@@ -1502,8 +1516,15 @@
       ccDrag.group.forEach(g=>{ g.p.t=Math.max(0,g.t+dt); });
       lane.points.sort((a,b)=>a.t-b.t);
       document.body.style.cursor='ew-resize'; }
-    else if(ccDrag.mode==='line'){ const et=(state.snap==='off'||e.shiftKey)?t:snapT(t); ccDrag.t1=et; ccDrag.v1=v; lane._preview={t0:ccDrag.t0,v0:ccDrag.v0,t1:et,v1:v}; }
-    if(ccDrag.mode!=='erase'&&ccDrag.mode!=='marquee'&&ccDrag.mode!=='movesel'){ const liveV = ccDrag.mode==='movept' ? ccDrag.pt.v : v; sendLaneVal(lane,liveV); }
+    else if(ccDrag.mode==='line'){
+      // Ctrl forces a flat/horizontal line: the end value is held at the
+      // origin value regardless of vertical mouse position.
+      const et=(state.snap==='off'||e.shiftKey)?t:snapT(t); const ev=e.ctrlKey?ccDrag.v0:v;
+      ccDrag.t1=et; ccDrag.v1=ev; lane._preview={t0:ccDrag.t0,v0:ccDrag.v0,t1:et,v1:ev}; }
+    if(ccDrag.mode!=='erase'&&ccDrag.mode!=='marquee'&&ccDrag.mode!=='movesel'){
+      const liveV = ccDrag.mode==='movept' ? ccDrag.pt.v : (ccDrag.mode==='line' ? ccDrag.v1 : v);
+      sendLaneVal(lane,liveV);
+    }
     requestDraw(); });
   window.addEventListener('mouseup',e=>{ if(!ccDrag) return; const lane=ccDrag.lane;
     if(ccDrag.mode==='line'){ const a=Math.min(ccDrag.t0,ccDrag.t1),b=Math.max(ccDrag.t0,ccDrag.t1);

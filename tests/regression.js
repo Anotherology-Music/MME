@@ -42,6 +42,7 @@ function buildTestHtml() {
       '  window._TEST_totalTicks = () => totalTicks();',
       '  window._TEST_tickToSeconds = (t) => tickToSeconds(t);',
       '  window._TEST_fmtClockHundredths = (sec) => fmtClockHundredths(sec);',
+      '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
       '  init();',
     ].join('\n')
   );
@@ -651,6 +652,118 @@ async function run() {
     const expected = [960 + 120, 2450 + 120]; // both shift by the anchor's snap delta, relative spacing preserved
     check('dragging a multi-note selection moves the group by the anchor\'s snap delta (not per-note snapping)',
       after[0] === expected[0] && after[1] === expected[1], { after, expected });
+  });
+
+  // ---------------- Axis-lock modifiers (Ctrl/Alt while dragging) ----------------
+
+  async function dragNoteBodyXY(page, note, deltaTicks, deltaPitchSteps, modifier) {
+    const pt = await page.evaluate((note) => {
+      const rect = document.getElementById('prScroll').getBoundingClientRect();
+      const px = window._TEST_state.pxPerTick, nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
+      const tick = note.start + note.length / 2;
+      const x = tick * px - window._TEST_state.scrollLeft;
+      const y = (PITCH_MAX - note.pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
+      return { clientX: rect.left + x, clientY: rect.top + y };
+    }, note);
+    const pxPerTick = await page.evaluate(() => window._TEST_state.pxPerTick);
+    const nh = await page.evaluate(() => window._TEST_state.noteHeight);
+    await page.mouse.move(pt.clientX, pt.clientY);
+    await page.mouse.down();
+    if (modifier) await page.keyboard.down(modifier);
+    await page.mouse.move(pt.clientX + deltaTicks * pxPerTick, pt.clientY - deltaPitchSteps * nh, { steps: 5 });
+    if (modifier) await page.keyboard.up(modifier);
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+  }
+
+  await withPage(browser, async (page) => {
+    // pitch 70 sits within the piano roll's default scroll viewport (unlike,
+    // say, 64, which the earlier group-drag test never needed to click on)
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 70, start: 960, length: 480, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      return n;
+    });
+    await dragNoteBodyXY(page, note, 240, 5, 'Control'); // held during drag, not at mousedown -> starts as a normal move
+    const after = await page.evaluate((id) => window._TEST_state.notes.find(n => n.id === id), note.id);
+    check('Ctrl held mid-drag locks a note to horizontal-only (pitch unchanged)', after.pitch === 70 && after.start !== 960, after);
+  });
+
+  await withPage(browser, async (page) => {
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 70, start: 960, length: 480, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      return n;
+    });
+    await dragNoteBodyXY(page, note, 240, 5, 'Alt');
+    const after = await page.evaluate((id) => window._TEST_state.notes.find(n => n.id === id), note.id);
+    check('Alt held mid-drag locks a note to vertical-only (start tick unchanged)', after.start === 960 && after.pitch !== 70, after);
+  });
+
+  await withPage(browser, async (page) => {
+    const laneId = await page.evaluate(() => window._TEST_addLane(20, 0));
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 960, 64), laneId);
+    // A freshly-added lane can sit below the fold; scroll it into view so its
+    // canvas (not some other row) is actually under the synthetic mouse coords.
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    const start = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 64), laneId);
+    const target = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1440, 100), laneId);
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.keyboard.down('Control');
+    await page.mouse.move(target.x, target.y, { steps: 5 });
+    await page.keyboard.up('Control');
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const pt = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => p.v === 64), laneId);
+    check('Ctrl held mid-drag locks a CC point to horizontal-only (value unchanged)', pt && pt.v === 64 && pt.t !== 960, pt);
+  });
+
+  await withPage(browser, async (page) => {
+    const laneId = await page.evaluate(() => window._TEST_addLane(20, 0));
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 960, 64), laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    const start = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 64), laneId);
+    const target = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1440, 100), laneId);
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.keyboard.down('Alt');
+    await page.mouse.move(target.x, target.y, { steps: 5 });
+    await page.keyboard.up('Alt');
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const pt = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => p.t === 960), laneId);
+    check('Alt held mid-drag locks a CC point to vertical-only (time unchanged)', pt && pt.t === 960 && pt.v !== 64, pt);
+  });
+
+  await withPage(browser, async (page) => {
+    // Line tool: dragging normally ramps from the origin value to wherever the
+    // mouse ends up; holding Ctrl forces a flat/horizontal line at the origin value.
+    const laneId = await page.evaluate(() => window._TEST_addLane(21, 0));
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="line"]');
+    const start = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 480, 50), laneId);
+    const target = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 110), laneId);
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.keyboard.down('Control');
+    await page.mouse.move(target.x, target.y, { steps: 5 });
+    await page.keyboard.up('Control');
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    await page.click('[data-tool="select"]');
+    const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
+    const startPt = pts.find(p => Math.abs(p.t - 480) < 60);
+    const endPt = pts.find(p => Math.abs(p.t - 1920) < 60);
+    check('Ctrl held while drawing a Line forces a flat/horizontal line at the origin value',
+      !!startPt && !!endPt && endPt.v === startPt.v, { pts, startPt, endPt });
   });
 
   // ---------------- Quantise ----------------
