@@ -177,7 +177,7 @@ async function run() {
   // ---------------- Recording ----------------
 
   await withPage(browser, async (page) => {
-    await page.click('#setupBtn');
+    await page.click('#recordBtn', { button: 'right' });
     await page.selectOption('#recCountIn', '0');
     await page.click('#recordBtn');
     await page.waitForTimeout(100);
@@ -193,7 +193,7 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    await page.click('#setupBtn');
+    await page.click('#recordBtn', { button: 'right' });
     await page.selectOption('#recCountIn', '1');
     const bpm = await page.evaluate(() => window._TEST_state.bpm);
     const tsNum = await page.evaluate(() => window._TEST_state.tsNum);
@@ -209,7 +209,7 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    await page.click('#setupBtn');
+    await page.click('#recordBtn', { button: 'right' });
     await page.selectOption('#recCountIn', '4');
     await page.click('#recordBtn');
     await page.waitForTimeout(200);
@@ -222,7 +222,7 @@ async function run() {
   await withPage(browser, async (page) => {
     // stuck-note regression: a very short note straddling the recording boundary
     // must not get a length anywhere near the size of the whole timeline
-    await page.click('#setupBtn');
+    await page.click('#recordBtn', { button: 'right' });
     await page.selectOption('#recCountIn', '1');
     const bpm = await page.evaluate(() => window._TEST_state.bpm);
     const tsNum = await page.evaluate(() => window._TEST_state.tsNum);
@@ -240,7 +240,7 @@ async function run() {
 
   await withPage(browser, async (page) => {
     // coalesced/stale e.timeStamp must not collapse rapid successive notes together
-    await page.click('#setupBtn');
+    await page.click('#recordBtn', { button: 'right' });
     await page.selectOption('#recCountIn', '0');
     await page.click('#recordBtn');
     await page.waitForTimeout(100);
@@ -256,6 +256,121 @@ async function run() {
     await page.click('#recordBtn');
     const separated = notes.length === 3 && (notes[1] - notes[0]) > 50 && (notes[2] - notes[1]) > 50;
     check('recording ignores stale/coalesced e.timeStamp', separated, notes);
+  });
+
+  // ---------------- Recording channel UX (right-click popover) ----------------
+
+  await withPage(browser, async (page) => {
+    const info = await page.evaluate(() => ({
+      inSetup: document.getElementById('setupPanel').contains(document.getElementById('recCh')),
+      inRecPopover: document.getElementById('recPopover').contains(document.getElementById('recCh')),
+    }));
+    check('Rec Ch/Count-in/Rec Offset moved out of Setup into the record popover', !info.inSetup && info.inRecPopover, info);
+  });
+
+  await withPage(browser, async (page) => {
+    const beforeOpen = await page.evaluate(() => document.getElementById('recPopover').classList.contains('open'));
+    await page.click('#recordBtn', { button: 'right' });
+    const afterOpen = await page.evaluate(() => document.getElementById('recPopover').classList.contains('open'));
+    const recordingAfterRightClick = await page.evaluate(() => window._TEST_state.recording);
+    await page.click('#recordBtn'); // left-click still toggles record, unaffected by the popover
+    await page.waitForTimeout(50);
+    const armedOrRecording = await page.evaluate(() => window._TEST_state.recording || window._TEST_state.recArmed);
+    await page.click('#recordBtn'); // cancel
+    check('right-click opens the recording popover; left-click still toggles record',
+      !beforeOpen && afterOpen && !recordingAfterRightClick && armedOrRecording,
+      { beforeOpen, afterOpen, recordingAfterRightClick, armedOrRecording });
+  });
+
+  await withPage(browser, async (page) => {
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCh', '');
+    await page.waitForTimeout(50);
+    const info = await page.evaluate(() => ({
+      recCh: window._TEST_state.recCh,
+      badge: document.getElementById('recChBadge').textContent,
+    }));
+    check('selecting "All" in Rec Ch sets recCh to null and badges the button "All"', info.recCh === null && info.badge === 'All', info);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCh', { value: '15' });
+    await page.waitForTimeout(50);
+    const info = await page.evaluate(() => ({
+      recCh: window._TEST_state.recCh,
+      badge: document.getElementById('recChBadge').textContent,
+      warnClass: document.getElementById('recordBtn').classList.contains('ch16warn'),
+      warnRowVisible: document.getElementById('recCh16Warn').style.display !== 'none',
+    }));
+    check('selecting channel 16 badges "16" and shows the amber sync-track warning',
+      info.recCh === 15 && info.badge === '16' && info.warnClass && info.warnRowVisible, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // "All" mode: each recorded note keeps whatever channel it actually arrived
+    // on; channel 16 stays excluded (reserved for the Follow MMV sync-track)
+    // even in All mode.
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCh', '');
+    await page.selectOption('#recCountIn', '0');
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x91, 60, 100] })); // note on incoming ch 2
+    await page.waitForTimeout(60);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x81, 60, 0] }));
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x9F, 64, 100] })); // note on incoming ch 16 -> dropped
+    await page.waitForTimeout(60);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x8F, 64, 0] }));
+    await page.waitForTimeout(60);
+    const notes = await page.evaluate(() => window._TEST_state.notes.map(n => ({ pitch: n.pitch, ch: n.ch })));
+    await page.click('#recordBtn');
+    check('All mode records notes on their arriving channel; channel 16 is still dropped',
+      notes.length === 1 && notes[0].pitch === 60 && notes[0].ch === 1, notes);
+  });
+
+  await withPage(browser, async (page) => {
+    // Same pitch arriving on two different incoming channels while both are
+    // held must not let one note-off close the other's note-on (the open-note
+    // map is keyed by pitch+channel, not pitch alone).
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCh', '');
+    await page.selectOption('#recCountIn', '0');
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x90, 60, 100] })); // ch1 note-on
+    await page.waitForTimeout(80);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x91, 60, 100] })); // ch2 note-on, same pitch
+    await page.waitForTimeout(80);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x80, 60, 0] })); // ch1 note-off only
+    await page.waitForTimeout(80);
+    const midway = await page.evaluate(() => window._TEST_state.notes.length);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x81, 60, 0] })); // ch2 note-off
+    await page.waitForTimeout(80);
+    const notes = await page.evaluate(() => window._TEST_state.notes.map(n => ({ ch: n.ch, length: n.length })));
+    await page.click('#recordBtn');
+    check('All mode: same-pitch notes on different incoming channels do not cross-close each other',
+      midway === 1 && notes.length === 2 && notes.every(n => n.length > 0), { midway, notes });
+  });
+
+  await withPage(browser, async (page) => {
+    // Changing Rec Ch while a note is held must not retroactively reassign
+    // the channel of a note that's already sounding.
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCh', { value: '0' });
+    await page.selectOption('#recCountIn', '0');
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x90, 60, 100] }));
+    await page.waitForTimeout(80);
+    await page.selectOption('#recCh', { value: '4' }); // switch to channel 5 mid-hold
+    await page.waitForTimeout(50);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x80, 60, 0] }));
+    await page.waitForTimeout(80);
+    const notes = await page.evaluate(() => window._TEST_state.notes.map(n => ({ pitch: n.pitch, ch: n.ch })));
+    await page.click('#recordBtn');
+    check('changing Rec Ch mid-hold does not retroactively reassign an already-sounding note',
+      notes.length === 1 && notes[0].ch === 0, notes);
   });
 
   // ---------------- Time signature map ----------------

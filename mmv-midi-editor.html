@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.1
+  MMV MIDI & CC Curve Editor v0.7.2
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -13,6 +13,12 @@
   popover next to New Note, Export .mid matches Import .mid styling, multi-note drags
   move as a group (only the dragged note snaps), left panel starts twice as wide, and
   Note Info's Ch sits on the Pos row.
+  v0.7.2 Recording channel UX: right-click the record button for a Rec Ch / Count-in /
+  Rec Offset popover (moved out of Setup); the button badges the active channel (All,
+  1-15, or 16 in amber with a sync-track warning). Added an "All" recording mode that
+  keeps each note on whatever channel it actually arrived on, safe under concurrent
+  same-pitch notes on different channels; a note's output channel is now locked in at
+  note-on, so changing Rec Ch mid-hold can no longer retroactively reassign it.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -89,6 +95,15 @@
   button:disabled,select:disabled{opacity:.4;cursor:default;}
   .btnrow{display:flex;gap:4px;}
   .btnrow button{padding:5px 8px;}
+  /* ── Record button: channel badge + right-click popover ── */
+  #recWrapper{position:relative;display:inline-flex;}
+  #recordBtn{display:inline-flex;align-items:center;gap:3px;min-width:38px;justify-content:center;}
+  #recordBtn .recDot{font-size:12px;line-height:1;}
+  #recordBtn #recChBadge{font-size:10px;font-weight:700;line-height:1;}
+  #recordBtn.ch16warn #recChBadge{color:#ffb454;}
+  #recPopover{position:absolute;top:calc(100% + 3px);left:0;width:220px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;flex-direction:column;gap:6px;padding:9px 12px;}
+  #recPopover.open{display:flex;}
+  #recPopover .setup-row{gap:6px;}
   .dur{font-family:ui-monospace,Consolas,monospace;color:var(--txt);cursor:pointer;border:1px solid var(--line);
     border-radius:5px;padding:4px 7px;background:var(--panel2);min-width:96px;text-align:center;}
   .dur:hover{border-color:var(--accent);}
@@ -216,7 +231,33 @@
       <div class="btnrow">
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
-        <button id="recordBtn" title="Record incoming MIDI notes (R)">⏺</button>
+        <div id="recWrapper">
+          <button id="recordBtn" title="Record incoming MIDI notes (R) — right-click to change channel, count-in, offset">
+            <span class="recDot">⏺</span><span id="recChBadge">1</span>
+          </button>
+          <div id="recPopover">
+            <div class="setup-title">Recording Setup</div>
+            <div class="setup-row">
+              <span class="lbl">Rec Ch</span>
+              <select id="recCh" style="width:88px;" title="MIDI channel that recorded notes are written to. All = keep whatever channel each note arrives on."></select>
+            </div>
+            <div class="setup-row">
+              <span class="lbl">Count-in</span>
+              <select id="recCountIn" style="width:70px;" title="Bars of metronome count-in before recording starts">
+                <option value="0">Off</option>
+                <option value="1" selected>1 bar</option>
+                <option value="2">2 bars</option>
+                <option value="4">4 bars</option>
+              </select>
+            </div>
+            <div class="setup-row">
+              <span class="lbl">Rec Offset</span>
+              <input type="number" id="recOffsetMs" value="0" step="5" style="width:56px;" title="Shifts recorded note timing to compensate for MIDI/audio latency. Positive = notes recorded later (use this if notes land too early); negative = notes recorded earlier.">
+              <span class="pill">ms</span>
+            </div>
+            <div id="recCh16Warn" style="display:none;font-size:10px;color:#ffb454;">&#9888; Channel 16 is reserved for the Follow MMV sync-track — notes recorded here are silently dropped.</div>
+          </div>
+        </div>
         <button id="metroBtn" title="Metronome click during playback (C)">&#x1F514;</button>
       </div>
     </div>
@@ -287,18 +328,7 @@
             <span id="midiStatus" class="hint"></span>
           </div>
           <div class="setup-row">
-            <span class="lbl">Rec Ch</span>
-            <select id="recCh" style="width:88px;" title="MIDI channel that recorded notes are written to"></select>
-            <span class="lbl">Count-in</span>
-            <select id="recCountIn" style="width:70px;" title="Bars of metronome count-in before recording starts">
-              <option value="0">Off</option>
-              <option value="1" selected>1 bar</option>
-              <option value="2">2 bars</option>
-              <option value="4">4 bars</option>
-            </select>
-            <span class="lbl">Rec Offset</span>
-            <input type="number" id="recOffsetMs" value="0" step="5" style="width:56px;" title="Shifts recorded note timing to compensate for MIDI/audio latency. Positive = notes recorded later (use this if notes land too early); negative = notes recorded earlier.">
-            <span class="pill">ms</span>
+            <span style="font-size:11px;color:var(--txt2);">Rec Ch, Count-in and Rec Offset moved to the record button — right-click ⏺ to open them.</span>
           </div>
         </div>
         <div class="setup-section">
@@ -2573,24 +2603,36 @@
     // input latency the Rec Offset control can compensate for.
     const wallMs=performance.now()+state.recOffsetMs;
     const tick=clamp(Math.round(wallTimeToTick(wallMs)),0,totalTicks());
-    if(type===0x90 && d2>0){ recOpenNotes.set(d1,{start:tick,vel:d2,wallMs}); return; }
-    const o=recOpenNotes.get(d1); if(!o) return;
-    recOpenNotes.delete(d1);
+    // Keyed by pitch+incoming-channel (not pitch alone): in "All" mode two
+    // controllers/splits sending the same pitch on different channels must not
+    // let one's note-off close the other's note-on. The output channel is
+    // resolved once, at note-on time, and carried on the open-note record —
+    // changing Rec Ch mid-hold must not retroactively reassign a note that's
+    // already sounding.
+    const key=d1+'_'+ch;
+    if(type===0x90 && d2>0){
+      const outCh=state.recCh===null?ch:state.recCh;
+      recOpenNotes.set(key,{start:tick,vel:d2,wallMs,ch:outCh});
+      return;
+    }
+    const o=recOpenNotes.get(key); if(!o) return;
+    recOpenNotes.delete(key);
     // Length comes from elapsed wall-clock time, not (tick - o.start): subtracting
     // two independently loop-wrapped/clamped ticks can land on the same value for
     // a short note played right at the recording boundary, which used to read as
     // a zero-length note and get "corrected" by adding a full loop span — turning
     // a quick tap into a note almost as long as the whole timeline.
     const length=sched ? Math.max(1,Math.round((wallMs-o.wallMs)/sched.mpt)) : Math.max(1,tick-o.start);
-    state.notes.push({id:state.nextId++,pitch:d1,start:o.start,length,vel:o.vel,ch:state.recCh});
+    state.notes.push({id:state.nextId++,pitch:d1,start:o.start,length,vel:o.vel,ch:o.ch});
     requestDraw();
   }
   function finalizeOpenRecNotes(){
     if(!recOpenNotes.size) return;
     const nowWall=performance.now(), tick=state.playhead;
-    for(const [pitch,o] of recOpenNotes){
+    for(const [key,o] of recOpenNotes){
+      const pitch=+key.split('_')[0];
       const length=sched ? Math.max(1,Math.round((nowWall-o.wallMs)/sched.mpt)) : Math.max(1,tick-o.start);
-      state.notes.push({id:state.nextId++,pitch,start:o.start,length,vel:o.vel,ch:state.recCh});
+      state.notes.push({id:state.nextId++,pitch,start:o.start,length,vel:o.vel,ch:o.ch});
     }
     recOpenNotes.clear();
     requestDraw();
@@ -2774,16 +2816,28 @@
 
   function populateRecCh(){
     const sel=$('recCh'); if(!sel) return;
-    const cur=sel.value!==''?sel.value:String(state.recCh);
-    sel.innerHTML='';
+    const cur=sel.value!==''?sel.value:(state.recCh===null?'':String(state.recCh));
+    sel.innerHTML='<option value="">All</option>';
     for(let ch=0;ch<16;ch++){
       const name=state.channelNames[ch];
       const label=(ch+1)+(name?' ('+name+')':'');
       const op=document.createElement('option'); op.value=ch; op.textContent=label;
+      if(ch===15) op.style.color='#ffb454';
       sel.appendChild(op);
     }
     sel.value=cur;
-    state.recCh=+sel.value||0;
+    state.recCh=sel.value===''?null:+sel.value;
+    updateRecordBadge();
+  }
+  function updateRecordBadge(){
+    const badge=$('recChBadge'); if(!badge) return;
+    const isAll=state.recCh===null, isCh16=state.recCh===15;
+    badge.textContent=isAll?'All':String(state.recCh+1);
+    $('recordBtn').classList.toggle('ch16warn',isCh16);
+    const warnRow=$('recCh16Warn'); if(warnRow) warnRow.style.display=isCh16?'block':'none';
+    $('recordBtn').title=isCh16
+      ? 'Record incoming MIDI notes (R) — Channel 16 is reserved for the Follow MMV sync-track; notes recorded here are silently dropped. Right-click to change.'
+      : 'Record incoming MIDI notes (R) — recording to '+(isAll?'whatever channel each note arrives on (All)':'channel '+(state.recCh+1))+'. Right-click to change.';
   }
 
   function renderTsMapUI(){
@@ -2920,9 +2974,14 @@
   $('playBtn').onclick=togglePlay; $('stopBtn').onclick=stop;
   $('recordBtn').onclick=toggleRecord;
   $('metroBtn').onclick=toggleMetronome;
-  $('recCh').addEventListener('change',e=>{ state.recCh=+e.target.value||0; });
+  $('recCh').addEventListener('change',e=>{ state.recCh=e.target.value===''?null:+e.target.value; updateRecordBadge(); });
   $('tsMapAddBtn').addEventListener('click',addTsMapChange);
   $('recOffsetMs').addEventListener('input',e=>{ state.recOffsetMs=+e.target.value||0; });
+  $('recordBtn').addEventListener('contextmenu',e=>{
+    e.preventDefault(); e.stopPropagation();
+    const p=$('recPopover'); const open=p.classList.toggle('open');
+    if(open) populateRecCh();
+  });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
   $('midiEnable').onclick=initMidi; $('midiOut').addEventListener('change',e=>setMidiOutById(e.target.value));
@@ -4023,7 +4082,9 @@
     });
 
     document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; }
-      if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; } });
+      if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; }
+      if(!$('recWrapper').contains(e.target)){ $('recPopover').classList.remove('open'); } });
+    document.addEventListener('keydown',e=>{ if(e.key==='Escape') $('recPopover').classList.remove('open'); });
     window.addEventListener('resize',resizeCanvases); resizeCanvases();
     attachGrip($('gripVel'), $('velRow'), ()=>velCanvas, ()=>velScroll, 'down');
     (()=>{ const sp=$('prSplitter'),pr=document.querySelector('.piano-row'); let spd=null;
