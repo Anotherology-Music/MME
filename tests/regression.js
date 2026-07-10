@@ -41,6 +41,7 @@ function buildTestHtml() {
       '  window._TEST_barToTick = (b) => barToTick(b);',
       '  window._TEST_totalTicks = () => totalTicks();',
       '  window._TEST_tickToSeconds = (t) => tickToSeconds(t);',
+      '  window._TEST_fmtClockHundredths = (sec) => fmtClockHundredths(sec);',
       '  init();',
     ].join('\n')
   );
@@ -265,7 +266,7 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    await page.click('#setupBtn');
+    await page.click('#tsBtn');
     await page.fill('#tsMapBar', '3');
     await page.fill('#tsMapNum', '3');
     await page.selectOption('#tsMapDen', '4');
@@ -319,7 +320,7 @@ async function run() {
       return n;
     });
     const before = await page.evaluate((t) => ({ seconds: window._TEST_tickToSeconds(t), bbt: window._TEST_tickToBBT(t) }), note.start);
-    await page.click('#setupBtn');
+    await page.click('#tsBtn');
     await page.fill('#tsMapBar', '2');
     await page.fill('#tsMapNum', '3');
     await page.selectOption('#tsMapDen', '4');
@@ -338,12 +339,12 @@ async function run() {
     // 4/4 (4 beats, downbeat accented), then a meter change to 3/4 partway
     // through must switch to 3 beats per bar with the accent on each new
     // bar's downbeat — no drift, no leftover 4/4-shaped grouping.
-    await page.click('#setupBtn');
+    await page.click('#tsBtn');
     await page.fill('#tsMapBar', '2');
     await page.fill('#tsMapNum', '3');
     await page.selectOption('#tsMapDen', '4');
     await page.click('#tsMapAddBtn');
-    await page.click('#setupBtn');
+    await page.click('#tsBtn');
     await page.click('#metroBtn');
     await page.click('#playBtn');
     await page.waitForTimeout(150);
@@ -360,7 +361,7 @@ async function run() {
       stPlaySec: document.getElementById('stPlaySec').textContent,
       stPosSec: document.getElementById('stPosSec').textContent,
     }));
-    check('MM:SS(.t) fields exist next to Play and Cursor', initial.stPlaySec === '0:00.0' && initial.stPosSec === '0:00.0', initial);
+    check('MM:SS fields exist next to Play (hundredths) and Cursor (tenths)', initial.stPlaySec === '0:00.00' && initial.stPosSec === '0:00.0', initial);
   });
 
   await withPage(browser, async (page) => {
@@ -375,7 +376,7 @@ async function run() {
       stPlay: document.getElementById('stPlay').textContent,
       stPlaySec: document.getElementById('stPlaySec').textContent,
     }));
-    check('clicking the ruler updates Play BBT and MM:SS together', afterClick.stPlay === '3.1.1.0' && afterClick.stPlaySec === '0:04.0', afterClick);
+    check('clicking the ruler updates Play BBT and MM:SS together', afterClick.stPlay === '3.1.1.0' && afterClick.stPlaySec === '0:04.00', afterClick);
   });
 
   await withPage(browser, async (page) => {
@@ -397,12 +398,12 @@ async function run() {
     // Time-signature change indicator: the bar line at the change draws
     // thicker (accent color), and once bars are wide enough for per-bar
     // labels, the new signature is spelled out to the left of that line.
-    await page.click('#setupBtn');
+    await page.click('#tsBtn');
     await page.fill('#tsMapBar', '2');
     await page.fill('#tsMapNum', '3');
     await page.selectOption('#tsMapDen', '4');
     await page.click('#tsMapAddBtn');
-    await page.click('#setupBtn');
+    await page.click('#tsBtn');
     const draws = await page.evaluate(() => {
       const ctx = document.getElementById('rulerCanvas').getContext('2d');
       const strokeWidths = [], texts = [];
@@ -496,6 +497,47 @@ async function run() {
     check('right-edge drag keeps start, changes length (regression)', after.start === 960 && after.length > 480, after);
   });
 
+  // ---------------- Multi-note group drag ----------------
+
+  async function dragNoteBody(page, note, deltaTicks) {
+    const pt = await page.evaluate((note) => {
+      const rect = document.getElementById('prScroll').getBoundingClientRect();
+      const px = window._TEST_state.pxPerTick, nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
+      const tick = note.start + note.length / 2; // click mid-note, away from edge-resize zones
+      const x = tick * px - window._TEST_state.scrollLeft;
+      const y = (PITCH_MAX - note.pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
+      return { clientX: rect.left + x, clientY: rect.top + y };
+    }, note);
+    const pxPerTick = await page.evaluate(() => window._TEST_state.pxPerTick);
+    await page.mouse.move(pt.clientX, pt.clientY);
+    await page.mouse.down();
+    await page.mouse.move(pt.clientX + deltaTicks * pxPerTick, pt.clientY, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+  }
+
+  await withPage(browser, async (page) => {
+    // Two notes selected together, at different phases relative to the snap
+    // grid (120 ticks at the default 1/16 snap). Dragging the anchor note by
+    // a raw delta that lands off-grid must snap ONLY the anchor; the other
+    // note should move by that same resulting delta, not independently snap
+    // to its own nearest grid point (which would land it somewhere else,
+    // since it starts at a different grid phase).
+    const notes = await page.evaluate(() => {
+      const a = { id: window._TEST_state.nextId++, pitch: 70, start: 960, length: 480, vel: 100, ch: 0 };  // phase 0 mod 120
+      const b = { id: window._TEST_state.nextId++, pitch: 65, start: 2450, length: 200, vel: 100, ch: 0 }; // phase 50 mod 120
+      window._TEST_state.notes.push(a, b);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(a.id); window._TEST_state.selection.add(b.id);
+      return [a, b];
+    });
+    await dragNoteBody(page, notes[0], 90); // anchor raw target 1050 -> snaps to 1080 (delta +120)
+    const after = await page.evaluate((ids) => ids.map(id => window._TEST_state.notes.find(n => n.id === id).start), notes.map(n => n.id));
+    const expected = [960 + 120, 2450 + 120]; // both shift by the anchor's snap delta, relative spacing preserved
+    check('dragging a multi-note selection moves the group by the anchor\'s snap delta (not per-note snapping)',
+      after[0] === expected[0] && after[1] === expected[1], { after, expected });
+  });
+
   // ---------------- Quantise ----------------
 
   await withPage(browser, async (page) => {
@@ -559,6 +601,77 @@ async function run() {
     });
     const posVal = await page.inputValue('#noteInfoPos');
     check('Pos field shows BBT position for a single selected note', posVal === '1.2.1.0', posVal);
+  });
+
+  await withPage(browser, async (page) => {
+    const tops = await page.evaluate(() => {
+      const r = (id) => document.getElementById(id).getBoundingClientRect().top;
+      return { pos: r('noteInfoPos'), ch: r('noteInfoCh'), note: r('noteInfoNote') };
+    });
+    check('Note Info Ch sits on the same row as Pos (and Note)', tops.pos === tops.ch && tops.ch === tops.note, tops);
+  });
+
+  // ---------------- Toolbar / Setup panel restructuring ----------------
+
+  await withPage(browser, async (page) => {
+    const classes = await page.evaluate(() => ({
+      tool: [...document.querySelector('.tool-grp').classList],
+      snap: [...document.querySelector('.snap-grp').classList],
+    }));
+    check('Tool and Snap groups use the same blue-ring styling class as Project/New Note',
+      classes.tool.includes('tool-grp') && classes.snap.includes('snap-grp'), classes);
+  });
+
+  await withPage(browser, async (page) => {
+    const disabled = await page.evaluate(() => ({
+      out: document.getElementById('midiOut').disabled,
+      in: document.getElementById('midiIn').disabled,
+    }));
+    check('MIDI Out/In selects start disabled until MIDI is enabled', disabled.out === true && disabled.in === true, disabled);
+  });
+
+  await withPage(browser, async (page) => {
+    const exportHasOnClass = await page.evaluate(() => document.getElementById('exportBtn').classList.contains('on'));
+    check('Export .mid button no longer has the fake "on" look (matches Import .mid)', exportHasOnClass === false, exportHasOnClass);
+  });
+
+  await withPage(browser, async (page) => {
+    // Time Signature Changes now lives in its own popover next to New Note,
+    // not inside the Setup panel.
+    const inSetupPanel = await page.evaluate(() => document.getElementById('setupPanel').contains(document.getElementById('tsMapList')));
+    const inTsPanel = await page.evaluate(() => document.getElementById('tsPanel').contains(document.getElementById('tsMapList')));
+    await page.click('#tsBtn');
+    const openAfterClick = await page.evaluate(() => document.getElementById('tsPanel').classList.contains('open'));
+    check('Time Signature Changes lives in its own popover (not Setup), opened via #tsBtn',
+      !inSetupPanel && inTsPanel && openAfterClick, { inSetupPanel, inTsPanel, openAfterClick });
+  });
+
+  await withPage(browser, async (page) => {
+    // MMV Smooth moved down next to Clear All; Advanced (PPQ/CC Res) moved
+    // below Channel Names, both now trailing the Setup panel.
+    const order = await page.evaluate(() => {
+      const sections = [...document.querySelectorAll('#setupPanel .setup-section')];
+      return sections.map(s => s.querySelector('.setup-title')?.textContent || '');
+    });
+    const dangerIdx = order.indexOf('Danger zone');
+    const advancedIdx = order.indexOf('Advanced');
+    const mmvSmoothInDanger = await page.evaluate(() => {
+      const danger = [...document.querySelectorAll('#setupPanel .setup-section')].find(s => s.querySelector('.setup-title')?.textContent === 'Danger zone');
+      return !!danger && danger.contains(document.getElementById('mmvSmooth'));
+    });
+    check('MMV Smooth sits in Danger zone, and Advanced is near the bottom of Setup',
+      mmvSmoothInDanger && advancedIdx > 0 && advancedIdx < dangerIdx, { order, mmvSmoothInDanger });
+  });
+
+  await withPage(browser, async (page) => {
+    const keysW = await page.evaluate(() => window._TEST_state.keysW);
+    check('left side-panel default width is doubled (156px, was 78px)', keysW === 156, keysW);
+  });
+
+  await withPage(browser, async (page) => {
+    const sec = await page.evaluate(() => window._TEST_tickToSeconds(240)); // half a beat at 120bpm ≈ 0.25s
+    const hundredths = await page.evaluate(() => window._TEST_fmtClockHundredths(0.256));
+    check('top-row mm:ss formats to hundredths of a second', hundredths === '0:00.25', hundredths);
   });
 
   // ---------------- Lane tags / filter bar ----------------

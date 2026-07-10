@@ -1,11 +1,18 @@
+<meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.0
+  MMV MIDI & CC Curve Editor v0.7.1
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
   Lane tags + filter bar: tag lanes (free-form, e.g. shader/scene names) and filter the
   lane list by tag (OR across selected tags). Filtering is visual only — hidden lanes
   still play. ISF import auto-tags new lanes with the shader filename + optional scene tag.
+  v0.7.1 UI polish: hundredths-precision top-row clock, Tool/Snap styled like Project/New
+  Note, MIDI Out/In greyed out until enabled, Setup panel reorganized (MMV Smooth into
+  Danger Zone, Advanced moved to the bottom), Time Signature Changes is now its own
+  popover next to New Note, Export .mid matches Import .mid styling, multi-note drags
+  move as a group (only the dragged note snaps), left panel starts twice as wide, and
+  Note Info's Ch sits on the Pos row.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -14,7 +21,7 @@
     --grid:#272c35; --gridBar:#3a414f; --gridBeat:#323844;
     --txt:#d7dbe2; --txt2:#8c93a1; --accent:#4fa3ff; --accent2:#ffb454;
     --sel:#ffe08a; --white:#e9edf3; --black:#1a1d23; --play:#ff5d6c;
-    --keys-w:78px;
+    --keys-w:156px;
   }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
     font:13px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
@@ -27,8 +34,8 @@
   .toolbar-r2{background:var(--panel3);border-bottom:2px solid var(--line);padding:5px 10px;}
   .toolbar-r2 button{font-size:12px;padding:4px 8px;}
   .toolbar-r2 select,.toolbar-r2 input[type=number]{font-size:12px;padding:3px 5px;}
-  .newnote-grp,.project-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
-  .newnote-grp .lbl,.project-grp .lbl{color:var(--accent);font-size:10px;}
+  .newnote-grp,.project-grp,.tool-grp,.snap-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
+  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl{color:var(--accent);font-size:10px;}
   .view-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
   .view-grp .lbl{color:var(--accent);font-size:10px;}
   .view-grp .lbl2{color:#888;font-size:10px;}
@@ -44,11 +51,16 @@
   .setup-section button{font-size:11px;padding:3px 8px;}
   .setup-section select,.setup-section input[type=number]{font-size:11px;padding:2px 5px;}
   #setupBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
+  /* ── Time Signature dropdown ── */
+  #tsWrapper{position:relative;}
+  #tsPanel{position:absolute;top:calc(100% + 3px);left:0;width:320px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;padding:9px 14px;flex-direction:column;gap:6px;}
+  #tsPanel.open{display:flex;}
+  #tsBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
   /* ── Note Info columns (replaces velocity leftcol) ── */
   .note-info-left{padding:4px 5px!important;justify-content:flex-start!important;}
   .ni-title{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);padding-bottom:3px;white-space:nowrap;}
-  .note-info-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;width:100%;}
-  .ni-col{display:flex;flex-direction:column;align-items:center;gap:2px;}
+  .note-info-grid{display:grid;grid-template-columns:0.5fr 1fr 1fr 1fr;gap:3px;width:100%;}
+  .ni-col{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;}
   .ni-lbl{font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em;}
   .ni-input{width:100%;padding:2px 3px;font-size:10px;text-align:center;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
@@ -74,7 +86,7 @@
   button.rec-armed{background:#7a4a1f;color:#ffd9a0;border-color:#c98a3a;font-weight:600;animation:recPulse 1s step-start infinite;}
   button.rec-on{background:#ff3b3b;color:#fff;border-color:#ff3b3b;font-weight:600;}
   @keyframes recPulse{50%{opacity:.4;}}
-  button:disabled{opacity:.4;cursor:default;}
+  button:disabled,select:disabled{opacity:.4;cursor:default;}
   .btnrow{display:flex;gap:4px;}
   .btnrow button{padding:5px 8px;}
   .dur{font-family:ui-monospace,Consolas,monospace;color:var(--txt);cursor:pointer;border:1px solid var(--line);
@@ -211,7 +223,7 @@
     <div class="group">
       <span class="lbl">Play</span>
       <b id="stPlay" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt);min-width:80px;display:inline-block;">1.1.1.0</b>
-      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:52px;display:inline-block;">0:00.0</b>
+      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:58px;display:inline-block;">0:00.00</b>
     </div>
     <div class="sep"></div>
     <div class="group">
@@ -268,15 +280,11 @@
           <div class="setup-title">MIDI</div>
           <div class="setup-row">
             <span class="lbl">Out</span>
-            <select id="midiOut" style="width:160px;"><option value="">— none —</option></select>
+            <select id="midiOut" style="width:160px;" disabled title="Enable Web MIDI first"><option value="">— none —</option></select>
             <span class="lbl">In</span>
-            <select id="midiIn" style="width:130px;"><option value="">— none —</option></select>
+            <select id="midiIn" style="width:130px;" disabled title="Enable Web MIDI first"><option value="">— none —</option></select>
             <button id="midiEnable" title="Enable Web MIDI">Enable</button>
             <span id="midiStatus" class="hint"></span>
-          </div>
-          <div class="setup-row">
-            <button id="mmvSmooth" class="on" title="Trims Note Offs 10ms early — prevents dropout when notes touch. Turn off for audio-accurate MIDI.">MMV Smooth</button>
-            <span style="font-size:11px;color:var(--txt2);">Trims Note Offs 10ms early to prevent dropout on adjacent notes.</span>
           </div>
           <div class="setup-row">
             <span class="lbl">Rec Ch</span>
@@ -297,7 +305,7 @@
           <div class="setup-title">Files</div>
           <div class="setup-row">
             <button id="importBtn">Import .mid</button>
-            <button id="exportBtn" class="on">Export .mid</button>
+            <button id="exportBtn">Export .mid</button>
             <button id="syncExport" title="Export a sync-track MIDI for MMV. Re-export whenever Tempo, Bars, or Sig changes.">Export Sync Track</button>
           </div>
           <div class="setup-row">
@@ -309,6 +317,10 @@
             <button id="isfImportBtn" title="Import ISF shader parameters as CC lanes (v0.5.0)">&#x2B21; Import ISF</button>
             <input type="file" id="isfFileInput" accept=".fs,.glsl,.isf,.frag" style="display:none">
           </div>
+        </div>
+        <div class="setup-section" id="chNamesSection">
+          <div class="setup-title">Channel Names</div>
+          <div id="chNamesGrid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:4px;"></div>
         </div>
         <div class="setup-section">
           <div class="setup-title">Advanced</div>
@@ -322,26 +334,11 @@
           </div>
         </div>
         <div class="setup-section">
-          <div class="setup-title">Time Signature Changes</div>
-          <div id="tsMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
-          <div class="setup-row">
-            <span class="lbl">At bar</span><input type="number" id="tsMapBar" value="1" min="1" style="width:56px;">
-            <span class="lbl">Sig</span>
-            <input type="number" id="tsMapNum" value="4" min="1" max="32" style="width:44px;">
-            <span class="pill">/</span>
-            <select id="tsMapDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
-            <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
-          </div>
-        </div>
-        <div class="setup-section" id="chNamesSection">
-          <div class="setup-title">Channel Names</div>
-          <div id="chNamesGrid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:4px;"></div>
-        </div>
-        <div class="setup-section">
           <div class="setup-title">Danger zone</div>
           <div class="setup-row">
             <button id="clearBtn" class="warn">Clear All</button>
-            <span style="font-size:11px;color:var(--txt2);">Deletes all notes and CC curves.</span>
+            <button id="mmvSmooth" class="on" title="Trims Note Offs 10ms early — prevents dropout when notes touch. Turn off for audio-accurate MIDI.">MMV Smooth</button>
+            <span style="font-size:11px;color:var(--txt2);">Clear All deletes all notes and CC curves. MMV Smooth trims Note Offs 10ms early to prevent dropout on adjacent notes.</span>
           </div>
         </div>
       </div><!-- /setupPanel -->
@@ -358,7 +355,7 @@
       </div>
     </div>
     <div class="sep"></div>
-    <div class="group">
+    <div class="tool-grp">
       <span class="lbl">Tool</span>
       <div class="btnrow" id="tools">
         <button data-tool="draw" title="Draw notes (single-click to add)">Draw</button>
@@ -368,7 +365,7 @@
       </div>
     </div>
     <div class="sep"></div>
-    <div class="group">
+    <div class="snap-grp">
       <span class="lbl">Snap</span>
       <select id="snap">
         <option value="bar">Bar</option>
@@ -397,6 +394,23 @@
         <option value="16" selected>1/16</option><option value="16T">1/16T</option>
         <option value="32">1/32</option><option value="32T">1/32T</option>
       </select>
+    </div>
+    <div class="sep"></div>
+    <div id="tsWrapper">
+      <button id="tsBtn" title="Add, move or remove time signature changes anywhere in the project">𝄐 Time Sig ▾</button>
+      <div id="tsPanel">
+        <div class="setup-title">Time Signature Changes</div>
+        <div style="font-size:11px;color:var(--txt2);">Notes keep their real-world timing (mm:ss) — only bar/beat numbering shifts.</div>
+        <div id="tsMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
+        <div class="setup-row">
+          <span class="lbl">At bar</span><input type="number" id="tsMapBar" value="1" min="1" style="width:56px;">
+          <span class="lbl">Sig</span>
+          <input type="number" id="tsMapNum" value="4" min="1" max="32" style="width:44px;">
+          <span class="pill">/</span>
+          <select id="tsMapDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
+          <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
+        </div>
+      </div>
     </div>
   </div><!-- /toolbar-r2 -->
 
@@ -689,7 +703,7 @@
     sweepOn:false, sweepFreqStart:'1/8', sweepFreqEnd:'2 bars',
     sweepAmpLoStart:0, sweepAmpLoEnd:0, sweepAmpHiStart:30, sweepAmpHiEnd:127,
     durMode:'hms', rulerMode:'bars',
-    notes:[], ccLanes:[], nextId:1, pitchNames:{}, keysW:78, projectName:'',
+    notes:[], ccLanes:[], nextId:1, pitchNames:{}, keysW:156, projectName:'',
     channelNames:Array(16).fill(''),
     activeLaneId:null, selection:new Set(), focus:'piano',
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
@@ -803,6 +817,7 @@
   function fmtSecs(sec){ return String(Math.floor(sec)).padStart(4,'0')+':'+p2(Math.floor((sec*100)%100)); }
   function fmtClock(sec){ const s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return (h>0?h+':'+p2(m):m)+':'+p2(s); }
   function fmtClockTenths(sec){ const t=Math.floor(sec*10)%10, s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return (h>0?h+':'+p2(m):m)+':'+p2(s)+'.'+t; }
+  function fmtClockHundredths(sec){ const c=Math.floor(sec*100)%100, s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return (h>0?h+':'+p2(m):m)+':'+p2(s)+'.'+p2(c); }
   function getLoop(){ let a=state.locStart,b=state.locEnd; if(a==null||b==null||b<=a) return {a:0,b:totalTicks()}; return {a,b}; }
   function activeLane(){ return state.ccLanes.find(l=>l.id===state.activeLaneId); }
   function effTool(e){ if(e.altKey) return 'erase'; if(e.shiftKey) return 'select'; return state.tool; }
@@ -1222,7 +1237,14 @@
       } else { prDrag.note.start=newStart; prDrag.note.length=Math.max(1,anchorEnd-newStart); }
       state.lastNoteLen=prDrag.note.length; }
     else if(prDrag.mode==='move'){ const rawDt=xToTick(x)-xToTick(prDrag.startX); const dp=yToPitch(y)-yToPitch(prDrag.startY);
-      prDrag.group.forEach(g=>{ const raw=g.start+rawDt; g.n.start=Math.max(0,e.shiftKey?Math.round(raw):snapT(raw)); g.n.pitch=clamp(g.pitch+dp,0,127); }); }
+      // Snap only the dragged note itself; move the rest of the group by the same
+      // delta so multi-note selections keep their relative spacing instead of each
+      // note re-snapping to its own nearest grid point.
+      const anchor=(prDrag.group.find(g=>g.n===prDrag.note))||{start:prDrag.note.start};
+      const anchorRaw=anchor.start+rawDt;
+      const anchorSnapped=Math.max(0,e.shiftKey?Math.round(anchorRaw):snapT(anchorRaw));
+      const delta=anchorSnapped-anchor.start;
+      prDrag.group.forEach(g=>{ g.n.start=Math.max(0,g.start+delta); g.n.pitch=clamp(g.pitch+dp,0,127); }); }
     else if(prDrag.mode==='marquee'){ prDrag.x2=x; prDrag.y2=y; }
     updateStatus(x,y); requestDraw(); });
   window.addEventListener('mouseup',()=>{ if(!prDrag) return;
@@ -2389,6 +2411,7 @@
         populateOuts(); populateIns();
         if(p.type==='output' && p.state==='connected' && p.id===lastMidiOutId) setMidiOutById(p.id);
       };
+      $('midiOut').disabled=false; $('midiIn').disabled=false;
       populateOuts(); populateIns();
       const count=midiAccess.outputs.size;
       setMidiStatus(count?count+' output'+(count>1?'s':'')+' found — select one above':'MIDI access granted but no outputs detected');
@@ -2731,7 +2754,7 @@
     const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
   }
   function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn); }
-  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockTenths(tickToSeconds(state.playhead)); }
+  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockHundredths(tickToSeconds(state.playhead)); }
   function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
 
@@ -3616,7 +3639,8 @@
   function init(){
     schedWorker=makeWorker();
     // Setup panel toggle
-    $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; if(open) renderTsMapUI(); });
+    $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
+    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open) renderTsMapUI(); });
     // ── Advanced Generate panel ──
     (()=>{
       const btn=$('genAdvBtn'), panel=$('genAdvPanel');
@@ -3998,7 +4022,8 @@
       el.addEventListener('input',e=>{ state[key]=clamp(+e.target.value||0,0,127); drawAbPreview(); });
     });
 
-    document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; } });
+    document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; }
+      if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; } });
     window.addEventListener('resize',resizeCanvases); resizeCanvases();
     attachGrip($('gripVel'), $('velRow'), ()=>velCanvas, ()=>velScroll, 'down');
     (()=>{ const sp=$('prSplitter'),pr=document.querySelector('.piano-row'); let spd=null;
