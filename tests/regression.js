@@ -43,6 +43,8 @@ function buildTestHtml() {
       '  window._TEST_tickToSeconds = (t) => tickToSeconds(t);',
       '  window._TEST_fmtClockHundredths = (sec) => fmtClockHundredths(sec);',
       '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
+      '  window._TEST_pushUndo = pushUndo;',
+      '  window._TEST_undo = undo;',
       '  init();',
     ].join('\n')
   );
@@ -900,6 +902,145 @@ async function run() {
     const sec = await page.evaluate(() => window._TEST_tickToSeconds(240)); // half a beat at 120bpm ≈ 0.25s
     const hundredths = await page.evaluate(() => window._TEST_fmtClockHundredths(0.256));
     check('top-row mm:ss formats to hundredths of a second', hundredths === '0:00.25', hundredths);
+  });
+
+  // ---------------- Editor UX fixes ----------------
+
+  await withPage(browser, async (page) => {
+    // Alt+wheel (or grip-drag) resized row height must survive undo — undo
+    // should only revert data, not the view.
+    await page.evaluate(() => {
+      const l = window._TEST_state.ccLanes[0];
+      l._row.style.height = '400px'; l._row.style.flex = '0 0 auto';
+    });
+    const before = await page.evaluate(() => window._TEST_state.ccLanes[0]._row.style.height);
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.evaluate(() => window._TEST_pushUndo());
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 500, 90), laneId);
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_state.ccLanes[0]._row.style.height);
+    check('undo preserves a lane\'s zoomed/resized row height instead of resetting it',
+      before === '400px' && after === '400px', { before, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // Multi-selecting CC points that share a value should show that value,
+    // not blank — only genuinely differing values should blank the field.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.evaluate((laneId) => { window._TEST_upsertPoint(laneId, 960, 77); window._TEST_upsertPoint(laneId, 1920, 77); }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    const p1 = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 77), laneId);
+    const p2 = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 77), laneId);
+    await page.mouse.move(p1.x - 20, p1.y - 20);
+    await page.mouse.down();
+    await page.mouse.move(p2.x + 20, p2.y + 20, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const sameVal = await page.evaluate(() => window._TEST_state.ccLanes[0]._valInput.value);
+    check('multi-selecting CC points with the same value shows that shared value',
+      sameVal === '77', sameVal);
+
+    // now nudge one point's value so they differ, re-select, expect blank
+    await page.evaluate((laneId) => { const l = window._TEST_state.ccLanes.find(x => x.id === laneId); l.points.find(p => p.t === 1920).v = 90; }, laneId);
+    await page.mouse.move(p1.x - 20, p1.y - 20);
+    await page.mouse.down();
+    await page.mouse.move(p2.x + 20, p2.y + 20, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const diffVal = await page.evaluate(() => window._TEST_state.ccLanes[0]._valInput.value);
+    check('multi-selecting CC points with different values shows blank', diffVal === '', diffVal);
+  });
+
+  await withPage(browser, async (page) => {
+    // Name/CC/Val/Pos controls should stay centered in whatever part of a
+    // very tall (Alt+wheel-zoomed) lane is scrolled into view.
+    await page.evaluate(() => {
+      const l = window._TEST_state.ccLanes[0];
+      l._row.style.height = '1500px'; l._row.style.flex = '0 0 auto';
+      window.dispatchEvent(new Event('resize'));
+    });
+    await page.waitForTimeout(100);
+    const before = await page.evaluate(() => {
+      const lanesEl = document.querySelector('.lanes');
+      const inner = document.querySelector('.leftcol-inner');
+      const r = inner.getBoundingClientRect(), lr = lanesEl.getBoundingClientRect();
+      return { innerCenter: (r.top + r.bottom) / 2, viewportCenter: (lr.top + lr.bottom) / 2 };
+    });
+    await page.evaluate(() => { document.querySelector('.lanes').scrollTop = 700; });
+    await page.waitForTimeout(100);
+    const after = await page.evaluate(() => {
+      const lanesEl = document.querySelector('.lanes');
+      const inner = document.querySelector('.leftcol-inner');
+      const r = inner.getBoundingClientRect(), lr = lanesEl.getBoundingClientRect();
+      return { innerCenter: (r.top + r.bottom) / 2, viewportCenter: (lr.top + lr.bottom) / 2 };
+    });
+    check('a tall lane\'s left-column controls stay centered in the visible viewport while scrolling',
+      Math.abs(before.innerCenter - before.viewportCenter) < 2 && Math.abs(after.innerCenter - after.viewportCenter) < 2,
+      { before, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // Left/Right arrow steps a single selected CC point to the previous/next
+    // point on the same lane.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.evaluate((laneId) => {
+      window._TEST_upsertPoint(laneId, 480, 30);
+      window._TEST_upsertPoint(laneId, 960, 60);
+      window._TEST_upsertPoint(laneId, 1440, 90);
+    }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    const p = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 60), laneId);
+    await page.mouse.click(p.x, p.y);
+    await page.waitForTimeout(50);
+    await page.keyboard.press('ArrowRight');
+    await page.waitForTimeout(30);
+    const afterRight = await page.evaluate(() => window._TEST_state.ccLanes[0]._activePt.t);
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(30);
+    const afterLeft = await page.evaluate(() => window._TEST_state.ccLanes[0]._activePt.t);
+    check('Left/Right arrow steps the selected CC point to the previous/next point on the lane',
+      afterRight === 1440 && afterLeft === 480, { afterRight, afterLeft });
+  });
+
+  await withPage(browser, async (page) => {
+    // Left/Right arrow steps a single selected note to the previous/next
+    // note in time.
+    await page.evaluate(() => {
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 70, start: 480, length: 240, vel: 100, ch: 0 });
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 71, start: 960, length: 240, vel: 100, ch: 0 });
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 72, start: 1440, length: 240, vel: 100, ch: 0 });
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(window._TEST_state.notes.find(n => n.start === 960).id);
+      window._TEST_state.focus = 'piano';
+      window._TEST_updateNoteInfo();
+    });
+    await page.locator('body').click({ position: { x: 5, y: 5 } });
+    await page.keyboard.press('ArrowRight');
+    await page.waitForTimeout(30);
+    const afterRight = await page.evaluate(() => window._TEST_state.notes.find(n => window._TEST_state.selection.has(n.id)).start);
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(30);
+    const afterLeft = await page.evaluate(() => window._TEST_state.notes.find(n => window._TEST_state.selection.has(n.id)).start);
+    check('Left/Right arrow steps the selected note to the previous/next note in time',
+      afterRight === 1440 && afterLeft === 480, { afterRight, afterLeft });
+  });
+
+  await withPage(browser, async (page) => {
+    // D/S/E/L keyboard shortcuts switch tools.
+    await page.locator('body').click({ position: { x: 5, y: 5 } });
+    const results = {};
+    for (const [key, tool] of [['d', 'draw'], ['e', 'erase'], ['l', 'line'], ['s', 'select']]) {
+      await page.keyboard.press(key);
+      await page.waitForTimeout(20);
+      results[key] = await page.evaluate(() => window._TEST_state.tool);
+    }
+    check('D/S/E/L keyboard shortcuts switch Draw/Select/Erase/Line tools',
+      results.d === 'draw' && results.e === 'erase' && results.l === 'line' && results.s === 'select', results);
   });
 
   // ---------------- Lane tags / filter bar ----------------

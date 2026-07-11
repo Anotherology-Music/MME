@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.3
+  MMV MIDI & CC Curve Editor v0.7.4
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -24,6 +24,13 @@
   (pitch/value) — checked live, so the lock can be pressed or released mid-drag.
   With the Line tool, hold Ctrl while drawing a CC ramp to force a flat/horizontal
   line at the origin value.
+  v0.7.4 Editor UX fixes: undo/redo no longer resets a lane's Alt+wheel-zoomed row
+  height (view is preserved, only data changes). Left/Right arrow steps a single
+  selected note or CC point to the previous/next one. A tall lane's name/CC/val/pos
+  controls now stay centered in whatever part of the lane is scrolled into view,
+  instead of scrolling away with the top of the row. Multi-selecting CC points that
+  share a value now shows that value (blank only when they actually differ). Added
+  D/S/E/L keyboard shortcuts for Draw/Select/Erase/Line tools.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -169,7 +176,18 @@
   .lane-top-bar .tb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--txt2);}
 
   /* Lane leftcol — name row on top (last to hide), compact row below */
-  .lane .leftcol{font-size:11px;justify-content:flex-start;overflow:hidden;}
+  /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
+     overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
+     which *still* creates a scroll container). Any non-"visible" overflow-y
+     would make this element its own sticky containing block, trapping
+     .leftcol-inner's centering to the (mostly offscreen) full row height
+     instead of letting it stick relative to .lanes, the true scrolling
+     ancestor. Content here doesn't need horizontal clipping in practice. */
+  .lane .leftcol{font-size:11px;justify-content:flex-start;overflow:visible;}
+  /* Keeps the name/CC/val/pos controls vertically centered in whatever part of
+     a tall (Alt+wheel-zoomed) lane is currently scrolled into view, instead of
+     scrolling away with the top of the row. */
+  .leftcol-inner{position:sticky;top:50%;transform:translateY(-50%);}
   .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
   .lane .leftcol .name-row{padding:3px 0 1px;}
   .lane .leftcol .name-row input{flex:1;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
@@ -393,10 +411,10 @@
     <div class="tool-grp">
       <span class="lbl">Tool</span>
       <div class="btnrow" id="tools">
-        <button data-tool="draw" title="Draw notes (single-click to add)">Draw</button>
-        <button data-tool="select" class="on" title="Select &amp; move. Shift=add to sel, Alt=erase.&#10;While dragging: hold Ctrl to move horizontally only, Alt to move vertically only.">Select</button>
-        <button data-tool="line" title="Straight ramp (CC). Hold Ctrl while dragging to force a flat/horizontal line at the origin value.">Line</button>
-        <button data-tool="erase" title="Erase (or hold Alt)">Erase</button>
+        <button data-tool="draw" title="Draw notes (single-click to add) (D)">Draw</button>
+        <button data-tool="select" class="on" title="Select &amp; move (S). Shift=add to sel, Alt=erase.&#10;While dragging: hold Ctrl to move horizontally only, Alt to move vertically only.&#10;With a single note/point selected: ←/→ steps to the previous/next one.">Select</button>
+        <button data-tool="line" title="Straight ramp (CC) (L). Hold Ctrl while dragging to force a flat/horizontal line at the origin value.">Line</button>
+        <button data-tool="erase" title="Erase (E) (or hold Alt)">Erase</button>
       </div>
     </div>
     <div class="sep"></div>
@@ -955,10 +973,17 @@
     // Rebuild channel name inputs if they exist
     const _grid=$('chNamesGrid');
     if(_grid){ _grid.querySelectorAll('input[type=text]').forEach((inp,i)=>{ inp.value=state.channelNames[i]||''; }); }
-    state.ccLanes.forEach(l=>l._row&&l._row.remove()); state.ccLanes=[];
-    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane); });
+    // Preserve each lane's zoomed/resized row height (Alt+wheel or grip-drag)
+    // across the DOM rebuild below — undo/redo should only change data, not
+    // the view. Rows are keyed by lane id, which stays stable across undo.
+    const savedHeightById=new Map();
+    const prevActiveId=state.activeLaneId;
+    state.ccLanes.forEach(l=>{ if(l._row){ if(l._row.style.height) savedHeightById.set(l.id,l._row.style.height); l._row.remove(); } });
+    state.ccLanes=[];
+    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
+      const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; } });
     refreshTagBar();
-    state.activeLaneId=state.ccLanes.length?state.ccLanes[0].id:null; refreshActive();
+    state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
     state.selection.clear(); syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
   function undo(){ if(!undoStack.length) return; redoStack.push(snapshot()); applyState(undoStack.pop()); updateUndoBtns(); }
   function redo(){ if(!redoStack.length) return; undoStack.push(snapshot()); applyState(redoStack.pop()); updateUndoBtns(); }
@@ -1449,6 +1474,15 @@
   function clearCcSel(lane){ if(typeof window._clearAdvPreview==='function') window._clearAdvPreview(lane); ccSel.clear(); }
   function updateLaneValInput(lane){
     if(!lane._valInput) return;
+    if(ccSel.size>1){
+      // Multiple points selected (e.g. via marquee): show their common value
+      // if they all agree, blank only when they actually differ. Position has
+      // no single common answer for a multi-point selection, so stays blank.
+      const vals=[...ccSel].map(p=>Math.round(p.v));
+      lane._valInput.value=vals.every(v=>v===vals[0])?vals[0]:'';
+      if(lane._posInput) lane._posInput.value='';
+      return;
+    }
     const pt=lane._activePt;
     const valid=pt&&lane.points.indexOf(pt)>=0;
     lane._valInput.value=valid?Math.round(pt.v):'';
@@ -1531,7 +1565,8 @@
       lane.points=lane.points.filter(p=>p.t<a-1||p.t>b+1); upsertPoint(lane,ccDrag.t0,ccDrag.v0); upsertPoint(lane,ccDrag.t1,ccDrag.v1); }
     else if(ccDrag.mode==='marquee'){ const lx=Math.min(ccDrag.x0,ccDrag.x1),rx=Math.max(ccDrag.x0,ccDrag.x1);
       const ly=Math.min(ccDrag.y0,ccDrag.y1),ry=Math.max(ccDrag.y0,ccDrag.y1); const h=lane._canvas.height;
-      lane.points.forEach(p=>{ if(p.t>=xToTick(lx)&&p.t<=xToTick(rx)){ const py=val2yForLane(h,p.v,lane); if(py>=ly&&py<=ry) ccSel.add(p); } }); }
+      lane.points.forEach(p=>{ if(p.t>=xToTick(lx)&&p.t<=xToTick(rx)){ const py=val2yForLane(h,p.v,lane); if(py>=ly&&py<=ry) ccSel.add(p); } });
+      updateLaneValInput(lane); }
     else if(ccDrag.mode==='movesel'){
       // cancel if mouse released outside any CC lane canvas
       const el=document.elementFromPoint(e.clientX,e.clientY);
@@ -1650,7 +1685,13 @@
     posInput.placeholder='—'; posInput.title='Position (Bar.Beat.16th.Tick)\nScroll or ↑↓ = ±1 tick\nShift = ±1/16th\nCtrl = ±1 beat\nAlt = ±1 bar\nType B.B.S.T and press Enter';
     valRow.appendChild(valLbl); valRow.appendChild(valInput); valRow.appendChild(posLbl); valRow.appendChild(posInput);
 
-    left.appendChild(nameRow); left.appendChild(compRow); left.appendChild(valRow);
+    // Wrapped so it can be sticky-centered within the lane row: when a lane is
+    // resized very tall (Alt+wheel), the row can exceed the viewport, and
+    // without this the name/CC/val/pos controls (naturally at the row's top)
+    // scroll out of view while the lane's curve is still on screen.
+    const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
+    leftInner.appendChild(nameRow); leftInner.appendChild(compRow); leftInner.appendChild(valRow);
+    left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._activePt=null;
 
     const sc=document.createElement('div'); sc.className='scroll hx';
@@ -2900,7 +2941,8 @@
 
   // ---------- Inputs ----------
   function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; renderTsMapUI(); }
-  $('tools').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; state.tool=b.dataset.tool; [...$('tools').children].forEach(x=>x.classList.toggle('on',x===b)); });
+  function setTool(t){ state.tool=t; [...$('tools').children].forEach(x=>x.classList.toggle('on',x.dataset.tool===t)); }
+  $('tools').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; setTool(b.dataset.tool); });
   $('snap').addEventListener('change',e=>{ state.snap=e.target.value; requestDraw(); });
   $('quantStartBtn').addEventListener('click',e=>{ quantizeSelection('start', state.quantIterative||e.altKey); });
   $('quantEndBtn').addEventListener('click',e=>{ quantizeSelection('end', state.quantIterative||e.altKey); });
@@ -3020,6 +3062,41 @@
     if(!ctrl && e.key.toLowerCase()==='r'){ e.preventDefault(); toggleRecord(); return; }
     if(!ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); toggleMetronome(); return; }
     if(!ctrl && e.key.toLowerCase()==='q'){ e.preventDefault(); quantizeSelection(e.shiftKey?'end':'start', state.quantIterative||e.altKey); return; }
+    if(!ctrl && e.key.toLowerCase()==='d'){ e.preventDefault(); setTool('draw'); return; }
+    if(!ctrl && e.key.toLowerCase()==='s'){ e.preventDefault(); setTool('select'); return; }
+    if(!ctrl && e.key.toLowerCase()==='e'){ e.preventDefault(); setTool('erase'); return; }
+    if(!ctrl && e.key.toLowerCase()==='l'){ e.preventDefault(); setTool('line'); return; }
+    if(!ctrl && (e.key==='ArrowLeft'||e.key==='ArrowRight')){
+      // Step the current single-point/note selection to the previous or next
+      // one in time, on whichever pane (CC lane or piano roll) last had focus.
+      const dir=e.key==='ArrowLeft'?-1:1;
+      if(state.focus==='cc'){
+        const lane=activeLane();
+        if(lane&&lane._activePt&&ccSel.size<=1){
+          const pts=lane.points, idx=pts.indexOf(lane._activePt), nextIdx=idx+dir;
+          if(idx>=0&&nextIdx>=0&&nextIdx<pts.length){
+            e.preventDefault();
+            const p=pts[nextIdx];
+            clearCcSel(lane); ccSel.add(p); lane._activePt=p;
+            updateLaneValInput(lane); sendLaneVal(lane,p.v); requestDraw();
+          }
+        }
+        return;
+      }
+      if(state.focus==='piano'&&state.selection.size===1){
+        const curId=[...state.selection][0], cur=byId(curId);
+        if(cur){
+          const seq=state.notes.filter(n=>state.viewCh===null||n.ch===state.viewCh).sort((a,b)=>a.start-b.start||a.pitch-b.pitch);
+          const idx=seq.findIndex(n=>n.id===curId), nextIdx=idx+dir;
+          if(idx>=0&&nextIdx>=0&&nextIdx<seq.length){
+            e.preventDefault();
+            state.selection.clear(); state.selection.add(seq[nextIdx].id);
+            updateNoteInfo(); requestDraw();
+          }
+        }
+        return;
+      }
+    }
     if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
       else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); }
