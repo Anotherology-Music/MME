@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.5
+  MMV MIDI & CC Curve Editor v0.7.6
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -39,6 +39,16 @@
   be squeezed out or spill outside the lane; the value/position row hides outright
   once it no longer fits, instead of clipping mid-row. Minimizing a lane now shows
   its custom name plus CC#/PB and channel in the collapsed bar, not just the name.
+  v0.7.6 Steps (snap-to-value) for CC/PB lanes: set a lane's Stp count and new or
+  dragged points snap to one of N evenly-spaced values across the lane's own range
+  (e.g. Stp=12 on a CC lane snaps to 0,12,23,...,127; Stp=2 gives on/off at 0/127).
+  Shift-drag bypasses the snap for one edit. The active point's val row shows a
+  "step X/N" badge. Steps is capped at the lane's own value range (128 for CC,
+  16384 for pitch-bend) so a typo can't create a meaningless or oversized grid.
+  ISF import auto-sets Steps from the shader parameter (enum VALUES length,
+  bool -> 2, integer range -> range size); plain float params leave Steps off.
+  Steps is editor-only metadata carried in .mmvp project saves — exported .mid
+  files are unaffected and always contain plain 0-127 CC data.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -236,10 +246,14 @@
   .lane.drag-over-top{border-top:2px solid var(--accent);}
   .lane.drag-over-bot{border-bottom:2px solid var(--accent);}
 
-  .lane .leftcol .val-row{gap:3px;padding-top:2px;padding-bottom:1px;}
+  .lane .leftcol .val-row{gap:2px;padding-top:2px;padding-bottom:1px;}
   .lane .leftcol .val-row span{font-size:10px;color:var(--txt2);flex-shrink:0;}
+  .lane .leftcol .val-row .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34px;}
   .lane .leftcol .val-input{flex:1;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
   .lane .leftcol .pos-input{flex:1;min-width:0;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .val-row .stepsn{flex:0 0 24px;width:24px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
+  .lane .leftcol .val-row .stepsn::-webkit-outer-spin-button,
+  .lane .leftcol .val-row .stepsn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   .add-row{flex:0 0 auto;border-top:1px solid var(--line);display:flex;min-height:0;}
   .add-row .leftcol{flex-direction:column!important;justify-content:center!important;gap:4px!important;overflow:visible!important;}
   .add-row .leftcol button{font-size:11px;padding:3px 5px;}
@@ -971,7 +985,7 @@
   // ---------- Undo / Redo ----------
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
-    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],points:l.points})),
+    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,points:l.points})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     isfHistory:state.isfHistory||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
@@ -1016,7 +1030,7 @@
     const prevActiveId=state.activeLaneId;
     state.ccLanes.forEach(l=>{ if(l._row){ if(l._row.style.height) savedHeightById.set(l.id,l._row.style.height); l._row.remove(); } });
     state.ccLanes=[];
-    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
+    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
       const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; updateLaneCompactness(lane._row); } });
     refreshTagBar();
     state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
@@ -1498,7 +1512,21 @@
   })();
 
   // ---------- CC lanes ----------
-  function upsertPoint(lane,t,v){ const r=laneRange(lane); t=Math.round(clamp(t,0,totalTicks())); v=clamp(Math.round(v),r.min,r.max);
+  // Snap a value to one of `steps` evenly-spaced levels across [r.min,r.max]
+  // inclusive (steps=2 -> min,max only; steps<=1 -> off, value unchanged).
+  // Capped to the range's own span (max-min+1): a CC lane only has 128
+  // distinct integers to snap to, a pitch-bend lane 16384 — asking for more
+  // "steps" than that just produces duplicate levels, so it's a hard,
+  // meaningful ceiling rather than an arbitrary one.
+  function snapToSteps(v,r,steps){
+    if(!steps||steps<2) return v;
+    const n=Math.min(Math.round(steps),r.max-r.min+1);
+    if(n<2) return v;
+    const i=Math.round((v-r.min)/(r.max-r.min)*(n-1));
+    return r.min+i*(r.max-r.min)/(n-1);
+  }
+  function upsertPoint(lane,t,v){ const r=laneRange(lane); t=Math.round(clamp(t,0,totalTicks()));
+    v=clamp(Math.round(snapToSteps(v,r,lane.steps)),r.min,r.max);
     const win=Math.max(1,Math.round(state.ppq/state.ccRes/2)); lane.points=lane.points.filter(p=>Math.abs(p.t-t)>win);
     lane.points.push({t,v}); lane.points.sort((a,b)=>a.t-b.t); }
   function eraseRange(lane,a,b){ const lo=Math.min(a,b)-xToTick(6),hi=Math.max(a,b)+xToTick(6); lane.points=lane.points.filter(p=>p.t<lo||p.t>hi); }
@@ -1508,6 +1536,15 @@
   function removePoint(lane,p){ const i=lane.points.indexOf(p); if(i>=0) lane.points.splice(i,1); }
   let ccDrag=null, ccSel=new Set();
   function clearCcSel(lane){ if(typeof window._clearAdvPreview==='function') window._clearAdvPreview(lane); ccSel.clear(); }
+  // "step 11/12" — which of the lane's Steps levels a value lands on. Empty
+  // string when Steps is off, so callers can just check truthiness.
+  function stepIndexLabel(lane,v){
+    if(!lane.steps||lane.steps<2) return '';
+    const r=laneRange(lane), n=Math.min(Math.round(lane.steps),r.max-r.min+1);
+    if(n<2) return '';
+    const i=Math.round((v-r.min)/(r.max-r.min)*(n-1));
+    return (i+1)+'/'+n;
+  }
   function updateLaneValInput(lane){
     if(!lane._valInput) return;
     if(ccSel.size>1){
@@ -1517,12 +1554,18 @@
       const vals=[...ccSel].map(p=>Math.round(p.v));
       lane._valInput.value=vals.every(v=>v===vals[0])?vals[0]:'';
       if(lane._posInput) lane._posInput.value='';
+      if(lane._stepBadge) lane._stepBadge.style.display='none';
       return;
     }
     const pt=lane._activePt;
     const valid=pt&&lane.points.indexOf(pt)>=0;
     lane._valInput.value=valid?Math.round(pt.v):'';
     if(lane._posInput) lane._posInput.value=valid?tickToBBT(pt.t):'';
+    if(lane._stepBadge){
+      const label=valid?stepIndexLabel(lane,pt.v):'';
+      lane._stepBadge.textContent=label?('step '+label):'';
+      lane._stepBadge.style.display=label?'':'none';
+    }
   }
   function bindLane(lane){ const cv=lane._canvas;
     cv.addEventListener('mousedown',e=>{ setActiveLane(lane.id); state.focus='cc'; armUndo();
@@ -1574,11 +1617,13 @@
     else if(ccDrag.mode==='movept'){
       // Ctrl = horizontal-only (lock value); Alt = vertical-only (lock time).
       // Checked live so the axis lock can be pressed/released mid-drag.
+      // Shift bypasses both the time grid and value-steps snapping, same
+      // convention as everywhere else in the app.
       const pts=lane.points, idx=pts.indexOf(ccDrag.pt);
       const lo=idx>0?pts[idx-1].t+1:0, hi=idx<pts.length-1?pts[idx+1].t-1:totalTicks();
       const snapped=(state.snap==='off'||e.shiftKey)?Math.round(t):snapT(t);
       ccDrag.pt.t=e.altKey?ccDrag.origT:clamp(Math.round(snapped),lo,hi);
-      ccDrag.pt.v=e.ctrlKey?ccDrag.origV:clamp(Math.round(v),r.min,r.max);
+      ccDrag.pt.v=e.ctrlKey?ccDrag.origV:clamp(Math.round(e.shiftKey?v:snapToSteps(v,r,lane.steps)),r.min,r.max);
       updateLaneValInput(lane); }
     else if(ccDrag.mode==='movesel'){
       const snapped=(state.snap==='off'||e.shiftKey)?Math.round(t):snapT(t);
@@ -1659,7 +1704,7 @@
   function _addLane(type, cc, ch){ const id=state.nextId++; const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
     const ctr=0;
     const lane={id,type,cc:cc??(state.ccLanes.length?state.ccLanes[state.ccLanes.length-1].cc+1:1),ch:ch??0,color,name:'',visible:true,
-      tags:[...tagFilter],points:[{t:0,v:ctr}],_preview:null};
+      tags:[...tagFilter],steps:0,points:[{t:0,v:ctr}],_preview:null};
     state.ccLanes.push(lane); buildLaneDom(lane); setActiveLane(id); resizeCanvases(); refreshTagBar(); return lane; }
   function buildLaneDom(lane){
     const row=document.createElement('div'); row.className='lane'; row.dataset.id=lane.id;
@@ -1715,16 +1760,27 @@
     compRow.appendChild(chLbl); compRow.appendChild(chn); compRow.appendChild(swatch); compRow.appendChild(xBtn);
     compRow.appendChild(bUp); compRow.appendChild(bDn); compRow.appendChild(hideBtn); compRow.appendChild(dragHandle);
 
-    // Val + Pos on one row — saves vertical space when many lanes are open
+    // Val + Pos (+ Steps) on one row — saves vertical space when many lanes
+    // are open. Steps lives here rather than compact-row: that row's icons
+    // already overflow the fixed 156px column (a separate, pre-existing
+    // issue), and unlike those icons this input is the primary way to set
+    // a brand-new feature, so it needs to actually be usable.
     const valRow=document.createElement('div'); valRow.className='lr val-row';
     const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'Val';
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input'; valInput.style.cssText='width:46px;min-width:46px;flex:0 0 46px;';
     const rng=laneRange(lane); valInput.min=rng.min; valInput.max=rng.max; valInput.placeholder='—';
     valInput.title='Value of selected point\nScroll/↑↓=±1  Shift=±5  Ctrl=±10\nAlt+scroll=snap to % steps';
-    const posLbl=document.createElement('span'); posLbl.textContent='Pos'; posLbl.style.marginLeft='3px';
+    // Read-only "step X/N" badge — only shown when Steps is on, so it costs
+    // nothing for lanes not using the feature.
+    const stepBadge=document.createElement('span'); stepBadge.className='step-badge'; stepBadge.style.display='none';
+    const posLbl=document.createElement('span'); posLbl.textContent='Pos';
     const posInput=document.createElement('input'); posInput.type='text'; posInput.className='pos-input';
     posInput.placeholder='—'; posInput.title='Position (Bar.Beat.16th.Tick)\nScroll or ↑↓ = ±1 tick\nShift = ±1/16th\nCtrl = ±1 beat\nAlt = ±1 bar\nType B.B.S.T and press Enter';
-    valRow.appendChild(valLbl); valRow.appendChild(valInput); valRow.appendChild(posLbl); valRow.appendChild(posInput);
+    const stpLbl=document.createElement('span'); stpLbl.textContent='Stp'; stpLbl.style.flexShrink='0';
+    const stepsInput=document.createElement('input'); stepsInput.type='number'; stepsInput.className='stepsn'; stepsInput.min=0;
+    stepsInput.value=lane.steps||0; stepsInput.placeholder='0';
+    valRow.appendChild(valLbl); valRow.appendChild(valInput); valRow.appendChild(stepBadge); valRow.appendChild(posLbl); valRow.appendChild(posInput);
+    valRow.appendChild(stpLbl); valRow.appendChild(stepsInput);
 
     // Wrapped so it can be sticky-centered within the lane row: when a lane is
     // resized very tall (Alt+wheel), the row can exceed the viewport, and
@@ -1733,7 +1789,7 @@
     const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
     leftInner.appendChild(nameRow); leftInner.appendChild(compRow); leftInner.appendChild(valRow);
     left.appendChild(leftInner);
-    lane._valInput=valInput; lane._posInput=posInput; lane._activePt=null;
+    lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
 
     const sc=document.createElement('div'); sc.className='scroll hx';
     const cv=document.createElement('canvas'); sc.appendChild(cv);
@@ -1775,6 +1831,22 @@
       });
     }
     chn.addEventListener('input',ev=>{ lane.ch=clamp((+ev.target.value||1)-1,0,15); updateTbMeta(); });
+    // Steps ("snap-to"): 0/1 = off (full granularity). Committed on
+    // blur/Enter (not live on every keystroke) because the floor of 2 would
+    // otherwise fight you mid-type — e.g. typing "12" would jump to 2 the
+    // instant you'd typed just "1". Capped at the lane's own value range
+    // (128 for CC, 16384 for pitch-bend) — asking for more steps than there
+    // are distinct values just produces duplicate levels, so that's a real
+    // ceiling, not an arbitrary one.
+    stepsInput.addEventListener('change',()=>{
+      const r=laneRange(lane), cap=r.max-r.min+1;
+      const raw=Math.round(+stepsInput.value||0);
+      lane.steps=raw<=1?0:clamp(raw,2,cap);
+      stepsInput.value=lane.steps||'';
+      stepsInput.placeholder='0';
+      pushUndo(); updateLaneValInput(lane); requestDraw();
+    });
+    stepsInput.addEventListener('keydown',e=>{ if(e.key==='Enter') stepsInput.blur(); });
     swatch.addEventListener('click',()=>{
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
       swatch.style.background=lane.color; tbSwatch.style.background=lane.color; requestDraw();
@@ -1805,7 +1877,7 @@
       pushUndo(); rebuildLanesDom(srcId); });
 
     valInput.addEventListener('change',()=>{
-      const r=laneRange(lane); const newV=clamp(Math.round(+valInput.value||0),r.min,r.max);
+      const r=laneRange(lane); const newV=clamp(Math.round(snapToSteps(+valInput.value||0,r,lane.steps)),r.min,r.max);
       if(ccSel.size>0){
         ccSel.forEach(p=>{ if(lane.points.indexOf(p)>=0) p.v=newV; });
         valInput.value=newV;
@@ -3235,7 +3307,7 @@
       for(const lane of state.ccLanes){
         const pts=lane.points.filter(p=>p.t>=a&&p.t<=b).map(p=>({t:p.t-a,v:p.v}));
         if(pts.length===0) continue;
-        lanes.push({type:lane.type,cc:lane.cc,ch:lane.ch,color:lane.color,name:lane.name||'',tags:lane.tags||[],points:pts});
+        lanes.push({type:lane.type,cc:lane.cc,ch:lane.ch,color:lane.color,name:lane.name||'',tags:lane.tags||[],steps:lane.steps||0,points:pts});
       }
       const notes=state.notes.filter(n=>n.start>=a&&n.start<b).map(n=>({...n,id:undefined,start:n.start-a}));
       if(lanes.length===0&&notes.length===0){ flash('No data in loop range to save'); return; }
@@ -3267,7 +3339,7 @@
         if(!lane){
           const id=state.nextId++;
           const color=pl.color||LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
-          lane={id,type:pl.type,cc:pl.cc,ch:pl.ch,color,name:pl.name||'',visible:true,tags:pl.tags||[],points:[],_preview:null};
+          lane={id,type:pl.type,cc:pl.cc,ch:pl.ch,color,name:pl.name||'',visible:true,tags:pl.tags||[],steps:pl.steps||0,points:[],_preview:null};
           state.ccLanes.push(lane); buildLaneDom(lane);
         }
         if(!merge) lane.points=lane.points.filter(p=>p.t<targetTick||p.t>targetTick+dur);
@@ -3427,14 +3499,18 @@
           rows.push({name:nm,type:'float',min:mn,max:mx,defaultVal:dv});
         } else if(t==='bool'||t==='boolean'){
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:false);
-          rows.push({name:nm,type:'bool',min:0,max:1,defaultVal:dv?1:0});
+          rows.push({name:nm,type:'bool',min:0,max:1,defaultVal:dv?1:0,steps:2});
         } else if(t==='long'||t==='int'){
           const vals=inp.VALUES||inp.values||null;
           const labs=inp.LABELS||inp.labels||null;
           const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
           const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:(vals?vals.length-1:10));
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
-          rows.push({name:nm,type:'long',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs});
+          // Discrete ISF parameter -> auto-set the CC lane's Steps to match:
+          // an explicit VALUES list gives its own option count, otherwise a
+          // plain integer range is inherently one step per integer.
+          const isfSteps=vals?vals.length:Math.max(2,Math.round(mx-mn+1));
+          rows.push({name:nm,type:'long',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
         }
       }
       return rows;
@@ -3789,7 +3865,7 @@
           const id=state.nextId++;
           const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
           const lane={id, type:'cc', cc, ch, color, name:ref.row.name, visible:true, tags:[...importTags],
-            points:[{t:0, v:ref.defCCVal}], _preview:null};
+            steps:ref.row.steps||0, points:[{t:0, v:ref.defCCVal}], _preview:null};
           state.ccLanes.push(lane);
           buildLaneDom(lane);
           historyEntry.lanes.push({name:ref.row.name, cc, ch:ch+1, defVal:ref.defCCVal,

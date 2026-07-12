@@ -48,6 +48,10 @@ function buildTestHtml() {
       '  init();',
     ].join('\n')
   );
+  html = html.replace(
+    'function showISFDialog(header, filename){',
+    'window._TEST_showISFDialog=(h,f)=>showISFDialog(h,f);\n    function showISFDialog(header, filename){'
+  );
   return html;
 }
 
@@ -1100,6 +1104,144 @@ async function run() {
     }
     check('D/S/E/L keyboard shortcuts switch Draw/Select/Erase/Line tools',
       results.d === 'draw' && results.e === 'erase' && results.l === 'line' && results.s === 'select', results);
+  });
+
+  // ---------------- CC lane Steps (snap-to) ----------------
+
+  await withPage(browser, async (page) => {
+    // Setting Steps via the compact-row input snaps future points to N
+    // evenly-spaced values across the lane's own range; turning it off (0)
+    // stops snapping without retroactively touching existing points.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.fill('.lane .stepsn', '12');
+    await page.dispatchEvent('.lane .stepsn', 'change');
+    await page.waitForTimeout(50);
+    const steps = await page.evaluate(() => window._TEST_state.ccLanes[0].steps);
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 480, 100), laneId);
+    const snapped = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => Math.abs(p.t - 480) < 5).v, laneId);
+    check('Steps=12 snaps a new point to the nearest of 12 evenly-spaced values (100 -> 104)',
+      steps === 12 && snapped === 104, { steps, snapped });
+
+    await page.fill('.lane .stepsn', '0');
+    await page.dispatchEvent('.lane .stepsn', 'change');
+    await page.waitForTimeout(50);
+    const stillSnapped = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => Math.abs(p.t - 480) < 5).v, laneId);
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 1440, 77), laneId);
+    const offValue = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => Math.abs(p.t - 1440) < 5).v, laneId);
+    check('turning Steps off does not retroactively re-snap existing points, and stops snapping new ones',
+      stillSnapped === 104 && offValue === 77, { stillSnapped, offValue });
+  });
+
+  await withPage(browser, async (page) => {
+    // Steps is capped at the lane's own value range (128 for a CC lane) —
+    // typing a much larger number clamps rather than accepting a
+    // meaningless value with no distinct levels to snap to.
+    await page.fill('.lane .stepsn', '500');
+    await page.dispatchEvent('.lane .stepsn', 'change');
+    await page.waitForTimeout(50);
+    const steps = await page.evaluate(() => window._TEST_state.ccLanes[0].steps);
+    check('Steps is capped at the CC lane\'s own range (128), not left at an out-of-range value', steps === 128, steps);
+  });
+
+  await withPage(browser, async (page) => {
+    // Dragging an existing point also snaps to Steps; Shift bypasses it,
+    // matching the existing "Shift ignores the time grid" convention.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.fill('.lane .stepsn', '2'); // on/off: only 0 and 127
+    await page.dispatchEvent('.lane .stepsn', 'change');
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 960, 0), laneId);
+    await page.waitForTimeout(50);
+    const start = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 0), laneId);
+    const target = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 60), laneId); // drag to 60 -> should snap to 0 (nearer than 127)
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.mouse.move(target.x, target.y, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(80);
+    const snappedV = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => Math.abs(p.t - 960) < 5).v, laneId);
+    check('dragging a point snaps its value to Steps (on/off: 60 -> nearest of 0/127)', snappedV === 0, snappedV);
+
+    // Now the same drag with Shift held should bypass the snap
+    await page.evaluate((laneId) => { const l = window._TEST_state.ccLanes.find(x => x.id === laneId); l.points.find(p => Math.abs(p.t - 960) < 5).v = 0; }, laneId);
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.keyboard.down('Shift');
+    await page.mouse.move(target.x, target.y, { steps: 5 });
+    await page.keyboard.up('Shift');
+    await page.mouse.up();
+    await page.waitForTimeout(80);
+    const bypassedV = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => Math.abs(p.t - 960) < 5).v, laneId);
+    check('holding Shift while dragging a point bypasses Steps snapping', Math.abs(bypassedV - 60) <= 2, bypassedV);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Val row shows a "step X/N" badge for the active point once Steps
+    // is on, and hides it again once Steps is off or nothing is selected.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.fill('.lane .stepsn', '12');
+    await page.dispatchEvent('.lane .stepsn', 'change');
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 480, 100), laneId);
+    await page.waitForTimeout(50);
+    const p = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 480, 104), laneId);
+    await page.mouse.click(p.x, p.y);
+    await page.waitForTimeout(80);
+    const badge = await page.evaluate((laneId) => {
+      const l = window._TEST_state.ccLanes.find(x => x.id === laneId);
+      return { text: l._stepBadge.textContent, visible: l._stepBadge.style.display !== 'none' };
+    }, laneId);
+    check('Val row shows a "step X/N" badge for the active point when Steps is on',
+      badge.visible && /^step \d+\/12$/.test(badge.text), badge);
+  });
+
+  await withPage(browser, async (page) => {
+    // ISF import auto-sets a lane's Steps from the shader parameter's own
+    // discrete option count — VALUES array length, or the integer range
+    // span for a plain long/int without explicit enum labels.
+    const header = {
+      INPUTS: [
+        { NAME: 'preset', TYPE: 'long', VALUES: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], LABELS: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'] }, // 11 options
+        { NAME: 'lightCount', TYPE: 'long', MIN: 0, MAX: 15 }, // plain range, 16 discrete integers
+        { NAME: 'enabled', TYPE: 'bool' },
+        { NAME: 'brightness', TYPE: 'float', MIN: 0, MAX: 1 },
+      ],
+    };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'chaser.fs'), header);
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+    const lanes = await page.evaluate(() => window._TEST_state.ccLanes.map(l => ({ name: l.name, steps: l.steps })));
+    const preset = lanes.find(l => l.name === 'preset');
+    const lightCount = lanes.find(l => l.name === 'lightCount');
+    const enabled = lanes.find(l => l.name === 'enabled');
+    const brightness = lanes.find(l => l.name === 'brightness');
+    check('ISF import auto-sets Steps from an enum VALUES array (11 options)', preset && preset.steps === 11, preset);
+    check('ISF import auto-sets Steps from a plain integer range (0-15 -> 16 steps)', lightCount && lightCount.steps === 16, lightCount);
+    check('ISF import auto-sets Steps=2 for a bool parameter', enabled && enabled.steps === 2, enabled);
+    check('ISF import leaves Steps off (0) for a continuous float parameter', brightness && brightness.steps === 0, brightness);
+  });
+
+  await withPage(browser, async (page) => {
+    // Steps persists through snapshot()/applyState() (undo, save/load), same
+    // pattern as tags; MIDI export still just emits plain resampled CC
+    // values regardless of Steps — nothing about it is (or needs to be)
+    // encoded in the exported file.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.fill('.lane .stepsn', '5');
+    await page.dispatchEvent('.lane .stepsn', 'change');
+    await page.waitForTimeout(50);
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    await page.evaluate(() => { window._TEST_state.ccLanes[0].steps = 0; });
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    const restoredSteps = await page.evaluate(() => window._TEST_state.ccLanes[0].steps);
+    check('lane.steps survives snapshot()/applyState() roundtrip', restoredSteps === 5, restoredSteps);
+
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 2400, 100), laneId); // snaps under steps=5
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    const parsed = await page.evaluate((bytes) => window._TEST_parseMidi(bytes), bytes);
+    const ccVals = Object.values(parsed.ccMap || {}).flatMap(l => l.points.map(p => p.v));
+    check('exported MIDI CC values are plain 0-127 integers regardless of Steps (no proprietary encoding)',
+      ccVals.length > 0 && ccVals.every(v => Number.isInteger(v) && v >= 0 && v <= 127), ccVals.slice(0, 5));
   });
 
   // ---------------- Lane tags / filter bar ----------------
