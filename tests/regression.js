@@ -45,6 +45,14 @@ function buildTestHtml() {
       '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
       '  window._TEST_pushUndo = pushUndo;',
       '  window._TEST_undo = undo;',
+      '  window._TEST_play = (t0) => play(t0);',
+      '  window._TEST_pause = () => pause();',
+      '  window._TEST_stop = () => stop();',
+      '  window._TEST_seekPlayhead = (t) => seekPlayhead(t);',
+      '  window._TEST_updateLaneValInput = (laneId) => { const l = state.ccLanes.find(x => x.id === laneId); updateLaneValInput(l); };',
+      '  window._TEST_nearestBarAt = (t) => nearestBarAt(t);',
+      '  window._TEST_applyScrollLock = () => applyScrollLock();',
+      '  window._TEST_prScrollWidth = () => document.getElementById(\'prScroll\').clientWidth;',
       '  init();',
     ].join('\n')
   );
@@ -1175,8 +1183,10 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // The Val row shows a "step X/N" badge for the active point once Steps
-    // is on, and hides it again once Steps is off or nothing is selected.
+    // The Val row shows a compact "X/N" step-index badge for the active point
+    // once Steps is on, and hides it again once Steps is off or nothing is
+    // selected. Kept prefix-free (no "step " text) so it has room to show
+    // 2-3 digit step counts without truncating.
     const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
     await page.fill('.lane .stepsn', '12');
     await page.dispatchEvent('.lane .stepsn', 'change');
@@ -1189,8 +1199,8 @@ async function run() {
       const l = window._TEST_state.ccLanes.find(x => x.id === laneId);
       return { text: l._stepBadge.textContent, visible: l._stepBadge.style.display !== 'none' };
     }, laneId);
-    check('Val row shows a "step X/N" badge for the active point when Steps is on',
-      badge.visible && /^step \d+\/12$/.test(badge.text), badge);
+    check('Val row shows a "X/N" step-index badge for the active point when Steps is on',
+      badge.visible && /^\d+\/12$/.test(badge.text), badge);
   });
 
   await withPage(browser, async (page) => {
@@ -1301,6 +1311,105 @@ async function run() {
     const snap = await page.evaluate(() => window._TEST_snapshot());
     const roundTrip = await page.evaluate((s) => { window._TEST_applyState(s); return window._TEST_state.ccLanes.map(l => l.tags); }, snap);
     check('lane tags survive snapshot()/applyState() roundtrip', roundTrip.some(t => Array.isArray(t) && t.includes('persistTag')), roundTrip);
+  });
+
+  // ---------------- Transport shortcuts, project buttons, Time Sig default, Scroll Lock ----------------
+
+  await withPage(browser, async (page) => {
+    // Numpad0 jumps back to wherever the current/last playback was started
+    // from; while paused it just moves the (stopped) playhead.
+    const startTick = await page.evaluate(() => window._TEST_bbtToTick('9.1.1.0'));
+    await page.evaluate((t) => { window._TEST_state.playhead = t; }, startTick);
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(250);
+    await page.evaluate(() => window._TEST_pause());
+    const advanced = await page.evaluate(() => window._TEST_state.playhead);
+    await page.keyboard.press('Numpad0');
+    await page.waitForTimeout(30);
+    const afterNumpad0 = await page.evaluate(() => window._TEST_state.playhead);
+    check('Numpad0 jumps the playhead back to where playback was last started',
+      advanced > startTick && afterNumpad0 === startTick, { startTick, advanced, afterNumpad0 });
+
+    // Period key returns to the very start of the track (tick 0).
+    await page.keyboard.press('.');
+    await page.waitForTimeout(30);
+    const afterPeriod = await page.evaluate(() => window._TEST_state.playhead);
+    check('Period key returns the playhead to the start of the track', afterPeriod === 0, afterPeriod);
+
+    // While already playing, both keys jump and keep playing immediately.
+    await page.evaluate((t) => { window._TEST_state.playhead = t; }, startTick);
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(250);
+    await page.keyboard.press('Numpad0');
+    await page.waitForTimeout(30);
+    const stillPlaying = await page.evaluate(() => window._TEST_state.playing);
+    const seekTick = await page.evaluate(() => window._TEST_state.playhead);
+    await page.waitForTimeout(150);
+    const continuedTick = await page.evaluate(() => window._TEST_state.playhead);
+    check('Numpad0/period seek while playing keeps playback running from the new position',
+      stillPlaying && Math.abs(seekTick - startTick) < 5 && continuedTick > seekTick,
+      { stillPlaying, seekTick, continuedTick });
+    await page.evaluate(() => window._TEST_stop());
+  });
+
+  await withPage(browser, async (page) => {
+    // Save/Load Project buttons now live in the top toolbar row next to the
+    // Project Name field, not buried in the Setup panel.
+    const info = await page.evaluate(() => {
+      const projectGrp = document.querySelector('.project-grp');
+      return {
+        oneOfEach: document.querySelectorAll('#saveProjectBtn').length === 1 && document.querySelectorAll('#loadProjectBtn').length === 1,
+        inProjectGrp: !!(projectGrp && projectGrp.contains(document.getElementById('saveProjectBtn')) && projectGrp.contains(document.getElementById('loadProjectBtn'))),
+        notInSetupPanel: !document.querySelector('#setupPanel #saveProjectBtn') && !document.querySelector('#setupPanel #loadProjectBtn'),
+      };
+    });
+    check('Save/Load Project buttons sit in the top row next to Project Name (not duplicated, not in Setup)',
+      info.oneOfEach && info.inProjectGrp && info.notInSetupPanel, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // Opening the Time Sig popover defaults "At bar" to the bar closest to
+    // the playhead, not always bar 1.
+    const t1 = await page.evaluate(() => window._TEST_bbtToTick('9.3.1.0')); // past halfway of bar 9
+    await page.evaluate((t) => { window._TEST_state.playhead = t; }, t1);
+    await page.click('#tsBtn');
+    await page.waitForTimeout(50);
+    const bar1 = await page.evaluate(() => document.getElementById('tsMapBar').value);
+    await page.click('#tsBtn');
+
+    const t2 = await page.evaluate(() => window._TEST_bbtToTick('5.1.1.0')); // exact bar start
+    await page.evaluate((t) => { window._TEST_state.playhead = t; }, t2);
+    await page.click('#tsBtn');
+    await page.waitForTimeout(50);
+    const bar2 = await page.evaluate(() => document.getElementById('tsMapBar').value);
+
+    check('Time Sig popover defaults At Bar to the bar closest to the playhead',
+      bar1 === '10' && bar2 === '5', { bar1, bar2 });
+  });
+
+  await withPage(browser, async (page) => {
+    // Scroll Lock: off by default (no auto-scroll); once on, the view only
+    // starts following the playhead after it passes the middle of the
+    // viewport, then keeps it centered.
+    const viewW = await page.evaluate(() => window._TEST_prScrollWidth());
+    const farTick = await page.evaluate(() => window._TEST_bbtToTick('50.1.1.0'));
+
+    await page.evaluate((t) => { window._TEST_state.scrollLock = false; window._TEST_state.playhead = t; window._TEST_applyScrollLock(); }, farTick);
+    const scrollWhileOff = await page.evaluate(() => window._TEST_state.scrollLeft);
+    check('Scroll Lock does nothing while off', scrollWhileOff === 0, scrollWhileOff);
+
+    const nearTick = await page.evaluate(() => window._TEST_bbtToTick('2.1.1.0'));
+    await page.evaluate((t) => { window._TEST_state.scrollLock = true; window._TEST_state.scrollLeft = 0; document.getElementById('prScroll').scrollLeft = 0; window._TEST_state.playhead = t; window._TEST_applyScrollLock(); }, nearTick);
+    const scrollBeforeCenter = await page.evaluate(() => window._TEST_state.scrollLeft);
+    check('Scroll Lock leaves the view alone before the playhead reaches the middle', scrollBeforeCenter === 0, scrollBeforeCenter);
+
+    const result = await page.evaluate(({ farTick, viewW }) => {
+      window._TEST_state.playhead = farTick; window._TEST_applyScrollLock();
+      const px = farTick * window._TEST_state.pxPerTick;
+      return { scrollLeft: window._TEST_state.scrollLeft, expected: px - viewW / 2 };
+    }, { farTick, viewW });
+    check('Scroll Lock centers the playhead once it is past the middle of the view',
+      Math.abs(result.scrollLeft - result.expected) < 2, result);
   });
 
   await browser.close();

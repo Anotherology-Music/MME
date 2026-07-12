@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.6
+  MMV MIDI & CC Curve Editor v0.7.7
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -49,6 +49,20 @@
   bool -> 2, integer range -> range size); plain float params leave Steps off.
   Steps is editor-only metadata carried in .mmvp project saves — exported .mid
   files are unaffected and always contain plain 0-127 CC data.
+  v0.7.7 Playhead shortcuts + UI tweaks: Numpad0 jumps the playhead back to
+  wherever the current/last playback was started from; . (period) jumps it
+  back to the very start of the track. Both work whether paused (just moves
+  the playhead) or playing (seeks in place and keeps playing, no audible
+  gap). Save Project / Load Project moved from the Setup panel to the top
+  toolbar row, next to the Project Name field. Opening the Time Signature
+  popover now defaults "At bar" to the bar closest to the playhead instead
+  of always bar 1. Added a Scroll Lock toggle: once on, the playhead stays
+  centered in the view once it reaches the middle during playback, and the
+  timeline scrolls under it instead of the playhead running off past center.
+  CC lane val-row layout: the Steps badge dropped its "step " prefix (now a
+  plain "X/N") and is 50% wider so 2-3 digit step counts display fully;
+  Val/Pos/Steps labels shortened to single letters and the Pos field no
+  longer balloons to fill leftover space, freeing room for the badge.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -248,9 +262,9 @@
 
   .lane .leftcol .val-row{gap:2px;padding-top:2px;padding-bottom:1px;}
   .lane .leftcol .val-row span{font-size:10px;color:var(--txt2);flex-shrink:0;}
-  .lane .leftcol .val-row .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34px;}
+  .lane .leftcol .val-row .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:51px;}
   .lane .leftcol .val-input{flex:1;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
-  .lane .leftcol .pos-input{flex:1;min-width:0;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .pos-input{flex:1 1 0%;min-width:0;max-width:44px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
   .lane .leftcol .val-row .stepsn{flex:0 0 24px;width:24px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
   .lane .leftcol .val-row .stepsn::-webkit-outer-spin-button,
   .lane .leftcol .val-row .stepsn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
@@ -333,6 +347,9 @@
       <button id="syncFollow" title="Follow MMV: when Ch16 sync-track notes arrive, move playhead to match MMV position">Follow MMV</button>
     </div>
     <div class="group">
+      <button id="scrollLockBtn" title="Scroll Lock: once the playhead reaches the middle of the view during playback, keep it centered there and scroll the timeline underneath it instead">&#8646; Scroll Lock</button>
+    </div>
+    <div class="group">
       <span class="lbl">Go to</span>
       <input type="number" id="gotoSec" min="0" step="0.01" style="width:60px;" title="Jump playhead to this position (seconds). Press Enter.">
       <span class="pill">s</span>
@@ -341,6 +358,9 @@
     <div class="project-grp">
       <span class="lbl">Project</span>
       <input type="text" id="projectName" placeholder="Project name" style="flex:1;min-width:120px;font-size:12px;" title="Project name — used as the filename when exporting">
+      <button id="saveProjectBtn" style="padding:3px 7px;" title="Save project as a .mmvp file (includes all notes, CC, settings — audio must be reloaded separately)">&#x1F4BE;</button>
+      <button id="loadProjectBtn" style="padding:3px 7px;" title="Load a previously saved .mmvp project file">&#x1F4C2;</button>
+      <input type="file" id="projectFileInput" accept=".mmvp,.json" style="display:none">
       <div class="sep" style="height:18px;"></div>
       <div class="group">
         <span class="lbl">Tempo</span>
@@ -401,9 +421,7 @@
             <button id="syncExport" title="Export a sync-track MIDI for MMV. Re-export whenever Tempo, Bars, or Sig changes.">Export Sync Track</button>
           </div>
           <div class="setup-row">
-            <button id="saveProjectBtn" title="Save project as a .mmvp file (includes all notes, CC, settings — audio must be reloaded separately)">&#x1F4BE; Save Project</button>
-            <button id="loadProjectBtn" title="Load a previously saved .mmvp project file">&#x1F4C2; Load Project</button>
-            <input type="file" id="projectFileInput" accept=".mmvp,.json" style="display:none">
+            <span style="font-size:11px;color:var(--txt2);">Save Project / Load Project moved to the top row, next to the project name.</span>
           </div>
           <div class="setup-row">
             <button id="isfImportBtn" title="Import ISF shader parameters as CC lanes (v0.5.0)">&#x2B21; Import ISF</button>
@@ -799,8 +817,8 @@
     channelNames:Array(16).fill(''),
     activeLaneId:null, selection:new Set(), focus:'piano',
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
-    playing:false, playhead:0, midiOut:null, clipboard:null,
-    locStart:null, locEnd:null, syncFollow:false, mmvSmooth:true,
+    playing:false, playhead:0, lastPlayStart:0, midiOut:null, clipboard:null,
+    locStart:null, locEnd:null, syncFollow:false, mmvSmooth:true, scrollLock:false,
   };
   const PITCH_MIN=0, PITCH_MAX=127, NPITCH=128;
   const LANE_COLORS=['#4fa3ff','#ffb454','#7ed957','#ff6fae','#b18cff','#36d1c4','#ff8a5c','#c9d24f'];
@@ -869,6 +887,10 @@
     }
   }
   function totalTicks(){ return Math.round(barToTick(state.bars)); }
+  // 1-indexed number of the bar boundary closest to `tick` (rounds to the
+  // next bar once past its halfway point, not just the containing bar).
+  function nearestBarAt(tick){ const {bar,seg,tickInBar}=walkToTick(clamp(tick,0,totalTicks()));
+    const tpb=segTicksPerBar(seg); return bar+1+(tickInBar>=tpb/2?1:0); }
   function contentW(){ return Math.max(200, Math.round(totalTicks()*state.pxPerTick)); }
   function prContentH(){ return NPITCH*state.noteHeight; }
   function tickToX(t){ return t*state.pxPerTick; }
@@ -947,6 +969,21 @@
   // canvas is absolute at content origin; translate it by +scroll to keep in viewport (horizontal), and (piano) +scrollTop handled natively
   function tx2(sc){ return 'translate('+sc.scrollLeft+'px,0px)'; }
   function updatePlayheadEl(){ if(phEl) phEl.style.transform='translateX('+(tickToX(state.playhead)-state.scrollLeft)+'px)'; }
+  // Scroll Lock: once the playhead reaches the middle of the viewport it
+  // stays pinned there and the timeline scrolls underneath it instead.
+  // Only nudges the scroll when the playhead is past center or has gone
+  // off-screen (e.g. after a backward seek) — before that it just moves
+  // across the view normally, matching the two-phase behavior of a typical
+  // DAW center-lock scroll.
+  function applyScrollLock(){ if(!state.scrollLock) return;
+    const viewW=prScroll.clientWidth||300, centerX=viewW/2;
+    const playheadX=tickToX(state.playhead), maxScroll=Math.max(0,contentW()-viewW);
+    const onScreenX=playheadX-state.scrollLeft;
+    if(onScreenX<=centerX && onScreenX>=0) return;
+    const desired=clamp(playheadX-centerX,0,maxScroll);
+    if(desired===state.scrollLeft) return;
+    prScroll.scrollLeft=desired; state.scrollLeft=desired; syncH(prScroll); applyTransforms(); requestDraw();
+  }
 
   // ---------- Scroll sync ----------
   let syncing=false;
@@ -1563,7 +1600,8 @@
     if(lane._posInput) lane._posInput.value=valid?tickToBBT(pt.t):'';
     if(lane._stepBadge){
       const label=valid?stepIndexLabel(lane,pt.v):'';
-      lane._stepBadge.textContent=label?('step '+label):'';
+      lane._stepBadge.textContent=label;
+      lane._stepBadge.title=label?('Step '+label+' of the lane\'s Steps grid'):'';
       lane._stepBadge.style.display=label?'':'none';
     }
   }
@@ -1766,17 +1804,18 @@
     // issue), and unlike those icons this input is the primary way to set
     // a brand-new feature, so it needs to actually be usable.
     const valRow=document.createElement('div'); valRow.className='lr val-row';
-    const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'Val';
+    const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input'; valInput.style.cssText='width:46px;min-width:46px;flex:0 0 46px;';
     const rng=laneRange(lane); valInput.min=rng.min; valInput.max=rng.max; valInput.placeholder='—';
     valInput.title='Value of selected point\nScroll/↑↓=±1  Shift=±5  Ctrl=±10\nAlt+scroll=snap to % steps';
-    // Read-only "step X/N" badge — only shown when Steps is on, so it costs
-    // nothing for lanes not using the feature.
+    // Read-only "N/M" step-index badge — only shown when Steps is on, so it
+    // costs nothing for lanes not using the feature. Kept prefix-free (no
+    // "step " text) so it has room to show 2-3 digit step counts.
     const stepBadge=document.createElement('span'); stepBadge.className='step-badge'; stepBadge.style.display='none';
-    const posLbl=document.createElement('span'); posLbl.textContent='Pos';
+    const posLbl=document.createElement('span'); posLbl.textContent='P'; posLbl.title='Position';
     const posInput=document.createElement('input'); posInput.type='text'; posInput.className='pos-input';
     posInput.placeholder='—'; posInput.title='Position (Bar.Beat.16th.Tick)\nScroll or ↑↓ = ±1 tick\nShift = ±1/16th\nCtrl = ±1 beat\nAlt = ±1 bar\nType B.B.S.T and press Enter';
-    const stpLbl=document.createElement('span'); stpLbl.textContent='Stp'; stpLbl.style.flexShrink='0';
+    const stpLbl=document.createElement('span'); stpLbl.textContent='S'; stpLbl.title='Steps (snap-to-value)'; stpLbl.style.flexShrink='0';
     const stepsInput=document.createElement('input'); stepsInput.type='number'; stepsInput.className='stepsn'; stepsInput.min=0;
     stepsInput.value=lane.steps||0; stepsInput.placeholder='0';
     valRow.appendChild(valLbl); valRow.appendChild(valInput); valRow.appendChild(stepBadge); valRow.appendChild(posLbl); valRow.appendChild(posInput);
@@ -2709,7 +2748,7 @@
     if(syncAnchor){
       const msPerTick=60000/(state.bpm*ticksPerBeat());
       state.playhead=clamp(Math.round(syncAnchor.tick+(now-syncAnchor.wallMs)/msPerTick),0,totalTicks());
-      updatePlayheadEl(); updatePlayPos();
+      applyScrollLock(); updatePlayheadEl(); updatePlayPos();
     }
     if(state.syncFollow&&!state.playing) syncRaf=requestAnimationFrame(syncFrame);
   }
@@ -2901,8 +2940,13 @@
     }
     evs.sort((x,y)=> x.tick-y.tick || x.o-y.o); return evs;
   }
-  function play(explicitT0){ if(state.playing) return; const {a,b}=getLoop(); if(b<=a) return;
+  function play(explicitT0){ if(state.playing) return; beginPlayback(explicitT0); }
+  // Shared by play() and seekPlayhead() (which restarts playback in place
+  // after a mid-playback jump) — assumes the caller has already confirmed
+  // state.playing is false.
+  function beginPlayback(explicitT0){ const {a,b}=getLoop(); if(b<=a) return;
     let startTick=state.playhead; if(startTick<a||startTick>=b) startTick=a;
+    state.lastPlayStart=startTick;
     state.playing=true; updateTransportBtns();
     const mpt=(60000/state.bpm)/ticksPerBeat(), span=b-a, t0=explicitT0!=null?explicitT0:(performance.now()+START_DELAY);
     const evs=buildPassEvents(a,b); let idx=0; while(idx<evs.length && evs[idx].tick<startTick) idx++;
@@ -2960,7 +3004,7 @@
   }
   function visualFrame(now){ if(!state.playing||!sched) return; const s=sched;
     state.playhead = (now<s.t0) ? s.startTick : s.a + wrapv((now-s.t0)/s.mpt + (s.startTick-s.a), s.span);
-    updatePlayheadEl(); updatePlayPos(); rafVisual=requestAnimationFrame(visualFrame);
+    applyScrollLock(); updatePlayheadEl(); updatePlayPos(); rafVisual=requestAnimationFrame(visualFrame);
   }
   function stopTransport(){ if(rafVisual){ cancelAnimationFrame(rafVisual); rafVisual=null; } stopClock();
     clearSyncHeartbeat();
@@ -2969,6 +3013,15 @@
   function pause(){ if(!state.playing) return; if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); updateTransportBtns(); }
   function stop(){ if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); state.playhead=getLoop().a; updatePlayPos(); updatePlayheadEl(); updateTransportBtns(); }
   function togglePlay(){ state.playing?pause():play(); }
+  // Jumps the playhead to `tick`. If playback is running, restarts it in
+  // place at the new position (no audible/visible pause); otherwise just
+  // moves the (stopped) playhead. Used by the Numpad0 (back to last play
+  // start) and . (back to 0) shortcuts.
+  function seekPlayhead(tick){ tick=clamp(Math.round(tick),0,totalTicks());
+    if(state.playing){ if(state.recording||state.recArmed) endRecordingSession();
+      stopTransport(); state.playing=false; state.playhead=tick; beginPlayback();
+    } else { state.playhead=tick; applyScrollLock(); updatePlayPos(); updatePlayheadEl(); }
+  }
   function updateTransportBtns(){ $('playBtn').textContent=state.playing?'⏸':'▶'; $('playBtn').classList.toggle('on',state.playing);
     const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
   }
@@ -3114,6 +3167,8 @@
     if(!state.syncFollow){ syncAnchor=null; followReset(); lastSyncBeatIdx=-1;
       if(syncRaf){ cancelAnimationFrame(syncRaf); syncRaf=null; }
       allNotesOff(); if(state.midiOut) try{ state.midiOut.clear&&state.midiOut.clear(); }catch(e){} } });
+  $('scrollLockBtn').addEventListener('click',()=>{ state.scrollLock=!state.scrollLock; $('scrollLockBtn').classList.toggle('on',state.scrollLock);
+    if(state.scrollLock) applyScrollLock(); });
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
   $('saveProjectBtn').onclick=saveProject;
   $('loadProjectBtn').onclick=()=>$('projectFileInput').click();
@@ -3174,6 +3229,8 @@
     if(ctrl && e.key.toLowerCase()==='v'){ e.preventDefault(); paste(); return; }
     if(ctrl && e.key.toLowerCase()==='a'){ e.preventDefault(); const {a,b}=getLoop(); state.selection.clear(); state.notes.forEach(n=>{ if(n.start>=a&&n.start<b) state.selection.add(n.id); }); state.focus='piano'; updateNoteInfo(); requestDraw(); return; }
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
+    if(e.code==='Numpad0'){ e.preventDefault(); seekPlayhead(state.lastPlayStart||0); return; }
+    if(e.key==='.'){ e.preventDefault(); seekPlayhead(0); return; }
     if(!ctrl && e.key.toLowerCase()==='r'){ e.preventDefault(); toggleRecord(); return; }
     if(!ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); toggleMetronome(); return; }
     if(!ctrl && e.key.toLowerCase()==='q'){ e.preventDefault(); quantizeSelection(e.shiftKey?'end':'start', state.quantIterative||e.altKey); return; }
@@ -3916,7 +3973,7 @@
     schedWorker=makeWorker();
     // Setup panel toggle
     $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
-    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open) renderTsMapUI(); });
+    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); } });
     // ── Advanced Generate panel ──
     (()=>{
       const btn=$('genAdvBtn'), panel=$('genAdvPanel');
