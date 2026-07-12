@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.4
+  MMV MIDI & CC Curve Editor v0.7.5
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -31,6 +31,14 @@
   instead of scrolling away with the top of the row. Multi-selecting CC points that
   share a value now shows that value (blank only when they actually differ). Added
   D/S/E/L keyboard shortcuts for Draw/Select/Erase/Line tools.
+  v0.7.5 Lane layout fix: fixed a regression from the v0.7.4 sticky-centering change
+  where a lane's name/tags could render outside its own row and spill into the lane
+  above (the sticky trick now clamps within the row via a flexbox+auto-margin
+  technique instead of an unclamped transform). Shrinking a lane via the grip or
+  Alt+wheel now floors at name-row + compact-row (2 rows) — those two rows can never
+  be squeezed out or spill outside the lane; the value/position row hides outright
+  once it no longer fits, instead of clipping mid-row. Minimizing a lane now shows
+  its custom name plus CC#/PB and channel in the collapsed bar, not just the name.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -169,11 +177,16 @@
   .lane.lane-hidden .grip{display:none;}
   .lane.lane-hidden .lanebody{display:none;}
   .lane.lane-hidden{height:auto!important;min-height:0!important;}
+  /* Below the height that fits all 3 leftcol rows, hide val-row outright
+     rather than let it clip mid-row — keeps name-row and compact-row always
+     fully visible within the lane's own bounds. */
+  .lane.lane-compact2 .val-row{display:none!important;}
   .lane-top-bar{height:22px;display:none;align-items:center;gap:5px;padding:0 6px;background:var(--panel);border-bottom:1px solid var(--line);}
   .lane.lane-hidden .lane-top-bar{display:flex;}
   .lane-top-bar .tb-swatch{width:10px;height:10px;border-radius:2px;border:1px solid #0004;flex:0 0 auto;}
   .lane-top-bar .tb-vis{font-size:12px;line-height:1;padding:0 2px;border:none;background:none;cursor:pointer;color:var(--accent2);}
   .lane-top-bar .tb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--txt2);}
+  .lane-top-bar .tb-meta{flex:0 0 auto;font-size:10px;color:var(--txt2);opacity:.75;white-space:nowrap;}
 
   /* Lane leftcol — name row on top (last to hide), compact row below */
   /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
@@ -182,12 +195,24 @@
      would make this element its own sticky containing block, trapping
      .leftcol-inner's centering to the (mostly offscreen) full row height
      instead of letting it stick relative to .lanes, the true scrolling
-     ancestor. Content here doesn't need horizontal clipping in practice. */
+     ancestor. Horizontal clipping (compact-row's icon buttons can overflow
+     the 156px column) is applied on .leftcol-inner below instead — that's
+     the sticky element itself, not an ancestor, so it doesn't affect the
+     containing-block search and can safely clip. */
   .lane .leftcol{font-size:11px;justify-content:flex-start;overflow:visible;}
   /* Keeps the name/CC/val/pos controls vertically centered in whatever part of
      a tall (Alt+wheel-zoomed) lane is currently scrolled into view, instead of
-     scrolling away with the top of the row. */
-  .leftcol-inner{position:sticky;top:50%;transform:translateY(-50%);}
+     scrolling away with the top of the row.
+     top:0;bottom:0 (not top:50%+transform) is deliberate: the transform
+     variant computes its offset purely from the scrollport center and can
+     push the element past its own row's edges for compact/default-height
+     lanes shorter than the scrollport, spilling into the row above. This
+     variant leans on .leftcol already being a column flexbox — auto margins
+     do the centering, and pinning both edges means it can never escape its
+     own row's bounds regardless of row or scrollport size.
+     overflow:hidden here (not on .leftcol) clips compact-row's buttons back
+     to the column width without re-breaking the sticky containing-block. */
+  .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:3px;width:100%;overflow:hidden;}
   .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
   .lane .leftcol .name-row{padding:3px 0 1px;}
   .lane .leftcol .name-row input{flex:1;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
@@ -920,17 +945,28 @@
   [rulerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
 
   // ---------- Pane resize (grips) ----------
-  function attachGrip(grip,row,getCv,getSc,dir){
+  // A CC lane's leftcol content is name-row + compact-row (+ val-row when
+  // there's room). LANE_MIN_H is the floor when shrinking a lane — always
+  // enough for name+compact, never less, so those two rows can never spill
+  // into the row above. LANE_FULL_H is the height at which val-row (the 3rd
+  // row) actually fits; below that it's hidden outright rather than clipped.
+  const LANE_MIN_H=63, LANE_FULL_H=84;
+  function updateLaneCompactness(row){
+    if(!row||!row.classList||!row.classList.contains('lane')) return;
+    row.classList.toggle('lane-compact2', row.offsetHeight<LANE_FULL_H);
+  }
+  function attachGrip(grip,row,getCv,getSc,dir,minH){
+    minH=minH||46;
     grip.addEventListener('mousedown',e=>{ e.preventDefault();
       const sy=e.clientY, sh=row.offsetHeight; document.body.style.cursor='row-resize';
-      function mv(ev){ const dy=ev.clientY-sy; const h=Math.max(46, sh+(dir==='down'?dy:-dy)); row.style.height=h+'px'; row.style.flex='0 0 auto';
-        const sc=getSc&&getSc(), cv=getCv&&getCv(); if(cv&&sc){ cv.width=sc.clientWidth; cv.height=sc.clientHeight; } applyTransforms(); requestDraw(); }
+      function mv(ev){ const dy=ev.clientY-sy; const h=Math.max(minH, sh+(dir==='down'?dy:-dy)); row.style.height=h+'px'; row.style.flex='0 0 auto';
+        const sc=getSc&&getSc(), cv=getCv&&getCv(); if(cv&&sc){ cv.width=sc.clientWidth; cv.height=sc.clientHeight; } updateLaneCompactness(row); applyTransforms(); requestDraw(); }
       function up(){ document.body.style.cursor=''; window.removeEventListener('mousemove',mv); window.removeEventListener('mouseup',up); }
       window.addEventListener('mousemove',mv); window.addEventListener('mouseup',up);
     });
   }
-  function resizeRowBy(row, sc, cv, f){ const h=clamp(Math.round(row.offsetHeight*f),46,900); row.style.height=h+'px'; row.style.flex='0 0 auto';
-    cv.width=sc.clientWidth; cv.height=sc.clientHeight; applyTransforms(); requestDraw(); }
+  function resizeRowBy(row, sc, cv, f, minH){ minH=minH||46; const h=clamp(Math.round(row.offsetHeight*f),minH,900); row.style.height=h+'px'; row.style.flex='0 0 auto';
+    cv.width=sc.clientWidth; cv.height=sc.clientHeight; updateLaneCompactness(row); applyTransforms(); requestDraw(); }
 
   // ---------- Undo / Redo ----------
   let undoStack=[], redoStack=[], pending=null;
@@ -981,7 +1017,7 @@
     state.ccLanes.forEach(l=>{ if(l._row){ if(l._row.style.height) savedHeightById.set(l.id,l._row.style.height); l._row.remove(); } });
     state.ccLanes=[];
     o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
-      const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; } });
+      const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; updateLaneCompactness(lane._row); } });
     refreshTagBar();
     state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
     state.selection.clear(); syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
@@ -1630,13 +1666,18 @@
     if(lane.visible===false) row.classList.add('lane-hidden');
     if(!laneMatchesFilter(lane)) row.classList.add('lane-filtered');
 
-    // Top bar: always visible, shown only when lane is collapsed
+    // Top bar: always visible, shown only when lane is collapsed (minimized).
+    // Shows custom name, CC#/PB, and channel together so a minimized lane
+    // stays identifiable without un-minimizing it.
     const topBar=document.createElement('div'); topBar.className='lane-top-bar';
     const tbVis=document.createElement('button'); tbVis.className='tb-vis'; tbVis.title='Show lane'; tbVis.textContent='○';
     const tbSwatch=document.createElement('span'); tbSwatch.className='tb-swatch'; tbSwatch.style.background=lane.color;
     const tbName=document.createElement('span'); tbName.className='tb-name';
     tbName.textContent=lane.name||(laneIsPb(lane)?'Pitch Bend':'CC'+lane.cc);
-    topBar.appendChild(tbVis); topBar.appendChild(tbSwatch); topBar.appendChild(tbName);
+    const tbMeta=document.createElement('span'); tbMeta.className='tb-meta';
+    function updateTbMeta(){ tbMeta.textContent=(laneIsPb(lane)?'PB':'CC'+lane.cc)+' Ch'+(lane.ch+1); }
+    updateTbMeta();
+    topBar.appendChild(tbVis); topBar.appendChild(tbSwatch); topBar.appendChild(tbName); topBar.appendChild(tbMeta);
 
     const grip=document.createElement('div'); grip.className='grip'; grip.title='Drag to resize this lane';
     const body=document.createElement('div'); body.className='lanebody';
@@ -1730,9 +1771,10 @@
         lname.title=name;
         if(!lane.name){ lname.placeholder=name||'Lane name…'; }
         tbName.textContent=lane.name||'CC'+lane.cc;
+        updateTbMeta();
       });
     }
-    chn.addEventListener('input',ev=>{ lane.ch=clamp((+ev.target.value||1)-1,0,15); });
+    chn.addEventListener('input',ev=>{ lane.ch=clamp((+ev.target.value||1)-1,0,15); updateTbMeta(); });
     swatch.addEventListener('click',()=>{
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
       swatch.style.background=lane.color; tbSwatch.style.background=lane.color; requestDraw();
@@ -1839,7 +1881,8 @@
 
     body.addEventListener('mousedown',()=>{ setActiveLane(lane.id); state.focus='cc'; });
     sc.addEventListener('scroll',()=>onHScroll(sc));
-    attachGrip(grip,row,()=>cv,()=>sc,'down'); bindLane(lane);
+    attachGrip(grip,row,()=>cv,()=>sc,'down',LANE_MIN_H); bindLane(lane);
+    updateLaneCompactness(row);
   }
   function rebuildLanesDom(scrollToId){ state.ccLanes.forEach(l=>{ if(l._row) l._row.remove(); l._row=l._scroll=l._canvas=null; }); state.ccLanes.forEach(l=>buildLaneDom(l)); setActiveLane(state.activeLaneId); resizeCanvases();
     if(scrollToId){ const tgt=state.ccLanes.find(l=>l.id===scrollToId); if(tgt&&tgt._row) tgt._row.scrollIntoView({block:'nearest',behavior:'smooth'}); } }
@@ -4194,7 +4237,7 @@
       if(e.shiftKey){ e.preventDefault(); masterScroll.scrollLeft+=e.deltaY||e.deltaX; return; }
       if(e.altKey){ e.preventDefault(); const f=e.deltaY<0?1.12:1/1.12;
         const laneEl=e.target.closest&&e.target.closest('.lane');
-        if(laneEl){ const id=+laneEl.dataset.id; const l=state.ccLanes.find(x=>x.id===id); if(l) resizeRowBy(l._row,l._scroll,l._canvas,f); }
+        if(laneEl){ const id=+laneEl.dataset.id; const l=state.ccLanes.find(x=>x.id===id); if(l) resizeRowBy(l._row,l._scroll,l._canvas,f,LANE_MIN_H); }
         else if(e.target.closest&&e.target.closest('.vel-row')) resizeRowBy($('velRow'),velScroll,velCanvas,f);
         else zoomVAt(f, e.clientY); }
     },{passive:false});
