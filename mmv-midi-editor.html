@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.8.0
+  MMV MIDI & CC Curve Editor v0.8.1
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -78,6 +78,13 @@
   a single distributable .html; a small companion mmv-sw.js service
   worker must ship alongside it for the install/offline-shell capability
   (needs a secure context — https:// or http://localhost, not file://).
+  v0.8.1 Draggable audio track start: drag the waveform to move where the
+  audio track begins relative to the notes/CC timeline (e.g. to add silent
+  lead-in space at the start of a project) — snaps to the global Snap grid
+  by default, hold Shift to drag freely. Double-click the waveform to reset
+  the offset back to 0. A badge next to the M/Load buttons shows the
+  current offset (click it to reset too). The offset is undoable and
+  travels with the project through .mmvp save/load.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -572,6 +579,7 @@
           <button id="audioMuteBtn" style="font-size:10px;padding:2px 6px;" title="Mute / unmute audio track">M</button>
           <button id="audioLoadBtn" style="font-size:10px;padding:2px 7px;" title="Load an audio file (MP3, WAV, OGG…)">Load</button>
         </div>
+        <button id="audioOffsetBadge" style="display:none;font-size:9px;padding:1px 6px;color:var(--accent2);background:var(--panel2);" title="Audio start offset — click to reset to 0">Off +0</button>
         <input type="file" id="audioFileInput" accept="audio/*" style="display:none">
       </div>
       <div class="scroll hx" id="audioScroll"><canvas id="audioCanvas"></canvas></div>
@@ -854,6 +862,7 @@
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
     playing:false, playhead:0, lastPlayStart:0, midiOut:null, clipboard:null,
     locStart:null, locEnd:null, syncFollow:false, mmvSmooth:true, scrollLock:false,
+    audioOffset:0,
   };
   const PITCH_MIN=0, PITCH_MAX=127, NPITCH=128;
   const LANE_COLORS=['#4fa3ff','#ffb454','#7ed957','#ff6fae','#b18cff','#36d1c4','#ff8a5c','#c9d24f'];
@@ -1067,7 +1076,8 @@
     genOutputMode:state.genOutputMode,genBlend:state.genBlend,
     sweepOn:state.sweepOn,sweepFreqStart:state.sweepFreqStart,sweepFreqEnd:state.sweepFreqEnd,
     sweepAmpLoStart:state.sweepAmpLoStart,sweepAmpLoEnd:state.sweepAmpLoEnd,
-    sweepAmpHiStart:state.sweepAmpHiStart,sweepAmpHiEnd:state.sweepAmpHiEnd }); }
+    sweepAmpHiStart:state.sweepAmpHiStart,sweepAmpHiEnd:state.sweepAmpHiEnd,
+    audioOffset:state.audioOffset||0 }); }
   function pushUndo(){ undoStack.push(snapshot()); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); }
   function armUndo(){ pending=snapshot(); }
   function commitUndo(){ if(pending){ if(snapshot()!==pending){ undoStack.push(pending); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); } pending=null; } }
@@ -1091,6 +1101,7 @@
     if(o.sweepFreqStart){ state.sweepFreqStart=o.sweepFreqStart; if($('advFreqStart')) $('advFreqStart').value=o.sweepFreqStart; }
     if(o.sweepFreqEnd){ state.sweepFreqEnd=o.sweepFreqEnd; if($('advFreqEnd')) $('advFreqEnd').value=o.sweepFreqEnd; }
     ['sweepAmpLoStart','sweepAmpLoEnd','sweepAmpHiStart','sweepAmpHiEnd'].forEach(k=>{ if(o[k]!=null){ state[k]=o[k]; const el=$('adv'+k.charAt(0).toUpperCase()+k.slice(1)); if(el) el.value=o[k]; } });
+    state.audioOffset=o.audioOffset||0; updateAudioOffsetBadge();
     populateViewCh();
     // Rebuild channel name inputs if they exist
     const _grid=$('chNamesGrid');
@@ -1212,6 +1223,7 @@
     const sx=state.scrollLeft;
     ctx.fillStyle=getCss('--panel3'); ctx.fillRect(sx,0,w,h);
     gridLinesX(ctx,0,h,w); drawLocators(ctx,h);
+    if(!(audioDrag&&audioDrag.moved)) audioCanvas.style.cursor=audioBuf?'grab':'default';
     if(!audioBuf){
       ctx.fillStyle=getCss('--txt2'); ctx.font='11px system-ui'; ctx.textAlign='left'; ctx.textBaseline='middle';
       ctx.fillText('Load an audio file — use the Load button or drop a file here',sx+12,h/2);
@@ -1220,11 +1232,17 @@
     const ch=audioBuf.getChannelData(0), sr=audioBuf.sampleRate;
     const spt=sr*60/(state.bpm*ticksPerBeat()); // audio samples per tick
     const mid=h/2, pad=2;
+    // audioOffset shifts the buffer's sample-0 to that timeline tick — a
+    // positive offset delays audio (silent gap at the start), negative
+    // trims/pulls it earlier (content before tick 0 is simply never shown).
+    const off=state.audioOffset||0;
     const linePath=new Path2D(), fillPath=new Path2D();
     for(let px=0;px<w;px++){
       const cx=sx+px;
-      const i0=Math.max(0,Math.floor(cx/state.pxPerTick*spt));
-      const i1=Math.min(ch.length,Math.ceil((cx+1)/state.pxPerTick*spt)+1);
+      const t0px=cx/state.pxPerTick-off, t1px=(cx+1)/state.pxPerTick-off;
+      if(t1px<0) continue; // still within the pre-audio silent gap — keep scanning right
+      const i0=Math.max(0,Math.floor(t0px*spt));
+      const i1=Math.min(ch.length,Math.ceil(t1px*spt)+1);
       if(i0>=ch.length) break;
       let mn=0,mx=0; const skip=Math.max(1,Math.floor((i1-i0)/256));
       for(let i=i0;i<i1;i+=skip){const s=ch[i]; if(s<mn)mn=s; if(s>mx)mx=s;}
@@ -3124,17 +3142,32 @@
     if(audioBuf && audioCtx){
       if(audioCtx.state==='suspended') audioCtx.resume();
       if(audioSrc){ try{audioSrc.stop();}catch(e){} audioSrc=null; }
-      const offset=tickToSeconds(startTick);
-      if(offset<audioBuf.duration){
+      // audioOffset shifts the buffer's sample-0 to that timeline tick (drag
+      // the Audio track to set it) — positive delays audio (silent lead-in),
+      // negative trims/pulls it earlier. NOTE: the native loop can't
+      // reproduce a recurring silent gap, so this is correct for the pass
+      // that's about to play; if playback loops back around to the start of
+      // the loop region more than once with a nonzero offset, the audio
+      // resumes immediately on repeat passes instead of waiting out the gap
+      // again and will drift out of sync with the MIDI/CC transport. Not an
+      // issue for normal edit/playback/reseek use — only for letting a
+      // song with an offset loop unattended past its natural end.
+      const off=state.audioOffset||0;
+      const loopStartSec=Math.max(0,tickToSeconds(a-off));
+      const loopEndSec=Math.max(loopStartSec+0.001,Math.min(tickToSeconds(b-off),audioBuf.duration));
+      const bufTickAtStart=startTick-off;
+      const offset=bufTickAtStart>=0?tickToSeconds(bufTickAtStart):0;
+      const startDelaySec=bufTickAtStart>=0?0:tickToSeconds(off-startTick);
+      if(bufTickAtStart>=0?offset<audioBuf.duration:off<b){
         audioSrc=audioCtx.createBufferSource();
         audioSrc.buffer=audioBuf;
         audioSrc.loop=true;
-        audioSrc.loopStart=tickToSeconds(a);
-        audioSrc.loopEnd=Math.min(tickToSeconds(b), audioBuf.duration);
+        audioSrc.loopStart=loopStartSec;
+        audioSrc.loopEnd=loopEndSec;
         audioGain=audioCtx.createGain();
         audioGain.gain.value=audioMuted?0:1;
         audioSrc.connect(audioGain); audioGain.connect(audioCtx.destination);
-        audioSrc.start(audioCtx.currentTime+START_DELAY/1000, offset);
+        audioSrc.start(audioCtx.currentTime+START_DELAY/1000+startDelaySec, offset);
       }
     }
   }
@@ -3349,6 +3382,15 @@
     }catch(e){ alert('Could not decode audio: '+e.message); return; }
     requestDraw();
   }
+  function updateAudioOffsetBadge(){
+    const b=$('audioOffsetBadge'); if(!b) return;
+    const off=state.audioOffset||0;
+    if(off===0){ b.style.display='none'; return; }
+    b.style.display='';
+    b.textContent='Off '+(off<0?'-':'+')+fmtClockHundredths(tickToSeconds(Math.abs(off)));
+  }
+  $('audioOffsetBadge').addEventListener('click',()=>{ if(!state.audioOffset) return;
+    armUndo(); state.audioOffset=0; commitUndo(); updateAudioOffsetBadge(); requestDraw(); });
   $('audioMuteBtn').addEventListener('click',()=>{
     audioMuted=!audioMuted;
     if(audioGain) audioGain.gain.value=audioMuted?0:1;
@@ -3356,10 +3398,32 @@
     $('audioMuteBtn').title=audioMuted?'Unmute audio track':'Mute audio track';
   });
   $('audioLoadBtn').onclick=()=>$('audioFileInput').click();
-  $('audioFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; loadAudio(f); e.target.value=''; });
+  $('audioFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return;
+    state.audioOffset=0; updateAudioOffsetBadge(); loadAudio(f); e.target.value=''; });
   // Drag-and-drop onto the audio canvas
   audioScroll.addEventListener('dragover',e=>e.preventDefault());
-  audioScroll.addEventListener('drop',e=>{ e.preventDefault(); const f=e.dataTransfer.files[0]; if(f&&f.type.startsWith('audio/')) loadAudio(f); });
+  audioScroll.addEventListener('drop',e=>{ e.preventDefault(); const f=e.dataTransfer.files[0];
+    if(f&&f.type.startsWith('audio/')){ state.audioOffset=0; updateAudioOffsetBadge(); loadAudio(f); } });
+  // Drag the waveform to move the audio track's start time — snaps to the
+  // global Snap grid by default, hold Shift for a free (unsnapped) drag,
+  // matching the same convention used for notes/CC points elsewhere.
+  // Double-click resets the offset back to 0.
+  let audioDrag=null;
+  audioCanvas.addEventListener('mousedown',e=>{ if(!audioBuf) return; armUndo();
+    audioDrag={startX:e.clientX, startOffset:state.audioOffset||0, moved:false};
+    audioCanvas.style.cursor='grabbing'; });
+  window.addEventListener('mousemove',e=>{ if(!audioDrag) return;
+    if(Math.abs(e.clientX-audioDrag.startX)>2) audioDrag.moved=true;
+    if(!audioDrag.moved) return;
+    const deltaTicks=(e.clientX-audioDrag.startX)/state.pxPerTick;
+    const raw=audioDrag.startOffset+deltaTicks;
+    state.audioOffset=Math.round(e.shiftKey?raw:snapT(raw));
+    updateAudioOffsetBadge(); requestDraw();
+  });
+  window.addEventListener('mouseup',()=>{ if(!audioDrag) return; audioDrag=null; commitUndo();
+    audioCanvas.style.cursor=audioBuf?'grab':'default'; });
+  audioCanvas.addEventListener('dblclick',()=>{ if(!audioBuf||!state.audioOffset) return;
+    armUndo(); state.audioOffset=0; commitUndo(); updateAudioOffsetBadge(); requestDraw(); });
   // Audio lane grip resize
   { const grip=$('audioGrip');
     grip.addEventListener('mousedown',e=>{ e.preventDefault();

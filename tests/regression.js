@@ -20,6 +20,20 @@ const APP_PATH = path.join(__dirname, '..', 'mmv-midi-editor.html');
 const PORT = 8973;
 const URL = `http://localhost:${PORT}/app.html`;
 
+// Minimal valid mono 16-bit WAV (silence) — decodeAudioData needs real bytes,
+// and a zero-length data chunk gets rejected as invalid audio.
+function makeWavBytes(seconds) {
+  const sampleRate = 44100, numSamples = Math.round(sampleRate * seconds), bytesPerSample = 2, numChannels = 1;
+  const dataSize = numSamples * bytesPerSample * numChannels;
+  const buf = Buffer.alloc(44 + dataSize);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + dataSize, 4); buf.write('WAVE', 8);
+  buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(numChannels, 22);
+  buf.writeUInt32LE(sampleRate, 24); buf.writeUInt32LE(sampleRate * numChannels * bytesPerSample, 28);
+  buf.writeUInt16LE(numChannels * bytesPerSample, 32); buf.writeUInt16LE(16, 34);
+  buf.write('data', 36); buf.writeUInt32LE(dataSize, 40);
+  return [...buf];
+}
+
 function buildTestHtml() {
   let html = fs.readFileSync(APP_PATH, 'utf8');
   html = html.replace('  const state = {', '  window._TEST_state = null;\n  const state = {');
@@ -65,6 +79,8 @@ function buildTestHtml() {
       '  window._TEST_audioFileName = () => document.getElementById(\'audioFileName\').textContent;',
       '  window._TEST_setMidiOutById = (id) => setMidiOutById(id);',
       '  window._TEST_setMidiInById = (id) => setMidiInById(id);',
+      '  window._TEST_loadAudio = (file) => loadAudio(file);',
+      '  window._TEST_audioBufDuration = () => (typeof audioBuf !== "undefined" && audioBuf) ? audioBuf.duration : null;',
       '  init();',
     ].join('\n')
   );
@@ -1608,6 +1624,140 @@ async function run() {
       return { scope: reg.scope, active: !!reg.active };
     });
     check('the service worker (mmv-sw.js) registers and activates', swReg && swReg.active === true, swReg);
+  });
+
+  // ---------------- Audio track: draggable start offset ----------------
+
+  await withPage(browser, async (page) => {
+    const bytes = makeWavBytes(0.5);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(150);
+    check('audio file loads', await page.evaluate(() => window._TEST_audioBufDuration()) === 0.5,
+      await page.evaluate(() => window._TEST_audioBufDuration()));
+
+    // Dragging the waveform (default: snaps to the global Snap grid, 1/16 here).
+    const canvasBox = await page.locator('#audioCanvas').boundingBox();
+    const y = canvasBox.y + canvasBox.height / 2;
+    await page.mouse.move(canvasBox.x + 50, y);
+    await page.mouse.down();
+    await page.mouse.move(canvasBox.x + 250, y, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(50);
+    const snapped = await page.evaluate(() => window._TEST_state.audioOffset);
+    const sixteenth = await page.evaluate(() => window._TEST_state.ppq / 4);
+    check('dragging the audio waveform snaps the offset to the Snap grid by default',
+      snapped !== 0 && snapped % sixteenth === 0, { snapped, sixteenth });
+
+    const badge = await page.evaluate(() => ({
+      text: document.getElementById('audioOffsetBadge').textContent,
+      visible: document.getElementById('audioOffsetBadge').style.display !== 'none',
+    }));
+    check('the offset badge shows and displays a +/- duration once dragged', badge.visible && /^Off [+-]/.test(badge.text), badge);
+
+    // Shift-drag bypasses the snap for a free-form offset (reset to 0 first
+    // so the drag delta below isn't added on top of the previous sub-test's
+    // leftover offset).
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; });
+    await page.keyboard.down('Shift');
+    await page.mouse.move(canvasBox.x + 50, y);
+    await page.mouse.down();
+    await page.mouse.move(canvasBox.x + 50 + 137, y, { steps: 5 });
+    await page.mouse.up();
+    await page.keyboard.up('Shift');
+    await page.waitForTimeout(50);
+    const free = await page.evaluate(() => window._TEST_state.audioOffset);
+    const pxPerTick = await page.evaluate(() => window._TEST_state.pxPerTick);
+    check('holding Shift while dragging bypasses the snap for a free offset',
+      Math.abs(free - Math.round(137 / pxPerTick)) <= 1, { free, expected: Math.round(137 / pxPerTick) });
+
+    // Double-click resets the offset, and it's undoable.
+    await page.mouse.dblclick(canvasBox.x + 300, y);
+    await page.waitForTimeout(50);
+    const afterReset = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('double-clicking the waveform resets the offset to 0', afterReset === 0, afterReset);
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(50);
+    const afterUndo = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('the offset drag is undoable', afterUndo === free, { afterUndo, free });
+
+    // Roundtrips through snapshot/applyState (and therefore .mmvp saves).
+    await page.evaluate((t) => { window._TEST_state.audioOffset = t; }, sixteenth * 5);
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; });
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    const roundTripped = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('audioOffset survives snapshot()/applyState() roundtrip', roundTripped === sixteenth * 5, roundTripped);
+
+    // Loading a NEW file via loadAudio() alone (not through the manual
+    // load-button/drop handlers) must NOT reset a just-restored offset —
+    // this is exactly the path tryAutoLoadAudio takes right after opening a
+    // project, and the project's saved offset has to survive it.
+    await page.evaluate((t) => { window._TEST_state.audioOffset = t; }, 999);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test2.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    const preservedAcrossAutoLoad = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('loadAudio() alone preserves an existing offset (needed for auto-audio-load after opening a project)',
+      preservedAcrossAutoLoad === 999, preservedAcrossAutoLoad);
+  });
+
+  await withPage(browser, async (page) => {
+    // Playback scheduling: spy on AudioBufferSourceNode.start() to verify
+    // play() accounts for the offset correctly in both directions.
+    await page.evaluate(() => {
+      window.__startCalls = [];
+      const origStart = AudioBufferSourceNode.prototype.start;
+      AudioBufferSourceNode.prototype.start = function (when, offset, duration) {
+        window.__startCalls.push({ when, offset, duration, loopStart: this.loopStart, loopEnd: this.loopEnd, currentTime: this.context.currentTime });
+        return origStart.call(this, when, offset, duration);
+      };
+    });
+    const bytes = makeWavBytes(4);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(150);
+
+    const oneBarTicks = await page.evaluate(() => window._TEST_state.ppq * 4);
+
+    // Playhead before the audio's mapped start -> delayed start, buffer offset 0.
+    await page.evaluate((off) => { window._TEST_state.audioOffset = off; window._TEST_state.playhead = 0; }, oneBarTicks);
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(80);
+    await page.evaluate(() => window._TEST_stop());
+    const call1 = await page.evaluate(() => window.__startCalls[window.__startCalls.length - 1]);
+    const expectedDelay = await page.evaluate((off) => window._TEST_tickToSeconds(off), oneBarTicks);
+    check('play() delays the audio source until the playhead reaches a positive offset (silent lead-in)',
+      call1.offset === 0 && (call1.when - call1.currentTime) > expectedDelay * 0.9, call1);
+
+    // Playhead already past the offset -> starts immediately at the right buffer position.
+    await page.evaluate((off) => {
+      window._TEST_state.audioOffset = off;
+      window._TEST_state.playhead = off + window._TEST_state.ppq * 2;
+    }, oneBarTicks);
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(80);
+    await page.evaluate(() => window._TEST_stop());
+    const call2 = await page.evaluate(() => window.__startCalls[window.__startCalls.length - 1]);
+    const expectedOffsetSec = await page.evaluate(() => window._TEST_tickToSeconds(window._TEST_state.ppq * 2));
+    check('play() starts immediately at the correct buffer position once the playhead is past the offset',
+      Math.abs(call2.offset - expectedOffsetSec) < 0.02, { got: call2.offset, expected: expectedOffsetSec });
+
+    // Negative offset (trim) -> starts immediately, buffer offset = |offset| + playhead.
+    await page.evaluate(() => { window._TEST_state.audioOffset = -window._TEST_state.ppq; window._TEST_state.playhead = 0; });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(80);
+    await page.evaluate(() => window._TEST_stop());
+    const call3 = await page.evaluate(() => window.__startCalls[window.__startCalls.length - 1]);
+    const expectedTrimSec = await page.evaluate(() => window._TEST_tickToSeconds(window._TEST_state.ppq));
+    check('a negative offset trims the buffer start (plays from partway into the file, no delay)',
+      Math.abs(call3.offset - expectedTrimSec) < 0.02, { got: call3.offset, expected: expectedTrimSec });
   });
 
   await browser.close();
