@@ -53,6 +53,18 @@ function buildTestHtml() {
       '  window._TEST_nearestBarAt = (t) => nearestBarAt(t);',
       '  window._TEST_applyScrollLock = () => applyScrollLock();',
       '  window._TEST_prScrollWidth = () => document.getElementById(\'prScroll\').clientWidth;',
+      '  window._TEST_hasFSA = () => hasFSA;',
+      '  window._TEST_setProjDirHandle = (h) => { projDirHandle = h; };',
+      '  window._TEST_getProjDirHandle = () => projDirHandle;',
+      '  window._TEST_renderProjList = () => renderProjList();',
+      '  window._TEST_saveProject = () => saveProject();',
+      '  window._TEST_loadProject = (file) => loadProject(file);',
+      '  window._TEST_tryAutoLoadAudio = (n) => tryAutoLoadAudio(n);',
+      '  window._TEST_idbGet = (k) => idbGet(k);',
+      '  window._TEST_idbSet = (k, v) => idbSet(k, v);',
+      '  window._TEST_audioFileName = () => document.getElementById(\'audioFileName\').textContent;',
+      '  window._TEST_setMidiOutById = (id) => setMidiOutById(id);',
+      '  window._TEST_setMidiInById = (id) => setMidiInById(id);',
       '  init();',
     ].join('\n')
   );
@@ -79,7 +91,17 @@ async function withPage(browser, fn) {
 
 async function run() {
   const testHtml = buildTestHtml();
+  const swPath = path.join(__dirname, '..', 'mmv-sw.js');
   const server = http.createServer((req, res) => {
+    // The app registers its service worker via a relative 'mmv-sw.js' URL —
+    // serve the real sibling file for that path (with a JS MIME type, which
+    // browsers require for SW registration) so that behavior is actually
+    // exercised, and fall back to the injected test HTML for everything else.
+    if (req.url.split('?')[0] === '/mmv-sw.js' && fs.existsSync(swPath)) {
+      res.writeHead(200, { 'Content-Type': 'application/javascript' });
+      res.end(fs.readFileSync(swPath, 'utf8'));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(testHtml);
   });
@@ -1410,6 +1432,182 @@ async function run() {
     }, { farTick, viewW });
     check('Scroll Lock centers the playhead once it is past the middle of the view',
       Math.abs(result.scrollLeft - result.expected) < 2, result);
+  });
+
+  // ---------------- File System Access: recent projects, direct-folder save, auto-audio ----------------
+  // Chromium ships the File System Access API but showDirectoryPicker()/
+  // showOpenFilePicker() need a real native dialog — unreachable headlessly.
+  // Instead these tests inject an in-memory mock FileSystemDirectoryHandle
+  // (same shape: kind/name/queryPermission/requestPermission/getFileHandle/
+  // entries) via the projDirHandle test hook, exercising every layer of app
+  // logic above the picker call itself (which is a single line we trust the
+  // browser to implement correctly).
+
+  await withPage(browser, async (page) => {
+    const hasFSA = await page.evaluate(() => window._TEST_hasFSA());
+    check('File System Access API is available in this browser', hasFSA === true, hasFSA);
+
+    const seeded = await page.evaluate(() => {
+      class MockFileHandle {
+        constructor(name, content, lastModified) { this.kind = 'file'; this.name = name; this._content = content; this._lastModified = lastModified; }
+        async getFile() { return new File([this._content], this.name, { lastModified: this._lastModified }); }
+        async createWritable() {
+          const self = this;
+          return { async write(s) { this._buf = s; }, async close() { self._content = this._buf; self._lastModified = Date.now(); } };
+        }
+      }
+      class MockDirHandle {
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); }
+        async queryPermission() { return 'granted'; }
+        async requestPermission() { return 'granted'; }
+        async getFileHandle(name, opts) {
+          if (!this._files.has(name)) {
+            if (opts && opts.create) this._files.set(name, new MockFileHandle(name, '', Date.now()));
+            else { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          }
+          return this._files.get(name);
+        }
+        async *entries() { for (const [name, handle] of this._files) yield [name, handle]; }
+      }
+      const proj = (name) => JSON.stringify({ version: 1, projectName: name, snapshot: { notes: [], ccLanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: name, locS: null, locE: null } });
+      // A minimal (silent, 4-sample) valid WAV so decodeAudioData actually
+      // succeeds — a zero-length data chunk gets rejected as invalid audio.
+      const wavBytes = new Uint8Array([
+        0x52,0x49,0x46,0x46, 0x2c,0x00,0x00,0x00, 0x57,0x41,0x56,0x45,
+        0x66,0x6d,0x74,0x20, 0x10,0x00,0x00,0x00, 0x01,0x00, 0x01,0x00,
+        0x44,0xac,0x00,0x00, 0x88,0x58,0x01,0x00, 0x02,0x00, 0x10,0x00,
+        0x64,0x61,0x74,0x61, 0x08,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      ]);
+      const dir = new MockDirHandle('MyProjects');
+      dir._files.set('song-a.mmvp', new MockFileHandle('song-a.mmvp', proj('song-a'), Date.now() - 5000));
+      dir._files.set('song-b.mmvp', new MockFileHandle('song-b.mmvp', proj('song-b'), Date.now() - 1000));
+      dir._files.set('notes.txt', new MockFileHandle('notes.txt', 'not a project', Date.now()));
+      dir._files.set('song-a.wav', new MockFileHandle('song-a.wav', wavBytes, Date.now() - 5000));
+      window._TEST_setProjDirHandle(dir);
+      window.__mockDir = dir;
+      return { fileCount: dir._files.size };
+    });
+    check('mock projects folder seeded', seeded.fileCount === 4, seeded);
+
+    await page.evaluate(() => window._TEST_renderProjList());
+    const listItems = await page.evaluate(() => [...document.querySelectorAll('#projList button')].map(b => b.querySelector('span').textContent));
+    check('Recent Projects list shows only .mmvp files, newest first', JSON.stringify(listItems) === JSON.stringify(['song-b', 'song-a']), listItems);
+
+    await page.evaluate(async () => {
+      const fh = window.__mockDir._files.get('song-a.mmvp');
+      window._TEST_loadProject(await fh.getFile());
+    });
+    await page.waitForTimeout(80);
+    const projectName = await page.evaluate(() => window._TEST_state.projectName);
+    check('opening a project from the Recent Projects list loads it', projectName === 'song-a', projectName);
+
+    await page.evaluate(() => window._TEST_tryAutoLoadAudio('song-a'));
+    await page.waitForTimeout(150);
+    const audioName = await page.evaluate(() => window._TEST_audioFileName());
+    check('auto-locates and loads a same-named audio file next to the opened project', audioName === 'song-a.wav', audioName);
+
+    await page.evaluate(() => { window._TEST_state.projectName = 'brand-new-song'; });
+    await page.evaluate(() => window._TEST_saveProject());
+    await page.waitForTimeout(50);
+    const savedInDir = await page.evaluate(() => window.__mockDir._files.has('brand-new-song.mmvp'));
+    check('Save Project writes directly into the remembered folder when one is set', savedInDir === true, savedInDir);
+
+    await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  await withPage(browser, async (page) => {
+    // IndexedDB plumbing (open/upgrade/get/put) with a plain cloneable value —
+    // real FileSystemDirectoryHandle round-tripping can't be exercised
+    // headlessly since it requires a native picker, but the DB layer itself
+    // (shared by both) is fully testable this way.
+    await page.evaluate(() => window._TEST_idbSet('testKey', { hello: 'world' }));
+    const val = await page.evaluate(() => window._TEST_idbGet('testKey'));
+    check('IndexedDB handle-store get/set round-trips a value', JSON.stringify(val) === JSON.stringify({ hello: 'world' }), val);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Recent Projects popover opens on click and closes on an outside click,
+    // matching the existing recPopover/tsPanel dismissal pattern.
+    await page.click('#loadProjectBtn');
+    await page.waitForTimeout(50);
+    const openAfterClick = await page.evaluate(() => document.getElementById('projPopover').classList.contains('open'));
+    await page.mouse.click(5, 5);
+    await page.waitForTimeout(50);
+    const closedAfterOutsideClick = await page.evaluate(() => !document.getElementById('projPopover').classList.contains('open'));
+    check('Recent Projects popover opens on click and closes on outside click',
+      openAfterClick && closedAfterOutsideClick, { openAfterClick, closedAfterOutsideClick });
+  });
+
+  // ---------------- MIDI: auto-init on already-granted permission, device persistence ----------------
+
+  await withPage(browser, async (page) => {
+    // Without permission pre-granted, the app must NOT auto-connect (no
+    // surprise prompt/side effect on a plain page load).
+    const outDisabled = await page.evaluate(() => document.getElementById('midiOut').disabled);
+    check('MIDI does not auto-connect on load without a prior permission grant', outDisabled === true, outDisabled);
+  });
+
+  {
+    const midiCtx = await browser.newContext();
+    await midiCtx.grantPermissions(['midi'], { origin: `http://localhost:${PORT}` });
+    const page = await midiCtx.newPage();
+    page.on('pageerror', e => console.log('  [page error]', e.message));
+    await page.goto(URL);
+    await page.waitForTimeout(600);
+    // Auto-init fires (calls initMidi()) purely because navigator.permissions
+    // reports 'granted', with zero clicks — verified by midiStatus changing
+    // from its empty default. (Asserting a successful *connection* isn't
+    // possible here: requestMIDIAccess() itself fails in this headless/CDP
+    // environment since there's no real MIDI backend to attach to, even
+    // though the permission grant is honored — that's an environment limit,
+    // not something this test claims to cover. The button-click path already
+    // uses this identical initMidi() call and works in real desktop Chrome.)
+    const statusNonEmpty = await page.evaluate(() => document.getElementById('midiStatus').textContent.length > 0);
+    check('MIDI auto-init fires with no click when permission is already granted',
+      statusNonEmpty, { statusNonEmpty });
+    await midiCtx.close();
+  }
+
+  await withPage(browser, async (page) => {
+    // Device-preference persistence: localStorage round-trip for the
+    // remembered MIDI Out/In device (id + name fallback). Real MIDIPort
+    // objects can't be constructed in script, so this covers the storage
+    // layer that populateOuts()/populateIns() read from on the next launch.
+    await page.evaluate(() => localStorage.removeItem('mmv-midi-out'));
+    await page.evaluate(() => window._TEST_setMidiOutById(''));
+    const afterEmpty = await page.evaluate(() => localStorage.getItem('mmv-midi-out'));
+    check('selecting no MIDI device does not write a bogus preference', afterEmpty === null, afterEmpty);
+  });
+
+  // ---------------- PWA: manifest + service worker ----------------
+
+  await withPage(browser, async (page) => {
+    await page.waitForTimeout(400); // let setupPWA()'s SW registration settle
+    const href = await page.evaluate(() => document.querySelector('link[rel="manifest"]')?.href);
+    check('a web app manifest link is injected', !!href && href.startsWith('blob:'), href);
+
+    const manifest = await page.evaluate(async (h) => (await fetch(h)).json(), href);
+    check('manifest has a name, standalone display, and two icon sizes',
+      manifest.name && manifest.display === 'standalone' && manifest.icons?.length === 2 &&
+      manifest.icons.some(i => i.sizes === '192x192') && manifest.icons.some(i => i.sizes === '512x512'),
+      { name: manifest.name, display: manifest.display, iconSizes: manifest.icons?.map(i => i.sizes) });
+
+    const iconDims = await page.evaluate((src) => new Promise((res) => {
+      const img = new Image();
+      img.onload = () => res({ w: img.naturalWidth, h: img.naturalHeight });
+      img.onerror = () => res(null);
+      img.src = src;
+    }), manifest.icons[1].src);
+    check('the 512x512 manifest icon is a decodable image of the right size',
+      iconDims && iconDims.w === 512 && iconDims.h === 512, iconDims);
+
+    const swReg = await page.evaluate(async () => {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg) return null;
+      await navigator.serviceWorker.ready;
+      return { scope: reg.scope, active: !!reg.active };
+    });
+    check('the service worker (mmv-sw.js) registers and activates', swReg && swReg.active === true, swReg);
   });
 
   await browser.close();

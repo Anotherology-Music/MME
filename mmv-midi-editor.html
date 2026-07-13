@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.7.7
+  MMV MIDI & CC Curve Editor v0.8.0
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -63,6 +63,21 @@
   plain "X/N") and is 50% wider so 2-3 digit step counts display fully;
   Val/Pos/Steps labels shortened to single letters and the Pos field no
   longer balloons to fill leftover space, freeing room for the badge.
+  v0.8.0 Local-workflow convenience (Chromium only, feature-detected —
+  browsers without the File System Access API fall back to the original
+  flow unchanged): remember a "Projects Folder" once (Load Project ▾ ▸
+  Choose Projects Folder) and Load Project shows a one-click Recent
+  Projects list from it instead of an OS file dialog every time; Save
+  Project writes straight into that folder once it's set; opening a
+  project auto-locates and loads a same-named audio file next to it. MIDI
+  auto-connects on launch with no "Enable" click whenever this origin
+  already has Web MIDI permission granted, and the last-selected MIDI
+  Out/In devices auto-reselect themselves. Installable as a PWA (own
+  window/taskbar icon): a web app manifest is generated at runtime as a
+  Blob URL (icons drawn on canvas, no extra image files) so the app stays
+  a single distributable .html; a small companion mmv-sw.js service
+  worker must ship alongside it for the install/offline-shell capability
+  (needs a secure context — https:// or http://localhost, not file://).
 -->
 <style>
   * { box-sizing: border-box; }
@@ -148,6 +163,14 @@
   #recPopover{position:absolute;top:calc(100% + 3px);left:0;width:220px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;flex-direction:column;gap:6px;padding:9px 12px;}
   #recPopover.open{display:flex;}
   #recPopover .setup-row{gap:6px;}
+  #projWrapper{position:relative;display:inline-flex;}
+  #projPopover{position:absolute;top:calc(100% + 3px);left:0;width:280px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;flex-direction:column;gap:6px;padding:9px 12px;}
+  #projPopover.open{display:flex;}
+  #projList{display:flex;flex-direction:column;gap:2px;max-height:220px;overflow-y:auto;}
+  #projList button{display:flex;justify-content:space-between;gap:8px;text-align:left;width:100%;font-size:11px;padding:4px 7px;background:var(--panel2);}
+  #projList button:hover{border-color:var(--accent);}
+  #projList button .projFileTime{color:var(--txt2);font-size:9px;flex-shrink:0;}
+  #projList .hint{font-size:11px;color:var(--txt2);}
   .dur{font-family:ui-monospace,Consolas,monospace;color:var(--txt);cursor:pointer;border:1px solid var(--line);
     border-radius:5px;padding:4px 7px;background:var(--panel2);min-width:96px;text-align:center;}
   .dur:hover{border-color:var(--accent);}
@@ -359,7 +382,19 @@
       <span class="lbl">Project</span>
       <input type="text" id="projectName" placeholder="Project name" style="flex:1;min-width:120px;font-size:12px;" title="Project name — used as the filename when exporting">
       <button id="saveProjectBtn" style="padding:3px 7px;" title="Save project as a .mmvp file (includes all notes, CC, settings — audio must be reloaded separately)">&#x1F4BE;</button>
-      <button id="loadProjectBtn" style="padding:3px 7px;" title="Load a previously saved .mmvp project file">&#x1F4C2;</button>
+      <div id="projWrapper">
+        <button id="loadProjectBtn" style="padding:3px 7px;" title="Load a previously saved .mmvp project file">&#x1F4C2;</button>
+        <div id="projPopover">
+          <div class="setup-title">Recent Projects</div>
+          <div id="projList"><span class="hint">—</span></div>
+          <div class="setup-row">
+            <button id="projPickFolderBtn" title="Remember a folder so projects (and matching audio) can be opened with one click">Choose Projects Folder…</button>
+          </div>
+          <div class="setup-row">
+            <button id="projBrowseBtn" title="Pick a single .mmvp file the usual way">Browse for file…</button>
+          </div>
+        </div>
+      </div>
       <input type="file" id="projectFileInput" accept=".mmvp,.json" style="display:none">
       <div class="sep" style="height:18px;"></div>
       <div class="group">
@@ -2437,9 +2472,114 @@
   function exportSyncTrack(){ const bytes=buildSyncTrack(); const blob=new Blob([bytes],{type:'audio/midi'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=projFilename('-sync.mid'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
 
-  function saveProject(){
+  // ---------- File System Access (recent projects, direct folder save, auto-audio) ----------
+  // Chromium-only convenience layer for local use: remembering a "Projects
+  // Folder" once lets Load Project show a one-click list instead of an OS
+  // file dialog every time, lets Save Project write straight into it, and
+  // lets opening a project auto-locate a same-named audio file next to it —
+  // all the file-picker steps the classic flow needs, gone after one-time
+  // setup. Fully feature-detected: browsers without the File System Access
+  // API (Firefox, Safari) keep the original <input type=file>/download flow
+  // untouched, and the "Projects Folder" UI just says so instead of showing.
+  const hasFSA = 'showDirectoryPicker' in window;
+  let projDirHandle = null; // FileSystemDirectoryHandle, once chosen/restored
+
+  function idbOpen(){ return new Promise((res,rej)=>{ const rq=indexedDB.open('mmv-fsa',1);
+    rq.onupgradeneeded=()=>rq.result.createObjectStore('handles');
+    rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error); }); }
+  async function idbGet(key){ const db=await idbOpen(); return new Promise((res,rej)=>{
+    const tx=db.transaction('handles','readonly'); const rq=tx.objectStore('handles').get(key);
+    rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error); }); }
+  async function idbSet(key,val){ const db=await idbOpen(); return new Promise((res,rej)=>{
+    const tx=db.transaction('handles','readwrite'); tx.objectStore('handles').put(val,key);
+    tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
+
+  // queryPermission/requestPermission ship as part of the File System Access
+  // API on FileSystemHandle even where TS lib typings lag behind.
+  async function verifyDirPermission(handle,forWrite){
+    const opts={mode:forWrite?'readwrite':'read'};
+    if(await handle.queryPermission(opts)==='granted') return true;
+    if(await handle.requestPermission(opts)==='granted') return true;
+    return false;
+  }
+  async function restoreProjDir(){
+    if(!hasFSA) return;
+    try{
+      const h=await idbGet('projectsDir');
+      if(h && await h.queryPermission({mode:'read'})==='granted') projDirHandle=h;
+    }catch(e){ /* IndexedDB unavailable, or the handle no longer resolves — user can re-pick */ }
+  }
+  async function pickProjectsFolder(){
+    if(!hasFSA) return;
+    try{
+      const h=await window.showDirectoryPicker({id:'mmv-projects',mode:'readwrite'});
+      projDirHandle=h; await idbSet('projectsDir',h);
+      flash('Projects folder set: '+h.name);
+      renderProjList();
+    }catch(e){ if(e.name!=='AbortError') flash('Could not set projects folder: '+e.message); }
+  }
+  const AUDIO_EXTS=['mp3','wav','ogg','m4a','flac','aac'];
+  async function tryAutoLoadAudio(baseName){
+    if(!projDirHandle) return;
+    if(!await verifyDirPermission(projDirHandle,false)) return;
+    for(const ext of AUDIO_EXTS){
+      try{
+        const fh=await projDirHandle.getFileHandle(baseName+'.'+ext);
+        const file=await fh.getFile();
+        await loadAudio(file);
+        flash('Auto-loaded audio: '+file.name);
+        return;
+      }catch(e){ /* not found with this extension — try the next one */ }
+    }
+  }
+  async function listProjectFiles(){
+    if(!projDirHandle) return [];
+    if(!await verifyDirPermission(projDirHandle,false)) return [];
+    const out=[];
+    for await (const [name,handle] of projDirHandle.entries()){
+      if(handle.kind==='file' && /\.mmvp$/i.test(name)){
+        const file=await handle.getFile();
+        out.push({name,handle,lastModified:file.lastModified});
+      }
+    }
+    out.sort((a,b)=>b.lastModified-a.lastModified);
+    return out;
+  }
+  async function renderProjList(){
+    const list=$('projList'); if(!list) return;
+    if(!hasFSA){ list.innerHTML='<span class="hint">Not supported in this browser — use Browse for file.</span>'; return; }
+    if(!projDirHandle){ list.innerHTML='<span class="hint">No folder set yet — choose one below.</span>'; return; }
+    list.innerHTML='<span class="hint">Loading…</span>';
+    const files=await listProjectFiles();
+    if(!files.length){ list.innerHTML='<span class="hint">No .mmvp files found in '+projDirHandle.name+'.</span>'; return; }
+    list.innerHTML='';
+    for(const f of files){
+      const b=document.createElement('button');
+      const nameSpan=document.createElement('span'); nameSpan.textContent=f.name.replace(/\.mmvp$/i,'');
+      const timeSpan=document.createElement('span'); timeSpan.className='projFileTime'; timeSpan.textContent=new Date(f.lastModified).toLocaleDateString();
+      b.appendChild(nameSpan); b.appendChild(timeSpan);
+      b.title='Open '+f.name;
+      b.addEventListener('click',async()=>{
+        $('projPopover').classList.remove('open');
+        const file=await f.handle.getFile();
+        loadProject(file);
+        await tryAutoLoadAudio(f.name.replace(/\.mmvp$/i,''));
+      });
+      list.appendChild(b);
+    }
+  }
+  async function saveProject(){
     const data={version:1,projectName:state.projectName,audioFile:$('audioFileName').textContent!=='No audio'?$('audioFileName').textContent:'',snapshot:JSON.parse(snapshot())};
-    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const json=JSON.stringify(data,null,2);
+    if(projDirHandle && await verifyDirPermission(projDirHandle,true)){
+      try{
+        const fh=await projDirHandle.getFileHandle(projFilename('.mmvp'),{create:true});
+        const w=await fh.createWritable(); await w.write(json); await w.close();
+        flash('Saved to '+projDirHandle.name+'/'+projFilename('.mmvp'));
+        return;
+      }catch(e){ flash('Could not save to folder ('+e.message+') — downloading instead'); }
+    }
+    const blob=new Blob([json],{type:'application/json'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
     a.download=projFilename('.mmvp'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
   }
@@ -2664,11 +2804,25 @@
     }
     catch(err){ settled=true; setMidiStatus('⚠ '+err.message); }
   }
+  // Remembers the last-chosen MIDI Out/In device (id + name — id is usually
+  // stable across launches for the same physical port on Chrome, but name
+  // is kept as a fallback match in case it isn't) so the device auto-selects
+  // itself once ports are populated, instead of defaulting to "— none —"
+  // and requiring a manual reselect every launch.
+  function rememberMidiPort(key,port){ if(!port) return; try{ localStorage.setItem(key,JSON.stringify({id:port.id,name:port.name})); }catch(e){} }
+  function preferredMidiId(key,ports){
+    try{
+      const saved=JSON.parse(localStorage.getItem(key)||'null'); if(!saved) return '';
+      const byId=ports.find(p=>p.id===saved.id); if(byId) return byId.id;
+      const byName=ports.find(p=>p.name===saved.name); if(byName) return byName.id;
+    }catch(e){}
+    return '';
+  }
   function populateOuts(){
-    const sel=$('midiOut'); const cur=lastMidiOutId||sel.value;
+    const sel=$('midiOut'); const ports=midiAccess?[...midiAccess.outputs.values()]:[];
+    const cur=lastMidiOutId||sel.value||preferredMidiId('mmv-midi-out',ports);
     sel.innerHTML='<option value="">— none —</option>';
-    if(midiAccess){ for(const o of midiAccess.outputs.values()){
-      const op=document.createElement('option'); op.value=o.id; op.textContent=o.name+(o.state==='disconnected'?' [off]':''); sel.appendChild(op); } }
+    for(const o of ports){ const op=document.createElement('option'); op.value=o.id; op.textContent=o.name+(o.state==='disconnected'?' [off]':''); sel.appendChild(op); }
     if(cur){ sel.value=cur; } setMidiOutById(sel.value);
   }
   function setMidiOutById(id){
@@ -2676,18 +2830,20 @@
     $('midiOut').value=id||'';
     const port=(midiAccess&&id)?midiAccess.outputs.get(id):null;
     state.midiOut=(port&&port.state!=='disconnected')?port:null;
+    rememberMidiPort('mmv-midi-out',port);
   }
   function populateIns(){
-    const sel=$('midiIn'); const cur=sel.value;
+    const sel=$('midiIn'); const ports=midiAccess?[...midiAccess.inputs.values()]:[];
+    const cur=sel.value||preferredMidiId('mmv-midi-in',ports);
     sel.innerHTML='<option value="">— none —</option>';
-    if(midiAccess){ for(const i of midiAccess.inputs.values()){
-      const op=document.createElement('option'); op.value=i.id; op.textContent=i.name+(i.state==='disconnected'?' [off]':''); sel.appendChild(op); } }
+    for(const i of ports){ const op=document.createElement('option'); op.value=i.id; op.textContent=i.name+(i.state==='disconnected'?' [off]':''); sel.appendChild(op); }
     if(cur){ sel.value=cur; } setMidiInById(sel.value);
   }
   function setMidiInById(id){
     if(midiInPort) midiInPort.onmidimessage=null;
     midiInPort=(midiAccess&&id)?midiAccess.inputs.get(id):null;
     if(midiInPort) midiInPort.onmidimessage=onMidiIn;
+    rememberMidiPort('mmv-midi-in',midiInPort);
   }
   let followScheduledBeats=new Set(), followSentNotes=new Set(), lastSyncBeatIdx=-1;
 
@@ -3171,8 +3327,16 @@
     if(state.scrollLock) applyScrollLock(); });
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
   $('saveProjectBtn').onclick=saveProject;
-  $('loadProjectBtn').onclick=()=>$('projectFileInput').click();
-  $('projectFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; loadProject(f); e.target.value=''; });
+  $('loadProjectBtn').addEventListener('click',e=>{ e.stopPropagation();
+    if(!hasFSA){ $('projectFileInput').click(); return; }
+    const open=$('projPopover').classList.toggle('open');
+    if(open) renderProjList();
+  });
+  $('projPickFolderBtn').addEventListener('click',pickProjectsFolder);
+  $('projBrowseBtn').addEventListener('click',()=>{ $('projPopover').classList.remove('open'); $('projectFileInput').click(); });
+  $('projectFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; loadProject(f);
+    tryAutoLoadAudio(f.name.replace(/\.mmvp$/i,'')); e.target.value=''; });
+  restoreProjDir();
 
   // ---------- Audio track ----------
   async function loadAudio(file){
@@ -3218,6 +3382,17 @@
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
   $('midiEnable').onclick=initMidi; $('midiOut').addEventListener('change',e=>setMidiOutById(e.target.value));
+  // Skip the manual "Enable" click on repeat launches: if this origin already
+  // has MIDI permission granted (from a previous session), silently connect
+  // on load instead of waiting for the button. Browsers still enforce the
+  // permission prompt itself the first time — this only skips re-asking.
+  (async function autoInitMidi(){
+    if(!navigator.requestMIDIAccess || !navigator.permissions) return;
+    try{
+      const status=await navigator.permissions.query({name:'midi',sysex:false});
+      if(status.state==='granted') initMidi();
+    }catch(e){ /* permissions.query({name:'midi'}) not supported everywhere — manual Enable still works */ }
+  })();
   $('undoBtn').onclick=undo; $('redoBtn').onclick=redo;
 
   window.addEventListener('keydown',e=>{
@@ -3968,6 +4143,55 @@
     });
   })();
 
+  // ---------- PWA install support (manifest + service worker) ----------
+  // Generates a Web App Manifest at runtime (as a Blob URL) so the app can
+  // be "installed" as its own window/taskbar icon, while staying a single
+  // distributable .html file — no separate manifest.json to lose track of.
+  // Icons are drawn on a canvas at load time rather than shipped as image
+  // files, for the same reason. Both the manifest and the service worker
+  // need a secure context (https:// or http://localhost) — over plain
+  // file:// this silently does nothing, same as the browser already refuses
+  // service worker registration there; the app itself is unaffected either
+  // way. The service worker itself (mmv-sw.js) must ship as a real sibling
+  // file next to whichever name this HTML is served as — a blob/data URL
+  // isn't allowed as a service worker script by spec.
+  function makeAppIcon(size){
+    const c=document.createElement('canvas'); c.width=size; c.height=size;
+    const ctx=c.getContext('2d');
+    const r=size*0.18;
+    ctx.fillStyle='#15171c';
+    ctx.beginPath(); ctx.moveTo(r,0); ctx.arcTo(size,0,size,size,r); ctx.arcTo(size,size,0,size,r); ctx.arcTo(0,size,0,0,r); ctx.arcTo(0,0,size,0,r); ctx.closePath(); ctx.fill();
+    // Stylised CC curve + points, in the app's own accent colors.
+    ctx.strokeStyle='#4fa3ff'; ctx.lineWidth=size*0.055; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.beginPath();
+    const pts=[[0.14,0.72],[0.32,0.72],[0.44,0.30],[0.56,0.62],[0.68,0.28],[0.86,0.28]];
+    pts.forEach(([x,y],i)=>{ const px=x*size, py=y*size; i===0?ctx.moveTo(px,py):ctx.lineTo(px,py); });
+    ctx.stroke();
+    ctx.fillStyle='#ffb454';
+    for(const [x,y] of [[0.32,0.72],[0.56,0.62],[0.86,0.28]]){ ctx.beginPath(); ctx.arc(x*size,y*size,size*0.045,0,7); ctx.fill(); }
+    return c.toDataURL('image/png');
+  }
+  function setupPWA(){
+    try{
+      const manifest={
+        name:'MME — MIDI & CC Curve Editor', short_name:'MME',
+        start_url:location.origin+location.pathname, scope:new URL('.',location.href).href,
+        display:'standalone', background_color:'#15171c', theme_color:'#15171c',
+        icons:[
+          {src:makeAppIcon(192),sizes:'192x192',type:'image/png'},
+          {src:makeAppIcon(512),sizes:'512x512',type:'image/png'},
+        ],
+      };
+      const blob=new Blob([JSON.stringify(manifest)],{type:'application/manifest+json'});
+      const link=document.createElement('link'); link.rel='manifest'; link.href=URL.createObjectURL(blob);
+      document.head.appendChild(link);
+    }catch(e){ /* canvas/Blob unavailable — no install prompt, app still works normally */ }
+    if('serviceWorker' in navigator && (location.protocol==='https:'||location.hostname==='localhost')){
+      navigator.serviceWorker.register(new URL('mmv-sw.js',location.href).href)
+        .catch(()=>{ /* companion mmv-sw.js missing, or blocked — app still works, just not installable/offline-capable */ });
+    }
+  }
+
   // ---------- Init ----------
   function init(){
     schedWorker=makeWorker();
@@ -4357,8 +4581,9 @@
 
     document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; }
       if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; }
-      if(!$('recWrapper').contains(e.target)){ $('recPopover').classList.remove('open'); } });
-    document.addEventListener('keydown',e=>{ if(e.key==='Escape') $('recPopover').classList.remove('open'); });
+      if(!$('recWrapper').contains(e.target)){ $('recPopover').classList.remove('open'); }
+      if(!$('projWrapper').contains(e.target)){ $('projPopover').classList.remove('open'); } });
+    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); } });
     window.addEventListener('resize',resizeCanvases); resizeCanvases();
     attachGrip($('gripVel'), $('velRow'), ()=>velCanvas, ()=>velScroll, 'down');
     (()=>{ const sp=$('prSplitter'),pr=document.querySelector('.piano-row'); let spd=null;
@@ -4389,6 +4614,7 @@
     keysCanvas.style.transform='translateY('+(-state.scrollTop)+'px)'; prCanvas.style.transform='translate(0px,'+state.scrollTop+'px)';
     updatePlayheadEl(); updateUndoBtns(); updateLoopStatus(); updatePlayPos(); updateTransportBtns(); updateDuration();
     requestDraw();
+    setupPWA();
   }
   init();
 })();
