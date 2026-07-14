@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.1
+  MMV MIDI & CC Curve Editor v0.9.2
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -113,6 +113,21 @@
   data, so it's now cleared whenever a project loads (a matching audio
   file still auto-loads afterward if one's found next to it). Also added
   a × button next to Load to remove the current audio at any time.
+  v0.9.2 Audio Latency Trim: a new Setup panel field (Advanced, ms,
+  ±2000) fine-corrects audio playback timing independent of the
+  drag-to-reposition offset — useful for MP3 decoder priming-silence or
+  output-latency lag versus a DAW's metronome. Positive plays the audio
+  earlier; it only affects playback scheduling, never the waveform's
+  visual position or the offset badge. Deleting a CC lane now asks
+  "Delete CC Lane?" before removing it (the Mute/Delete icons sit close
+  together and are easy to hit by mistake). Fixed the tag/ALL Mute/Solo
+  long-press: it's now a genuinely different, one-way "force on" action
+  that never toggles a group off, even if every lane in it is already in
+  the target state — previously it behaved identically to a short click.
+  Fixed a bug where minimized CC lanes could shrink to near-zero height
+  and effectively vanish once several were minimized at once (a flex-
+  shrink CSS defect, not a scrolling issue) — minimized lanes now keep a
+  fixed, protected height regardless of how many siblings are minimized.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -258,7 +273,15 @@
   /* Lane collapsed state */
   .lane.lane-hidden .grip{display:none;}
   .lane.lane-hidden .lanebody{display:none;}
-  .lane.lane-hidden{height:auto!important;min-height:0!important;}
+  /* flex-shrink:0 is the actual fix here: a plain min-height:0 still let the
+     flex algorithm crush a minimized lane toward 0px once enough of them
+     were competing with the rest of the lane list for space (the more you
+     minimized, the more "shrinkable slack" accumulated across them) — they'd
+     visually vanish until scrolled to where flex-shrink happened to still
+     leave them a sliver. Locking min-height to the top-bar's own fixed
+     height and refusing to shrink at all fixes that regardless of how many
+     lanes (minimized or not) are stacked above/below it. */
+  .lane.lane-hidden{height:auto!important;min-height:22px!important;flex-shrink:0!important;}
   /* Below the height that fits all 3 leftcol rows, hide val-row outright
      rather than let it clip mid-row — keeps name-row and compact-row always
      fully visible within the lane's own bounds. */
@@ -528,6 +551,11 @@
               <option value="8">8/beat</option><option value="16">16/beat</option>
               <option value="24" selected>24/beat</option><option value="48">48/beat</option>
             </select>
+          </div>
+          <div class="setup-row">
+            <span class="lbl">Audio Latency Trim</span>
+            <input type="number" id="audioLatencyMs" value="0" step="1" style="width:64px;" title="Fine correction (ms) for audio decode/output latency — e.g. MP3 encoder priming silence that makes the track sound like it lags the beat. Positive = play audio earlier. Doesn't move the waveform — only affects playback timing.">
+            <span class="pill">ms</span>
           </div>
         </div>
         <div class="setup-section">
@@ -912,7 +940,7 @@
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
     playing:false, playhead:0, lastPlayStart:0, midiOut:null, clipboard:null,
     locStart:null, locEnd:null, syncFollow:false, mmvSmooth:true, scrollLock:false,
-    audioOffset:0,
+    audioOffset:0, audioLatencyMs:0,
   };
   const PITCH_MIN=0, PITCH_MAX=127, NPITCH=128;
   const LANE_COLORS=['#4fa3ff','#ffb454','#7ed957','#ff6fae','#b18cff','#36d1c4','#ff8a5c','#c9d24f'];
@@ -1020,6 +1048,15 @@
     return barStart+beat*tpe+tk; }
   function tickToSeconds(t){ return t/ticksPerBeat()*(60/state.bpm); }
   function secondsToTicks(s){ return s*ticksPerBeat()*state.bpm/60; }
+  // Combines the coarse drag offset (audioOffset, ticks — where you've
+  // positioned the track) with the fine latency trim (audioLatencyMs, a
+  // fixed ms correction for decoder/output latency, e.g. MP3 encoder
+  // priming silence) into one effective offset for playback scheduling.
+  // Positive audioLatencyMs pulls the audio EARLIER (use it when audio
+  // sounds like it's lagging behind the beat). Deliberately not used by
+  // drawAudioWave()/the offset badge — the trim is an inaudible-until-you-
+  // need-it correction, not a visible timeline edit.
+  function effectiveAudioOffsetTicks(){ return (state.audioOffset||0)-secondsToTicks((state.audioLatencyMs||0)/1000); }
   function songSeconds(){ return tickToSeconds(totalTicks()); }
   function p2(n){ return String(n).padStart(2,'0'); }
   function fmtHMS(sec){ const cs=Math.floor((sec*100)%100), s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return p2(h)+':'+p2(m)+':'+p2(s)+':'+p2(cs); }
@@ -1128,7 +1165,7 @@
     sweepOn:state.sweepOn,sweepFreqStart:state.sweepFreqStart,sweepFreqEnd:state.sweepFreqEnd,
     sweepAmpLoStart:state.sweepAmpLoStart,sweepAmpLoEnd:state.sweepAmpLoEnd,
     sweepAmpHiStart:state.sweepAmpHiStart,sweepAmpHiEnd:state.sweepAmpHiEnd,
-    audioOffset:state.audioOffset||0 }); }
+    audioOffset:state.audioOffset||0, audioLatencyMs:state.audioLatencyMs||0 }); }
   function pushUndo(){ undoStack.push(snapshot()); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); }
   function armUndo(){ pending=snapshot(); }
   function commitUndo(){ if(pending){ if(snapshot()!==pending){ undoStack.push(pending); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); } pending=null; } }
@@ -1153,6 +1190,7 @@
     if(o.sweepFreqEnd){ state.sweepFreqEnd=o.sweepFreqEnd; if($('advFreqEnd')) $('advFreqEnd').value=o.sweepFreqEnd; }
     ['sweepAmpLoStart','sweepAmpLoEnd','sweepAmpHiStart','sweepAmpHiEnd'].forEach(k=>{ if(o[k]!=null){ state[k]=o[k]; const el=$('adv'+k.charAt(0).toUpperCase()+k.slice(1)); if(el) el.value=o[k]; } });
     state.audioOffset=o.audioOffset||0; updateAudioOffsetBadge();
+    state.audioLatencyMs=o.audioLatencyMs||0; if($('audioLatencyMs')) $('audioLatencyMs').value=state.audioLatencyMs;
     populateViewCh();
     // Rebuild channel name inputs if they exist
     const _grid=$('chNamesGrid');
@@ -1849,14 +1887,15 @@
     refreshTagBar();
   }
   // Bulk mute/solo for a group of lanes (a #tag, or every lane for ALL).
-  // "Smart toggle": if every lane in scope is already in the target state,
-  // turn it off for all of them; otherwise turn it on for all of them
-  // (clearing the opposite flag) — this is what both a short click and a
-  // long-press run; the long-press exists so a single accidental click on
-  // a tag/ALL button can't silently bulk-mute/solo a whole group, and
-  // doubles as the "force everyone back in line" action from a mixed state
-  // (e.g. one lane got individually un-muted or soloed since the group was
-  // last set) since it always recomputes from the group's current state.
+  // Short click = "smart toggle": if every lane in scope is already in the
+  // target state, turn it off for all of them; otherwise turn it on for all
+  // of them (clearing the opposite flag) — a normal, bidirectional group
+  // toggle for everyday use. Long-press = unconditional, one-way "force ON"
+  // for every lane in the group, regardless of current state — it never
+  // turns things off, only re-asserts Muted/Soloed onto every lane,
+  // including ones that were individually changed since the group was last
+  // set. That's the deliberately different, "pull a mixed group back in
+  // line" action a hold is for.
   function groupSmartToggle(lanes,field){
     if(!lanes.length) return;
     pushUndo();
@@ -1864,18 +1903,23 @@
     lanes.forEach(l=>{ field==='muted'?setLaneMuted(l,target):setLaneSoloed(l,target); });
     refreshMuteSoloUI();
   }
-  // Attaches both a plain click and a press-and-hold (>500ms) gesture to a
-  // button, calling the same handler either way — the hold is a deliberate
-  // "are you sure" gate for bulk group actions, not a functionally
-  // different operation. Suppresses the browser's own click event that
-  // follows a long-press release so the action doesn't fire twice.
-  function attachTagMuteSoloBtn(btn,handler){
+  function groupForceOn(lanes,field){
+    if(!lanes.length) return;
+    pushUndo();
+    lanes.forEach(l=>{ field==='muted'?setLaneMuted(l,true):setLaneSoloed(l,true); });
+    refreshMuteSoloUI();
+  }
+  // Attaches a short click (smart toggle) and a press-and-hold (>500ms,
+  // force-on) gesture to a tag/ALL group's M or S button. Suppresses the
+  // browser's own click event that follows a long-press release so the
+  // short-click action doesn't also fire right after.
+  function attachTagMuteSoloBtn(btn,onShortClick,onLongPress){
     let timer=null,longFired=false;
     btn.addEventListener('mousedown',e=>{ e.stopPropagation(); longFired=false;
-      timer=setTimeout(()=>{ longFired=true; timer=null; handler(); },500); });
+      timer=setTimeout(()=>{ longFired=true; timer=null; onLongPress(); },500); });
     const cancel=()=>{ if(timer){ clearTimeout(timer); timer=null; } };
     btn.addEventListener('mouseup',cancel); btn.addEventListener('mouseleave',cancel);
-    btn.addEventListener('click',e=>{ e.stopPropagation(); if(longFired){ longFired=false; return; } handler(); });
+    btn.addEventListener('click',e=>{ e.stopPropagation(); if(longFired){ longFired=false; return; } onShortClick(); });
   }
 
   function refreshTagBar(){
@@ -1898,10 +1942,10 @@
       const allSoloed=lanesForGroup.length>0&&lanesForGroup.every(l=>l.soloed);
       const mBtn=document.createElement('button'); mBtn.className='tag-mini-btn mute-btn'+(allMuted?' on':'');
       mBtn.textContent='M'; mBtn.title='Mute every lane in this group (hold to force, overriding individual overrides)';
-      attachTagMuteSoloBtn(mBtn,()=>groupSmartToggle(lanesForGroup,'muted'));
+      attachTagMuteSoloBtn(mBtn,()=>groupSmartToggle(lanesForGroup,'muted'),()=>groupForceOn(lanesForGroup,'muted'));
       const sBtn=document.createElement('button'); sBtn.className='tag-mini-btn solo-btn'+(allSoloed?' on':'');
       sBtn.textContent='S'; sBtn.title='Solo every lane in this group (hold to force, overriding individual overrides)';
-      attachTagMuteSoloBtn(sBtn,()=>groupSmartToggle(lanesForGroup,'soloed'));
+      attachTagMuteSoloBtn(sBtn,()=>groupSmartToggle(lanesForGroup,'soloed'),()=>groupForceOn(lanesForGroup,'soloed'));
       wrap.appendChild(mBtn); wrap.appendChild(sBtn);
       bar.appendChild(wrap);
     }
@@ -2072,7 +2116,7 @@
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
       swatch.style.background=lane.color; tbSwatch.style.background=lane.color; requestDraw();
     });
-    xBtn.addEventListener('click',()=>{ pushUndo(); removeLane(lane.id); });
+    xBtn.addEventListener('click',()=>{ if(!confirm('Delete CC Lane?')) return; pushUndo(); removeLane(lane.id); });
     lane._muteBtn=muteBtn; lane._soloBtn=soloBtn;
     muteBtn.addEventListener('click',()=>toggleLaneMuted(lane));
     soloBtn.addEventListener('click',()=>toggleLaneSoloed(lane));
@@ -3295,7 +3339,7 @@
       // again and will drift out of sync with the MIDI/CC transport. Not an
       // issue for normal edit/playback/reseek use — only for letting a
       // song with an offset loop unattended past its natural end.
-      const off=state.audioOffset||0;
+      const off=effectiveAudioOffsetTicks();
       const loopStartSec=Math.max(0,tickToSeconds(a-off));
       const loopEndSec=Math.max(loopStartSec+0.001,Math.min(tickToSeconds(b-off),audioBuf.duration));
       const bufTickAtStart=startTick-off;
@@ -3489,7 +3533,7 @@
   }
 
   // ---------- Inputs ----------
-  function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; renderTsMapUI(); }
+  function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; if($('audioLatencyMs')) $('audioLatencyMs').value=state.audioLatencyMs||0; renderTsMapUI(); }
   function setTool(t){ state.tool=t; [...$('tools').children].forEach(x=>x.classList.toggle('on',x.dataset.tool===t)); }
   $('tools').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; setTool(b.dataset.tool); });
   $('snap').addEventListener('change',e=>{ state.snap=e.target.value; requestDraw(); });
@@ -3522,6 +3566,7 @@
   }
   $('noteLen').addEventListener('change',e=>{ state.noteLen=e.target.value; });
   $('ccRes').addEventListener('change',e=>{ state.ccRes=+e.target.value; });
+  $('audioLatencyMs').addEventListener('change',e=>{ state.audioLatencyMs=clamp(Math.round(+e.target.value||0),-2000,2000); e.target.value=state.audioLatencyMs; });
   $('genCycles').addEventListener('input',e=>{ state.genCycles=clamp(+e.target.value||1,1,64); if($('advCycles')) $('advCycles').value=state.genCycles; });
   $('genLen').addEventListener('change',e=>{ state.genLen=e.target.value; if($('advLen')) $('advLen').value=state.genLen; });
   $('durDisp').addEventListener('click',()=>{ state.durMode=state.durMode==='hms'?'secs':'hms'; updateDuration(); });

@@ -1974,6 +1974,20 @@ async function run() {
     check('holding a tag\'s Mute button forces every lane in the group to Muted from a mixed state',
       afterLongPress.every(m => m === true), afterLongPress);
 
+    // A long-press must be a genuinely different, one-way action from a short
+    // click, not just an alias for it: holding the button again while the
+    // group is ALREADY all-Muted must re-assert Muted, never toggle it off
+    // (a short click in that situation would smart-toggle everyone off).
+    const btnBox2 = await (await sceneAMute()).boundingBox();
+    await page.mouse.move(btnBox2.x + btnBox2.width / 2, btnBox2.y + btnBox2.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(600);
+    await page.mouse.up();
+    await page.waitForTimeout(30);
+    const afterSecondLongPress = await page.evaluate((ids) => [ids.a, ids.b].map(id => window._TEST_state.ccLanes.find(x => x.id === id).muted), ids);
+    check('holding a tag\'s Mute button on an already-all-Muted group re-asserts Muted rather than toggling it off (long-press differs from a short click)',
+      afterSecondLongPress.every(m => m === true), afterSecondLongPress);
+
     // ALL button reaches every lane, including untagged ones
     const allSoloBtn = async () => {
       const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.trim().startsWith('All')));
@@ -2087,6 +2101,110 @@ async function run() {
     const duration = await page.evaluate(() => window._TEST_audioBufDuration());
     const name = await page.evaluate(() => window._TEST_audioFileName());
     check('the audio clear (×) button removes the loaded audio', duration === null && name === 'No audio', { duration, name });
+  });
+
+  // ---------------- Audio latency/sync trim ----------------
+
+  await withPage(browser, async (page) => {
+    const bytes = makeWavBytes(4);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(120);
+
+    await page.evaluate(() => {
+      window.__startCalls = [];
+      const orig = AudioBufferSourceNode.prototype.start;
+      AudioBufferSourceNode.prototype.start = function (when, offset, duration) {
+        window.__startCalls.push({ offset });
+        return orig.call(this, when, offset, duration);
+      };
+    });
+
+    const runAt = async (latencyMs) => {
+      await page.evaluate((ms) => {
+        window._TEST_state.audioOffset = 0;
+        window._TEST_state.audioLatencyMs = ms;
+        window._TEST_state.playhead = window._TEST_state.ppq * 2;
+      }, latencyMs);
+      await page.evaluate(() => window._TEST_play());
+      await page.waitForTimeout(80);
+      await page.evaluate(() => window._TEST_stop());
+      return page.evaluate(() => window.__startCalls[window.__startCalls.length - 1].offset);
+    };
+
+    const baseline = await runAt(0);
+    const withPositiveTrim = await runAt(50);
+    const withNegativeTrim = await runAt(-30);
+    check('a +50ms latency trim advances the scheduled audio buffer offset by 0.05s',
+      Math.abs((withPositiveTrim - baseline) - 0.05) < 0.002, { baseline, withPositiveTrim });
+    check('a -30ms latency trim retards the scheduled audio buffer offset by 0.03s',
+      Math.abs((withNegativeTrim - baseline) - (-0.03)) < 0.002, { baseline, withNegativeTrim });
+
+    await page.click('#setupBtn');
+    await page.waitForTimeout(80);
+    await page.fill('#audioLatencyMs', '75');
+    await page.dispatchEvent('#audioLatencyMs', 'change');
+    const viaUI = await page.evaluate(() => window._TEST_state.audioLatencyMs);
+    check('the Setup panel Audio Latency Trim field updates state.audioLatencyMs', viaUI === 75, viaUI);
+
+    await page.fill('#audioLatencyMs', '99999');
+    await page.dispatchEvent('#audioLatencyMs', 'change');
+    const clamped = await page.evaluate(() => window._TEST_state.audioLatencyMs);
+    check('the latency trim field clamps extreme values to +/-2000ms', clamped === 2000, clamped);
+
+    await page.evaluate(() => { window._TEST_state.audioLatencyMs = 42; });
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    await page.evaluate(() => { window._TEST_state.audioLatencyMs = 0; });
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    const restored = await page.evaluate(() => window._TEST_state.audioLatencyMs);
+    check('audioLatencyMs survives snapshot()/applyState() roundtrip', restored === 42, restored);
+
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.audioLatencyMs = 500; });
+    const badgeHidden = await page.evaluate(() => document.getElementById('audioOffsetBadge').style.display === 'none');
+    check('a large latency trim alone (no audioOffset) does not make the audio-offset badge visible', badgeHidden, badgeHidden);
+  });
+
+  // ---------------- Delete CC Lane confirmation ----------------
+
+  await withPage(browser, async (page) => {
+    const laneId = await page.evaluate(() => window._TEST_addLane(50, 0));
+    await page.waitForTimeout(50);
+
+    page.once('dialog', d => d.dismiss());
+    await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .x`).click(), laneId);
+    await page.waitForTimeout(50);
+    const stillThere = await page.evaluate((id) => !!window._TEST_state.ccLanes.find(l => l.id === id), laneId);
+    check('dismissing the "Delete CC Lane?" confirmation leaves the lane intact', stillThere, stillThere);
+
+    page.once('dialog', d => { check('deleting a CC lane prompts "Delete CC Lane?"', d.message() === 'Delete CC Lane?', d.message()); d.accept(); });
+    await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .x`).click(), laneId);
+    await page.waitForTimeout(50);
+    const gone = await page.evaluate((id) => !window._TEST_state.ccLanes.find(l => l.id === id), laneId);
+    check('accepting the "Delete CC Lane?" confirmation removes the lane', gone, gone);
+  });
+
+  // ---------------- Minimized CC lane height ----------------
+
+  await withPage(browser, async (page) => {
+    // A crushed flex-shrink bug used to let minimized lanes collapse toward
+    // 0px once enough of them were competing for space with the rest of the
+    // lane list — they'd visually vanish. Every minimized lane must keep its
+    // fixed top-bar height (22px) no matter how many siblings are minimized.
+    const ids = [];
+    for (let i = 0; i < 8; i++) ids.push(await page.evaluate((cc) => window._TEST_addLane(cc, 0), 40 + i));
+    await page.waitForTimeout(100);
+
+    for (const id of ids) {
+      await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .move-btn[title="Hide lane"]`).click(), id);
+      await page.waitForTimeout(20);
+    }
+    await page.waitForTimeout(80);
+
+    const heights = await page.evaluate((ids) => ids.map(id => document.querySelector(`.lane[data-id="${id}"]`).offsetHeight), ids);
+    check('every minimized lane keeps a real, non-crushed height (>=20px) even with many minimized at once',
+      heights.every(h => h >= 20), heights);
   });
 
   await browser.close();
