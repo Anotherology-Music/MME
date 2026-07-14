@@ -55,6 +55,8 @@ function buildTestHtml() {
       '  window._TEST_barToTick = (b) => barToTick(b);',
       '  window._TEST_totalTicks = () => totalTicks();',
       '  window._TEST_tickToSeconds = (t) => tickToSeconds(t);',
+      '  window._TEST_secondsToTicks = (s) => secondsToTicks(s);',
+      '  window._TEST_audioGainValue = () => (typeof audioGain !== "undefined" && audioGain) ? audioGain.gain.value : null;',
       '  window._TEST_fmtClockHundredths = (sec) => fmtClockHundredths(sec);',
       '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
       '  window._TEST_pushUndo = pushUndo;',
@@ -1040,9 +1042,14 @@ async function run() {
     const row = await page.$('.lane');
     const grip = await page.$('.lane .grip');
     const gripBox = await grip.boundingBox();
-    await page.mouse.move(gripBox.x + gripBox.width / 2, gripBox.y + gripBox.height / 2);
+    // Click near the top of the (7px-tall) handle, not dead-center — the
+    // row immediately below it can overlap the handle's last couple of
+    // pixels by rounding, which makes a dead-center click land on that
+    // row instead of the grip.
+    const gripY = gripBox.y + 2;
+    await page.mouse.move(gripBox.x + gripBox.width / 2, gripY);
     await page.mouse.down();
-    await page.mouse.move(gripBox.x + gripBox.width / 2, gripBox.y - 500, { steps: 10 }); // drag way up (shrink)
+    await page.mouse.move(gripBox.x + gripBox.width / 2, gripY - 500, { steps: 10 }); // drag way up (shrink)
     await page.mouse.up();
     await page.waitForTimeout(100);
     const shrunk = await page.evaluate(() => {
@@ -1758,6 +1765,137 @@ async function run() {
     const expectedTrimSec = await page.evaluate(() => window._TEST_tickToSeconds(window._TEST_state.ppq));
     check('a negative offset trims the buffer start (plays from partway into the file, no delay)',
       Math.abs(call3.offset - expectedTrimSec) < 0.02, { got: call3.offset, expected: expectedTrimSec });
+  });
+
+  // ---------------- Audio: volume slider, anti-click fades, Set Loop to Audio, arrow-key nudge ----------------
+
+  await withPage(browser, async (page) => {
+    const bytes = makeWavBytes(2);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(150);
+
+    // Volume slider sets the gain node's target level (sampled after the
+    // start fade completes) and Mute overrides it to 0 without losing the
+    // slider's own value.
+    await page.evaluate(() => {
+      const el = document.getElementById('audioVolume');
+      el.value = '40'; el.dispatchEvent(new Event('input'));
+    });
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.playhead = 0; });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(120); // past the ~8ms start fade
+    const gainAt40 = await page.evaluate(() => window._TEST_audioGainValue());
+    check('the volume slider sets the audio gain to the chosen level', Math.abs(gainAt40 - 0.4) < 0.02, gainAt40);
+
+    await page.click('#audioMuteBtn');
+    await page.waitForTimeout(60); // past the ~8ms mute fade
+    const gainMuted = await page.evaluate(() => window._TEST_audioGainValue());
+    const muteOn = await page.evaluate(() => document.getElementById('audioMuteBtn').classList.contains('on'));
+    check('Mute ramps the live gain to 0 without changing the volume slider', muteOn && Math.abs(gainMuted) < 0.02, { muteOn, gainMuted });
+
+    await page.click('#audioMuteBtn');
+    await page.waitForTimeout(60);
+    const gainUnmuted = await page.evaluate(() => window._TEST_audioGainValue());
+    const volumeVal = await page.evaluate(() => document.getElementById('audioVolume').value);
+    check('unmuting restores the volume slider\'s level (not always 100%)',
+      volumeVal === '40' && Math.abs(gainUnmuted - 0.4) < 0.02, { volumeVal, gainUnmuted });
+
+    await page.evaluate(() => window._TEST_stop());
+  });
+
+  await withPage(browser, async (page) => {
+    // Anti-click fades: spy on the gain AudioParam to confirm play()/stop()
+    // ramp instead of jumping the value instantly.
+    await page.evaluate(() => {
+      window.__gainCalls = [];
+      const proto = AudioParam.prototype;
+      ['setValueAtTime', 'linearRampToValueAtTime', 'cancelScheduledValues'].forEach((m) => {
+        const orig = proto[m];
+        proto[m] = function (...args) { window.__gainCalls.push({ m, args }); return orig.apply(this, args); };
+      });
+    });
+    const bytes = makeWavBytes(2);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { window.__gainCalls.length = 0; });
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.playhead = 0; });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(100);
+    const startRamp = await page.evaluate(() => window.__gainCalls.filter((c) => c.m === 'linearRampToValueAtTime').length);
+    check('play() ramps the gain in (not an instant jump) to avoid a click', startRamp > 0, startRamp);
+
+    await page.evaluate(() => { window.__gainCalls.length = 0; });
+    await page.evaluate(() => window._TEST_stop());
+    const stopRamp = await page.evaluate(() => window.__gainCalls.some((c) => c.m === 'linearRampToValueAtTime' && c.args[0] === 0));
+    check('stop() ramps the gain down to 0 (not an instant cut) to avoid a click', stopRamp, stopRamp);
+  });
+
+  await withPage(browser, async (page) => {
+    // "Set Loop to Audio" sets the A/B loop markers to exactly the audio's
+    // current mapped span (accounting for the offset).
+    const bytes = makeWavBytes(2); // 2-second buffer
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(150);
+    const oneBeat = await page.evaluate(() => window._TEST_state.ppq);
+    await page.evaluate((off) => { window._TEST_state.audioOffset = off; }, oneBeat);
+    await page.click('#audioSetLoopBtn');
+    await page.waitForTimeout(50);
+    const loop = await page.evaluate(() => ({ a: window._TEST_state.locStart, b: window._TEST_state.locEnd }));
+    const expectedA = oneBeat;
+    const expectedB = oneBeat + await page.evaluate(() => window._TEST_secondsToTicks(2));
+    check('Set Loop to Audio sets locStart to the audio offset', loop.a === expectedA, { got: loop.a, expected: expectedA });
+    check('Set Loop to Audio sets locEnd to offset + audio duration (in ticks)',
+      Math.abs(loop.b - expectedB) < 2, { got: loop.b, expected: expectedB });
+  });
+
+  await withPage(browser, async (page) => {
+    // Arrow-key nudge: only active once the audio row has focus (set on
+    // mousedown, same convention as 'cc'/'piano' focus elsewhere).
+    const bytes = makeWavBytes(2);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.focus = 'piano'; });
+
+    // Without audio focus, arrow keys must not touch audioOffset.
+    await page.keyboard.press('ArrowRight');
+    await page.waitForTimeout(30);
+    const untouched = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('arrow keys do not nudge the audio offset unless the audio row has focus', untouched === 0, untouched);
+
+    // Click the waveform once (without dragging) to give it focus, then nudge.
+    const canvasBox = await page.locator('#audioCanvas').boundingBox();
+    await page.mouse.click(canvasBox.x + 5, canvasBox.y + canvasBox.height / 2);
+    await page.waitForTimeout(30);
+    await page.keyboard.press('ArrowRight');
+    await page.waitForTimeout(30);
+    const afterOneNudge = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('ArrowRight nudges the audio offset by 1 tick once focused', afterOneNudge === 1, afterOneNudge);
+
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(30);
+    const afterBack = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('ArrowLeft nudges it back', afterBack === 0, afterBack);
+
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('ArrowRight');
+    await page.keyboard.up('Shift');
+    await page.waitForTimeout(30);
+    const afterShiftNudge = await page.evaluate(() => window._TEST_state.audioOffset);
+    const snapTick = await page.evaluate(() => window._TEST_state.ppq / 4);
+    check('Shift+ArrowRight nudges by a full snap-grid step instead of 1 tick',
+      afterShiftNudge === snapTick, { afterShiftNudge, snapTick });
   });
 
   await browser.close();

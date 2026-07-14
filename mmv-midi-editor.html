@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.8.1
+  MMV MIDI & CC Curve Editor v0.8.2
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -85,6 +85,14 @@
   the offset back to 0. A badge next to the M/Load buttons shows the
   current offset (click it to reset too). The offset is undoable and
   travels with the project through .mmvp save/load.
+  v0.8.2 More audio track controls: a volume slider next to Mute (0-100%,
+  independent of Mute so unmuting restores your level instead of always
+  jumping to full). Anti-click fades on play/stop/pause and at each loop
+  wrap point, so starting, stopping or looping the audio never produces an
+  audible pop. A "Set Loop to Audio" button (⇥⟺) sets the A/B loop markers
+  to exactly match the loaded audio's current start/end, accounting for
+  any offset. Left/Right arrow keys nudge the audio offset by 1 tick (Shift
+  = a full Snap-grid step) once the audio track has focus (click it once).
 -->
 <style>
   * { box-sizing: border-box; }
@@ -210,7 +218,7 @@
   .ruler-row .scroll{overflow-x:hidden;overflow-y:hidden;}
   #rulerCanvas{cursor:text;}
 
-  .audio-row{flex:0 0 auto;height:64px;border-bottom:1px solid var(--line);min-height:32px;}
+  .audio-row{flex:0 0 auto;height:84px;border-bottom:1px solid var(--line);min-height:32px;}
   .audio-row .scroll{overflow:hidden;}
   .audio-leftcol{display:flex!important;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:3px 5px;}
   .audio-name{font-size:10px;color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;text-align:center;}
@@ -578,6 +586,10 @@
         <div style="display:flex;gap:4px;align-items:center;">
           <button id="audioMuteBtn" style="font-size:10px;padding:2px 6px;" title="Mute / unmute audio track">M</button>
           <button id="audioLoadBtn" style="font-size:10px;padding:2px 7px;" title="Load an audio file (MP3, WAV, OGG…)">Load</button>
+        </div>
+        <div style="display:flex;gap:4px;align-items:center;width:100%;">
+          <input type="range" id="audioVolume" min="0" max="100" value="100" style="flex:1;min-width:0;height:12px;" title="Audio track volume">
+          <button id="audioSetLoopBtn" style="font-size:9px;padding:1px 5px;flex-shrink:0;" title="Set the A/B loop markers to exactly match the loaded audio's start/end">⇥⟺</button>
         </div>
         <button id="audioOffsetBadge" style="display:none;font-size:9px;padding:1px 6px;color:var(--accent2);background:var(--panel2);" title="Audio start offset — click to reset to 0">Off +0</button>
         <input type="file" id="audioFileInput" accept="audio/*" style="display:none">
@@ -969,6 +981,7 @@
     const beat=Math.max(0,(p[1]||1)-1),tk=Math.max(0,p[2]||0);
     return barStart+beat*tpe+tk; }
   function tickToSeconds(t){ return t/ticksPerBeat()*(60/state.bpm); }
+  function secondsToTicks(s){ return s*ticksPerBeat()*state.bpm/60; }
   function songSeconds(){ return tickToSeconds(totalTicks()); }
   function p2(n){ return String(n).padStart(2,'0'); }
   function fmtHMS(sec){ const cs=Math.floor((sec*100)%100), s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return p2(h)+':'+p2(m)+':'+p2(s)+':'+p2(cs); }
@@ -987,7 +1000,7 @@
   const prScroll=$('prScroll'), prCanvas=$('prCanvas'), pctx=prCanvas.getContext('2d');
   const velScroll=$('velScroll'), velCanvas=$('velCanvas'), vctx=velCanvas.getContext('2d');
   const audioRow=$('audioRow'), audioScroll=$('audioScroll'), audioCanvas=$('audioCanvas'), actx=audioCanvas.getContext('2d');
-  let audioCtx=null, audioSrc=null, audioGain=null, audioBuf=null, audioMuted=false;
+  let audioCtx=null, audioSrc=null, audioGain=null, audioBuf=null, audioMuted=false, audioVolume=1;
   const phEl=$('playheadEl');
 
   function ensureSpacer(scrollEl){ let sp=scrollEl.querySelector(':scope > .spacer'); if(!sp){ sp=document.createElement('div'); sp.className='spacer'; scrollEl.insertBefore(sp, scrollEl.firstChild); } return sp; }
@@ -3082,6 +3095,7 @@
   // ---------- Transport: Worker clock + timestamped MIDI ----------
   let sched=null, rafVisual=null, schedWorker=null, schedTimer=null;
   const LOOKAHEAD=150, START_DELAY=90, POLL=20;
+  const AUDIO_FADE=0.008, AUDIO_WRAP_DIP=0.004; // seconds — anti-click ramps at start/stop/loop-wrap
   function wrapv(x,s){ return ((x % s)+s)%s; }
   function makeWorker(){ try{
     const src="var id=null;self.onmessage=function(e){var d=e.data||{};if(d.cmd==='start'){if(id)clearInterval(id);id=setInterval(function(){self.postMessage(0);},d.ms||20);}else if(d.cmd==='stop'){if(id)clearInterval(id);id=null;}};";
@@ -3165,11 +3179,50 @@
         audioSrc.loopStart=loopStartSec;
         audioSrc.loopEnd=loopEndSec;
         audioGain=audioCtx.createGain();
-        audioGain.gain.value=audioMuted?0:1;
+        const startAt=audioCtx.currentTime+START_DELAY/1000+startDelaySec;
+        audioGain.gain.setValueAtTime(0,startAt);
+        audioGain.gain.linearRampToValueAtTime(audioMuted?0:audioVolume,startAt+AUDIO_FADE);
         audioSrc.connect(audioGain); audioGain.connect(audioCtx.destination);
-        audioSrc.start(audioCtx.currentTime+START_DELAY/1000+startDelaySec, offset);
+        audioSrc.start(startAt, offset);
+        audioLoopSched={loopStartSec,loopEndSec,startAt,offset};
+        scheduleAudioWrapDips();
       }
     }
+  }
+  // Anti-click dips at each loop-wrap point (buffer jumps from loopEnd back
+  // to loopStart) — pre-scheduled up front since Web Audio automation just
+  // needs future timestamps, not incremental lookahead. Bounded to 500
+  // wraps (~hours of continuous unattended looping) so this can't grow
+  // unbounded. Re-callable any time the target gain changes mid-playback
+  // (mute/volume) since those cancel and replace all scheduled automation.
+  let audioLoopSched=null;
+  function scheduleAudioWrapDips(){
+    if(!audioGain||!audioLoopSched||!audioCtx) return;
+    const {loopStartSec,loopEndSec,startAt,offset}=audioLoopSched;
+    const period=loopEndSec-loopStartSec;
+    if(period<=AUDIO_FADE*4) return;
+    const target=audioMuted?0:audioVolume, now=audioCtx.currentTime;
+    const firstWrapAt=startAt+(loopEndSec-offset);
+    for(let i=0;i<500;i++){
+      const wrapAt=firstWrapAt+i*period;
+      if(wrapAt<=now) continue;
+      audioGain.gain.setValueAtTime(target,wrapAt-AUDIO_FADE);
+      audioGain.gain.linearRampToValueAtTime(0,wrapAt-AUDIO_WRAP_DIP/2);
+      audioGain.gain.setValueAtTime(0,wrapAt+AUDIO_WRAP_DIP/2);
+      audioGain.gain.linearRampToValueAtTime(target,wrapAt+AUDIO_WRAP_DIP/2+AUDIO_FADE);
+    }
+  }
+  // Smoothly ramps to the current mute/volume target — used for live
+  // mute-toggle/volume-slider changes during playback, not just the initial
+  // start. Cancels (and reschedules) the wrap dips since they're on the
+  // same automation timeline.
+  function setAudioGainLive(){
+    if(!audioGain||!audioCtx) return;
+    const target=audioMuted?0:audioVolume, now=audioCtx.currentTime;
+    audioGain.gain.cancelScheduledValues(now);
+    audioGain.gain.setValueAtTime(audioGain.gain.value,now);
+    audioGain.gain.linearRampToValueAtTime(target,now+AUDIO_FADE);
+    scheduleAudioWrapDips();
   }
   function schedulerTick(){ if(!state.playing||!sched) return; const s=sched, now=performance.now(); let guard=0;
     // MIDI Clock: only when we are the master (not following MMV)
@@ -3198,7 +3251,17 @@
   function stopTransport(){ if(rafVisual){ cancelAnimationFrame(rafVisual); rafVisual=null; } stopClock();
     clearSyncHeartbeat();
     if(state.midiOut){ if(!state.syncFollow) mSend([0xFC]); try{ state.midiOut.clear && state.midiOut.clear(); }catch(e){} } allNotesOff(); sched=null;
-    if(audioSrc){ try{audioSrc.stop();}catch(e){} audioSrc=null; } audioGain=null; }
+    if(audioSrc){
+      try{
+        const now=audioCtx.currentTime;
+        audioGain.gain.cancelScheduledValues(now);
+        audioGain.gain.setValueAtTime(audioGain.gain.value,now);
+        audioGain.gain.linearRampToValueAtTime(0,now+AUDIO_FADE);
+        audioSrc.stop(now+AUDIO_FADE);
+      }catch(e){ try{audioSrc.stop();}catch(e2){} }
+      audioSrc=null;
+    }
+    audioGain=null; audioLoopSched=null; }
   function pause(){ if(!state.playing) return; if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); updateTransportBtns(); }
   function stop(){ if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); state.playhead=getLoop().a; updatePlayPos(); updatePlayheadEl(); updateTransportBtns(); }
   function togglePlay(){ state.playing?pause():play(); }
@@ -3393,9 +3456,21 @@
     armUndo(); state.audioOffset=0; commitUndo(); updateAudioOffsetBadge(); requestDraw(); });
   $('audioMuteBtn').addEventListener('click',()=>{
     audioMuted=!audioMuted;
-    if(audioGain) audioGain.gain.value=audioMuted?0:1;
+    setAudioGainLive();
     $('audioMuteBtn').classList.toggle('on',audioMuted);
     $('audioMuteBtn').title=audioMuted?'Unmute audio track':'Mute audio track';
+  });
+  $('audioVolume').addEventListener('input',e=>{
+    audioVolume=clamp((+e.target.value||0)/100,0,1);
+    setAudioGainLive();
+  });
+  $('audioSetLoopBtn').addEventListener('click',()=>{
+    if(!audioBuf) return;
+    const off=state.audioOffset||0;
+    armUndo();
+    state.locStart=clamp(Math.round(off),0,totalTicks());
+    state.locEnd=clamp(Math.round(off+secondsToTicks(audioBuf.duration)),0,totalTicks());
+    commitUndo(); updateLoopStatus(); requestDraw();
   });
   $('audioLoadBtn').onclick=()=>$('audioFileInput').click();
   $('audioFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return;
@@ -3409,7 +3484,7 @@
   // matching the same convention used for notes/CC points elsewhere.
   // Double-click resets the offset back to 0.
   let audioDrag=null;
-  audioCanvas.addEventListener('mousedown',e=>{ if(!audioBuf) return; armUndo();
+  audioCanvas.addEventListener('mousedown',e=>{ state.focus='audio'; if(!audioBuf) return; armUndo();
     audioDrag={startX:e.clientX, startOffset:state.audioOffset||0, moved:false};
     audioCanvas.style.cursor='grabbing'; });
   window.addEventListener('mousemove',e=>{ if(!audioDrag) return;
@@ -3505,6 +3580,13 @@
             updateNoteInfo(); requestDraw();
           }
         }
+        return;
+      }
+      if(state.focus==='audio'&&audioBuf){
+        e.preventDefault();
+        const step=e.shiftKey?Math.max(1,snapTicks()):1;
+        armUndo(); state.audioOffset=(state.audioOffset||0)+dir*step; commitUndo();
+        updateAudioOffsetBadge(); requestDraw();
         return;
       }
     }
