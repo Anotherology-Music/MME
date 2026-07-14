@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.0
+  MMV MIDI & CC Curve Editor v0.9.1
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -108,6 +108,11 @@
   Live playback always honors them; exported .mid ignores both by default
   — two new Setup panel checkboxes ("Export Solo lanes only" / "Exclude
   Muted lanes") opt in per-export without changing the live-playback rule.
+  v0.9.1 Fix: loading a different project no longer leaves the previous
+  project's audio silently loaded — audio isn't part of a .mmvp's own
+  data, so it's now cleared whenever a project loads (a matching audio
+  file still auto-loads afterward if one's found next to it). Also added
+  a × button next to Load to remove the current audio at any time.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -618,6 +623,7 @@
         <div style="display:flex;gap:4px;align-items:center;">
           <button id="audioMuteBtn" style="font-size:10px;padding:2px 6px;" title="Mute / unmute audio track">M</button>
           <button id="audioLoadBtn" style="font-size:10px;padding:2px 7px;" title="Load an audio file (MP3, WAV, OGG…)">Load</button>
+          <button id="audioClearBtn" style="font-size:10px;padding:2px 6px;" title="Remove the loaded audio file">×</button>
         </div>
         <div style="display:flex;gap:4px;align-items:center;width:100%;">
           <input type="range" id="audioVolume" min="0" max="100" value="100" style="flex:1;min-width:0;height:12px;" title="Audio track volume">
@@ -2742,6 +2748,7 @@
         const data=JSON.parse(fr.result);
         if(!data.version||!data.snapshot) throw new Error('Not a valid project file');
         pushUndo();
+        clearAudio();
         applyState(JSON.stringify(data.snapshot));
         state.projectName=data.projectName||'';
         if($('projectName')) $('projectName').value=state.projectName;
@@ -3567,6 +3574,17 @@
     }catch(e){ alert('Could not decode audio: '+e.message); return; }
     requestDraw();
   }
+  // Removes the currently loaded audio (stopping playback if it's live) and
+  // resets its offset — called both by the manual × button and at the start
+  // of loadProject(), since audio isn't part of a .mmvp's own data and would
+  // otherwise silently carry over from whatever project was open before.
+  function clearAudio(){
+    if(audioSrc){ try{audioSrc.stop();}catch(e){} audioSrc=null; }
+    audioGain=null; audioLoopSched=null; audioBuf=null;
+    $('audioFileName').textContent='No audio';
+    state.audioOffset=0; updateAudioOffsetBadge();
+    requestDraw();
+  }
   function updateAudioOffsetBadge(){
     const b=$('audioOffsetBadge'); if(!b) return;
     const off=state.audioOffset||0;
@@ -3595,6 +3613,7 @@
     commitUndo(); updateLoopStatus(); requestDraw();
   });
   $('audioLoadBtn').onclick=()=>$('audioFileInput').click();
+  $('audioClearBtn').addEventListener('click',()=>{ if(!audioBuf) return; clearAudio(); flash('Audio removed'); });
   $('audioFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return;
     state.audioOffset=0; updateAudioOffsetBadge(); loadAudio(f); e.target.value=''; });
   // Drag-and-drop onto the audio canvas

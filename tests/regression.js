@@ -2045,6 +2045,50 @@ async function run() {
     check('lane.muted/lane.soloed survive snapshot()/applyState() roundtrip', restored === true, restored);
   });
 
+  // ---------------- Audio doesn't silently carry over between projects ----------------
+
+  await withPage(browser, async (page) => {
+    // Loading a different project must clear any audio left over from
+    // whatever was open before — audio isn't part of a .mmvp's own data,
+    // so without this it would silently keep playing the wrong track.
+    const bytes = makeWavBytes(1);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'projA.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(120);
+    check('audio loads into the current project', await page.evaluate(() => window._TEST_audioBufDuration()) === 1, null);
+
+    const projB = JSON.stringify({
+      version: 1, projectName: 'project-b', audioFile: '',
+      snapshot: { notes: [], ccLanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: 'project-b', locS: null, locE: null, audioOffset: 0 },
+    });
+    await page.evaluate((json) => {
+      const file = new File([json], 'projB.mmvp', { type: 'application/json' });
+      return window._TEST_loadProject(file);
+    }, projB);
+    await page.waitForTimeout(120);
+    const durationAfter = await page.evaluate(() => window._TEST_audioBufDuration());
+    const nameAfter = await page.evaluate(() => window._TEST_audioFileName());
+    check('loading a project with no audio of its own clears the previous project\'s audio',
+      durationAfter === null && nameAfter === 'No audio', { durationAfter, nameAfter });
+  });
+
+  await withPage(browser, async (page) => {
+    // Manual removal via the × button next to Load.
+    const bytes = makeWavBytes(1);
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'test.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(120);
+    await page.click('#audioClearBtn');
+    await page.waitForTimeout(80);
+    const duration = await page.evaluate(() => window._TEST_audioBufDuration());
+    const name = await page.evaluate(() => window._TEST_audioFileName());
+    check('the audio clear (×) button removes the loaded audio', duration === null && name === 'No audio', { duration, name });
+  });
+
   await browser.close();
   server.close();
 
