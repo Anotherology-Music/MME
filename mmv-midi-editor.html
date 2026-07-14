@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.8.2
+  MMV MIDI & CC Curve Editor v0.9.0
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -93,6 +93,21 @@
   to exactly match the loaded audio's current start/end, accounting for
   any offset. Left/Right arrow keys nudge the audio offset by 1 tick (Shift
   = a full Snap-grid step) once the audio track has focus (click it once).
+  v0.9.0 CC lane Mute/Solo: every lane gets M (yellow, Mute) and S (red,
+  Solo) buttons — replacing the ▲▼ reorder buttons, since the drag-handle
+  already reorders lanes. While any lane is soloed, only soloed lanes play;
+  others dim (their own Mute icon is untouched — it reflects your stored
+  choice, not what solo is temporarily suppressing). Un-soloing reverts
+  everyone to their own stored Mute state. Each #tag chip (and the ALL
+  chip) gets its own mini M/S buttons: a click bulk-applies "smart toggle"
+  to every lane in that group (mute all unless all are already muted, then
+  unmute all); holding the button (500ms+) force-applies it even to lanes
+  that were individually changed since — so mixed-state groups can always
+  be pulled back in line. Mute/Solo are mutually exclusive per lane
+  (setting one clears the other), undoable, and saved with the project.
+  Live playback always honors them; exported .mid ignores both by default
+  — two new Setup panel checkboxes ("Export Solo lanes only" / "Exclude
+  Muted lanes") opt in per-export without changing the live-playback rule.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -280,15 +295,24 @@
   .lane .leftcol .name-row input{flex:1;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   .lane .leftcol .name-row input.ltags{flex:0 0 42%;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
   .lane.lane-filtered{display:none!important;}
+  .lane.lane-dimmed{opacity:.4;}
   .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
   .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
-  .tag-chip{font-size:11px;padding:2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;cursor:pointer;}
+  .tag-chip{display:inline-flex;align-items:center;gap:3px;font-size:11px;padding:2px 4px 2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
   .tag-chip:hover{border-color:#4fa3ff;}
   .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
-  .lane .leftcol .compact-row{gap:2px;padding-bottom:2px;flex-wrap:nowrap;}
-  .lane .leftcol .compact-row .ccn{width:42px;padding:1px 3px;font-size:10px;}
-  .lane .leftcol .compact-row .chn{width:34px;padding:1px 3px;font-size:10px;}
-  .lane .leftcol .swatch{width:12px;height:12px;border-radius:3px;border:1px solid #0006;cursor:pointer;flex-shrink:0;}
+  .tag-chip-label{background:none;border:none;color:inherit;font-size:11px;padding:0;cursor:pointer;}
+  .tag-mini-btn{font-size:8px;font-weight:700;line-height:1;padding:2px 4px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;}
+  .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
+  .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
+  .lane .leftcol .compact-row{gap:1px;padding-bottom:2px;flex-wrap:nowrap;}
+  .lane .leftcol .compact-row .ccn{width:22px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
+  .lane .leftcol .compact-row .chn{width:16px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
+  .lane .leftcol .compact-row .ccn::-webkit-outer-spin-button,
+  .lane .leftcol .compact-row .ccn::-webkit-inner-spin-button,
+  .lane .leftcol .compact-row .chn::-webkit-outer-spin-button,
+  .lane .leftcol .compact-row .chn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  .lane .leftcol .swatch{width:9px;height:12px;border-radius:3px;border:1px solid #0006;cursor:pointer;flex-shrink:0;}
   .lane .leftcol .x{color:var(--txt2);cursor:pointer;border:none;background:none;padding:0 2px;font-size:14px;}
   .lane .leftcol .x:hover{color:#ff6b6b;}
   .lane .leftcol .move-btn{font-size:10px;line-height:1;padding:1px 2px;border:none;background:none;cursor:pointer;color:var(--txt2);}
@@ -469,6 +493,14 @@
             <button id="importBtn">Import .mid</button>
             <button id="exportBtn">Export .mid</button>
             <button id="syncExport" title="Export a sync-track MIDI for MMV. Re-export whenever Tempo, Bars, or Sig changes.">Export Sync Track</button>
+          </div>
+          <div class="setup-row" style="font-size:11px;color:var(--txt2);">
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Export .mid only includes lanes with at least one Soloed lane in the project — has no effect when nothing is soloed">
+              <input type="checkbox" id="exportSoloOnly"> Export Solo lanes only
+            </label>
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Export .mid leaves out any Muted lane">
+              <input type="checkbox" id="exportExcludeMuted"> Exclude Muted lanes
+            </label>
           </div>
           <div class="setup-row">
             <span style="font-size:11px;color:var(--txt2);">Save Project / Load Project moved to the top row, next to the project name.</span>
@@ -1079,7 +1111,7 @@
   // ---------- Undo / Redo ----------
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
-    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,points:l.points})),
+    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     isfHistory:state.isfHistory||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
@@ -1126,9 +1158,9 @@
     const prevActiveId=state.activeLaneId;
     state.ccLanes.forEach(l=>{ if(l._row){ if(l._row.style.height) savedHeightById.set(l.id,l._row.style.height); l._row.remove(); } });
     state.ccLanes=[];
-    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
+    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,muted:!!ld.muted,soloed:!!ld.soloed,points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
       const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; updateLaneCompactness(lane._row); } });
-    refreshTagBar();
+    refreshMuteSoloUI();
     state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
     state.selection.clear(); syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
   function undo(){ if(!undoStack.length) return; redoStack.push(snapshot()); applyState(undoStack.pop()); updateUndoBtns(); }
@@ -1337,6 +1369,14 @@
   const LANE_PAD=6; // px margin at top & bottom so min/max are reachable without pixel-perfect aim
   function laneIsPb(lane){ return lane.type==='pb'; }
   function laneRange(lane){ return laneIsPb(lane)?{min:-8192,max:8191,center:0}:{min:0,max:127,center:64}; }
+  // Whether a lane actually plays right now: while any lane in the project
+  // is soloed, only soloed lanes are audible (everyone else is suppressed
+  // regardless of their own Mute state); otherwise a lane plays unless it's
+  // individually Muted. This only gates live playback (buildPassEvents/the
+  // chase-CC block in beginPlayback) — never the exported .mid, which
+  // ignores Mute/Solo unless the Setup panel checkboxes opt into it.
+  function anyLaneSoloed(){ return state.ccLanes.some(l=>l.soloed); }
+  function laneAudible(lane){ return anyLaneSoloed()?!!lane.soloed:!lane.muted; }
   function val2yForLane(h,v,lane){ const r=laneRange(lane); return LANE_PAD+(1-(v-r.min)/(r.max-r.min))*(h-2*LANE_PAD); }
   function y2valForLane(y,h,lane){ const r=laneRange(lane); return r.min+clamp((1-(y-LANE_PAD)/(h-2*LANE_PAD)),0,1)*(r.max-r.min); }
   function sendLaneVal(lane,v,t){
@@ -1781,6 +1821,57 @@
     state.ccLanes.forEach(l=>{ if(l._row) l._row.classList.toggle('lane-filtered',!laneMatchesFilter(l)); });
     resizeCanvases(); requestDraw();
   }
+  // ---------- Mute / Solo ----------
+  // lane.muted/lane.soloed are the stored, user-set base state (persisted,
+  // undoable). Actual audibility is derived in laneAudible() — while any
+  // lane is soloed, only soloed lanes play; a lane's own Mute icon never
+  // changes just because another lane's solo is suppressing it (only the
+  // row dims). Setting one of Mute/Solo on a lane always clears the other,
+  // for that lane, since a single lane doesn't need to represent both at
+  // once and it keeps this predictable end-to-end.
+  function setLaneMuted(lane,val){ lane.muted=val; if(val) lane.soloed=false; }
+  function setLaneSoloed(lane,val){ lane.soloed=val; if(val) lane.muted=false; }
+  function toggleLaneMuted(lane){ pushUndo(); setLaneMuted(lane,!lane.muted); refreshMuteSoloUI(); }
+  function toggleLaneSoloed(lane){ pushUndo(); setLaneSoloed(lane,!lane.soloed); refreshMuteSoloUI(); }
+  function refreshMuteSoloUI(){
+    state.ccLanes.forEach(l=>{
+      if(!l._row) return;
+      l._row.classList.toggle('lane-dimmed',!laneAudible(l));
+      if(l._muteBtn) l._muteBtn.classList.toggle('on',!!l.muted);
+      if(l._soloBtn) l._soloBtn.classList.toggle('on',!!l.soloed);
+    });
+    refreshTagBar();
+  }
+  // Bulk mute/solo for a group of lanes (a #tag, or every lane for ALL).
+  // "Smart toggle": if every lane in scope is already in the target state,
+  // turn it off for all of them; otherwise turn it on for all of them
+  // (clearing the opposite flag) — this is what both a short click and a
+  // long-press run; the long-press exists so a single accidental click on
+  // a tag/ALL button can't silently bulk-mute/solo a whole group, and
+  // doubles as the "force everyone back in line" action from a mixed state
+  // (e.g. one lane got individually un-muted or soloed since the group was
+  // last set) since it always recomputes from the group's current state.
+  function groupSmartToggle(lanes,field){
+    if(!lanes.length) return;
+    pushUndo();
+    const target=!lanes.every(l=>l[field]);
+    lanes.forEach(l=>{ field==='muted'?setLaneMuted(l,target):setLaneSoloed(l,target); });
+    refreshMuteSoloUI();
+  }
+  // Attaches both a plain click and a press-and-hold (>500ms) gesture to a
+  // button, calling the same handler either way — the hold is a deliberate
+  // "are you sure" gate for bulk group actions, not a functionally
+  // different operation. Suppresses the browser's own click event that
+  // follows a long-press release so the action doesn't fire twice.
+  function attachTagMuteSoloBtn(btn,handler){
+    let timer=null,longFired=false;
+    btn.addEventListener('mousedown',e=>{ e.stopPropagation(); longFired=false;
+      timer=setTimeout(()=>{ longFired=true; timer=null; handler(); },500); });
+    const cancel=()=>{ if(timer){ clearTimeout(timer); timer=null; } };
+    btn.addEventListener('mouseup',cancel); btn.addEventListener('mouseleave',cancel);
+    btn.addEventListener('click',e=>{ e.stopPropagation(); if(longFired){ longFired=false; return; } handler(); });
+  }
+
   function refreshTagBar(){
     const bar=$('tagFilterBar'); if(!bar) return;
     const all=new Set(); state.ccLanes.forEach(l=>laneTagList(l).forEach(t=>all.add(t)));
@@ -1789,15 +1880,30 @@
     if(all.size===0){ bar.style.display='none'; applyTagFilter(); return; }
     bar.style.display='flex';
     const lbl=document.createElement('span'); lbl.className='tag-bar-lbl'; lbl.textContent='Show:'; bar.appendChild(lbl);
-    function chip(label,on,fn,title){
-      const b=document.createElement('button'); b.className='tag-chip'+(on?' on':''); b.textContent=label;
-      if(title) b.title=title; b.addEventListener('click',fn); bar.appendChild(b);
+    // Each chip is a small pill: a label button (the existing show/hide
+    // filter toggle) plus M/S mini-buttons that bulk mute/solo every lane
+    // in that group (a #tag, or every lane for "All") — lit when every
+    // lane in the group currently shares that state.
+    function chip(label,on,fn,title,lanesForGroup){
+      const wrap=document.createElement('span'); wrap.className='tag-chip'+(on?' on':'');
+      const b=document.createElement('button'); b.className='tag-chip-label'; b.textContent=label;
+      if(title) b.title=title; b.addEventListener('click',fn); wrap.appendChild(b);
+      const allMuted=lanesForGroup.length>0&&lanesForGroup.every(l=>l.muted);
+      const allSoloed=lanesForGroup.length>0&&lanesForGroup.every(l=>l.soloed);
+      const mBtn=document.createElement('button'); mBtn.className='tag-mini-btn mute-btn'+(allMuted?' on':'');
+      mBtn.textContent='M'; mBtn.title='Mute every lane in this group (hold to force, overriding individual overrides)';
+      attachTagMuteSoloBtn(mBtn,()=>groupSmartToggle(lanesForGroup,'muted'));
+      const sBtn=document.createElement('button'); sBtn.className='tag-mini-btn solo-btn'+(allSoloed?' on':'');
+      sBtn.textContent='S'; sBtn.title='Solo every lane in this group (hold to force, overriding individual overrides)';
+      attachTagMuteSoloBtn(sBtn,()=>groupSmartToggle(lanesForGroup,'soloed'));
+      wrap.appendChild(mBtn); wrap.appendChild(sBtn);
+      bar.appendChild(wrap);
     }
-    chip('All',tagFilter.size===0,()=>{ tagFilter.clear(); refreshTagBar(); },'Show every lane');
+    chip('All',tagFilter.size===0,()=>{ tagFilter.clear(); refreshTagBar(); },'Show every lane',state.ccLanes.slice());
     [...all].sort((a,b)=>a.localeCompare(b)).forEach(t=>{
-      const n=state.ccLanes.filter(l=>laneTagList(l).includes(t)).length;
-      chip(t+' ('+n+')',tagFilter.has(t),()=>{ tagFilter.has(t)?tagFilter.delete(t):tagFilter.add(t); refreshTagBar(); },
-        'Toggle lanes tagged "'+t+'" — multiple tags show the union');
+      const lanesForTag=state.ccLanes.filter(l=>laneTagList(l).includes(t));
+      chip(t+' ('+lanesForTag.length+')',tagFilter.has(t),()=>{ tagFilter.has(t)?tagFilter.delete(t):tagFilter.add(t); refreshTagBar(); },
+        'Toggle lanes tagged "'+t+'" — multiple tags show the union',lanesForTag);
     });
     applyTagFilter();
   }
@@ -1808,12 +1914,13 @@
   function _addLane(type, cc, ch){ const id=state.nextId++; const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
     const ctr=0;
     const lane={id,type,cc:cc??(state.ccLanes.length?state.ccLanes[state.ccLanes.length-1].cc+1:1),ch:ch??0,color,name:'',visible:true,
-      tags:[...tagFilter],steps:0,points:[{t:0,v:ctr}],_preview:null};
+      tags:[...tagFilter],steps:0,muted:false,soloed:false,points:[{t:0,v:ctr}],_preview:null};
     state.ccLanes.push(lane); buildLaneDom(lane); setActiveLane(id); resizeCanvases(); refreshTagBar(); return lane; }
   function buildLaneDom(lane){
     const row=document.createElement('div'); row.className='lane'; row.dataset.id=lane.id;
     if(lane.visible===false) row.classList.add('lane-hidden');
     if(!laneMatchesFilter(lane)) row.classList.add('lane-filtered');
+    if(!laneAudible(lane)) row.classList.add('lane-dimmed');
 
     // Top bar: always visible, shown only when lane is collapsed (minimized).
     // Shows custom name, CC#/PB, and channel together so a minimized lane
@@ -1857,12 +1964,15 @@
     const chn=document.createElement('input'); chn.type='number'; chn.className='chn'; chn.min=1; chn.max=16; chn.value=lane.ch+1;
     const swatch=document.createElement('span'); swatch.className='swatch'; swatch.style.background=lane.color;
     const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
-    const bUp=document.createElement('button'); bUp.className='move-btn'; bUp.textContent='▲'; bUp.title='Move lane up';
-    const bDn=document.createElement('button'); bDn.className='move-btn'; bDn.textContent='▼'; bDn.title='Move lane down';
+    // Mute/Solo replace the old ▲▼ reorder buttons — the drag-handle (⠿)
+    // already reorders lanes, so ▲▼ were redundant, and this row has no
+    // spare room otherwise (a pre-existing overflow issue in this column).
+    const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
+    const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
     const hideBtn=document.createElement('button'); hideBtn.className='move-btn'; hideBtn.textContent='●'; hideBtn.title='Hide lane';
     const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
     compRow.appendChild(chLbl); compRow.appendChild(chn); compRow.appendChild(swatch); compRow.appendChild(xBtn);
-    compRow.appendChild(bUp); compRow.appendChild(bDn); compRow.appendChild(hideBtn); compRow.appendChild(dragHandle);
+    compRow.appendChild(muteBtn); compRow.appendChild(soloBtn); compRow.appendChild(hideBtn); compRow.appendChild(dragHandle);
 
     // Val + Pos (+ Steps) on one row — saves vertical space when many lanes
     // are open. Steps lives here rather than compact-row: that row's icons
@@ -1957,8 +2067,9 @@
       swatch.style.background=lane.color; tbSwatch.style.background=lane.color; requestDraw();
     });
     xBtn.addEventListener('click',()=>{ pushUndo(); removeLane(lane.id); });
-    bUp.addEventListener('click',()=>{ const i=state.ccLanes.indexOf(lane); if(i>0){ pushUndo(); [state.ccLanes[i],state.ccLanes[i-1]]=[state.ccLanes[i-1],state.ccLanes[i]]; rebuildLanesDom(lane.id); } });
-    bDn.addEventListener('click',()=>{ const i=state.ccLanes.indexOf(lane); if(i<state.ccLanes.length-1){ pushUndo(); [state.ccLanes[i],state.ccLanes[i+1]]=[state.ccLanes[i+1],state.ccLanes[i]]; rebuildLanesDom(lane.id); } });
+    lane._muteBtn=muteBtn; lane._soloBtn=soloBtn;
+    muteBtn.addEventListener('click',()=>toggleLaneMuted(lane));
+    soloBtn.addEventListener('click',()=>toggleLaneSoloed(lane));
 
     // Drag-to-reorder via the ⠿ handle
     let _dragSrcId=null;
@@ -2453,13 +2564,22 @@
     const bytes=[...MMV_SIG,...Array.from(new TextEncoder().encode(json))];
     return [0xFF,0x7F,...writeVarLen(bytes.length),...bytes];
   }
-  function buildMidi(){ const ev=[]; const mpqn=Math.round(60000000/state.bpm);
+  // opts.soloOnly: only include lanes with .soloed (ignored if nothing is
+  // soloed, rather than silently exporting an empty CC set). opts.excludeMuted:
+  // leave out any .muted lane. Both default off — Mute/Solo are ignored by
+  // export unless explicitly opted into via the Setup panel checkboxes.
+  function buildMidi(opts){ opts=opts||{};
+    const anySolo=opts.soloOnly&&state.ccLanes.some(l=>l.soloed);
+    const ev=[]; const mpqn=Math.round(60000000/state.bpm);
     ev.push({tick:0,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]});
     tsMapSorted().forEach(s=>{ const dd=Math.round(Math.log2(s.den)); ev.push({tick:s.tick,o:0,d:[0xFF,0x58,0x04,s.num,dd,24,8]}); });
     ev.push({tick:0,o:0,d:buildMmvMeta()});
     for(const n of state.notes){ const ch=n.ch&15; ev.push({tick:Math.round(n.start),o:2,d:[0x90|ch,n.pitch&127,clamp(n.vel,1,127)]}); ev.push({tick:Math.round(n.start+Math.max(1,n.length)),o:1,d:[0x80|ch,n.pitch&127,0]}); }
     const end=totalTicks(), step=Math.max(1,Math.round(state.ppq/state.ccRes));
-    for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue; const ch=lane.ch&15; let last=null;
+    for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue;
+      if(anySolo&&!lane.soloed) continue;
+      if(opts.excludeMuted&&lane.muted) continue;
+      const ch=lane.ch&15; let last=null;
       if(laneIsPb(lane)){
         for(let t=0;t<=end;t+=step){ const pv=clamp(Math.round(laneValueAt(lane,t)),-8192,8191)+8192; const enc=(pv&0x7F)|((pv>>7)<<8); if(enc!==last){ ev.push({tick:t,o:3,d:[0xE0|ch,pv&0x7F,(pv>>7)&0x7F]}); last=enc; } }
       } else {
@@ -2473,7 +2593,9 @@
     const th=[0x4D,0x54,0x72,0x6B,(trk.length>>24)&255,(trk.length>>16)&255,(trk.length>>8)&255,trk.length&255];
     return new Uint8Array([...hdr,...th,...trk]); }
   function projFilename(suffix){ return (state.projectName.trim()||'mmv-curve').replace(/[^a-z0-9_\-. ]/gi,'_')+suffix; }
-  function exportMidi(){ const bytes=buildMidi(); const blob=new Blob([bytes],{type:'audio/midi'});
+  function exportMidi(){
+    const opts={soloOnly:$('exportSoloOnly').checked,excludeMuted:$('exportExcludeMuted').checked};
+    const bytes=buildMidi(opts); const blob=new Blob([bytes],{type:'audio/midi'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=projFilename('.mid'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
 
   function buildSyncTrack(){
@@ -2907,7 +3029,7 @@
       }
     }
     const step=Math.max(1,Math.round(state.ppq/state.ccRes));
-    for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue; let last=null;
+    for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false||!laneAudible(lane)) continue; let last=null;
       if(laneIsPb(lane)){
         for(let t=lo;t<hi;t+=step){ const pv=clamp(Math.round(laneValueAt(lane,t)),-8192,8191)+8192; const enc=(pv&0x7F)|((pv>>7)<<8); if(enc!==last){ try{state.midiOut.send([0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F],base+(t-lo)*mspt);}catch(e){} last=enc; } }
       } else {
@@ -3110,7 +3232,7 @@
       evs.push({tick:n.start, o:2, msg:[0x90|(n.ch&15), n.pitch&127, clamp(n.vel,1,127)]});
       const off=Math.min(b, n.start+Math.max(1,n.length)); evs.push({tick:off, o:1, msg:[0x80|(n.ch&15), n.pitch&127, 0]}); } }
     const step=Math.max(1, Math.round(state.ppq/state.ccRes));
-    for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue; let last=null;
+    for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false||!laneAudible(lane)) continue; let last=null;
       if(laneIsPb(lane)){
         for(let t=a;t<b;t+=step){ const pv=clamp(Math.round(laneValueAt(lane,t)),-8192,8191)+8192; const enc=(pv&0x7F)|((pv>>7)<<8); if(enc!==last){ evs.push({tick:t,o:3,msg:[0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F]}); last=enc; } }
       } else {
@@ -3149,7 +3271,7 @@
           mSend([0x90|(n.ch&15),n.pitch&127,clamp(n.vel,1,127)], t0);
       }
       // Chase CC: send current value of each lane at startTick
-      for(const lane of state.ccLanes){ if(lane.points.length&&lane.visible!==false){ const v=laneValueAt(lane,startTick); if(laneIsPb(lane)){ const pv=clamp(Math.round(v),-8192,8191)+8192; mSend([0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F],t0); } else { mSend([0xB0|(lane.ch&15),lane.cc&127,clamp(Math.round(v),0,127)],t0); } } }
+      for(const lane of state.ccLanes){ if(lane.points.length&&lane.visible!==false&&laneAudible(lane)){ const v=laneValueAt(lane,startTick); if(laneIsPb(lane)){ const pv=clamp(Math.round(v),-8192,8191)+8192; mSend([0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F],t0); } else { mSend([0xB0|(lane.ch&15),lane.cc&127,clamp(Math.round(v),0,127)],t0); } } }
     }
     startClock(); schedulerTick(); rafVisual=requestAnimationFrame(visualFrame);
     // Audio playback — start at the same wall-clock instant as MIDI (t0)

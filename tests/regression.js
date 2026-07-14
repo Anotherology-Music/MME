@@ -46,7 +46,7 @@ function buildTestHtml() {
       '  window._TEST_updateNoteInfo = updateNoteInfo;',
       '  window._TEST_snapshot = snapshot;',
       '  window._TEST_applyState = applyState;',
-      '  window._TEST_buildMidi = () => Array.from(buildMidi());',
+      '  window._TEST_buildMidi = (opts) => Array.from(buildMidi(opts));',
       '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents }; };',
       '  window._TEST_addLane = (cc, ch) => { const l = addLane(cc, ch); return l.id; };',
       '  window._TEST_upsertPoint = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); upsertPoint(l, t, v); };',
@@ -83,6 +83,8 @@ function buildTestHtml() {
       '  window._TEST_setMidiInById = (id) => setMidiInById(id);',
       '  window._TEST_loadAudio = (file) => loadAudio(file);',
       '  window._TEST_audioBufDuration = () => (typeof audioBuf !== "undefined" && audioBuf) ? audioBuf.duration : null;',
+      '  window._TEST_laneAudible = (id) => laneAudible(state.ccLanes.find(l => l.id === id));',
+      '  window._TEST_buildPassEvents = (a, b) => buildPassEvents(a, b);',
       '  init();',
     ].join('\n')
   );
@@ -1315,7 +1317,7 @@ async function run() {
     const tags = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
     check('lane tags parsed from comma/space separated input', JSON.stringify(tags) === JSON.stringify(['sceneA', 'kaleido']), tags);
     const barDisplay = await page.evaluate(() => document.getElementById('tagFilterBar').style.display);
-    const chipTexts = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].map(b => b.textContent));
+    const chipTexts = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].map(b => b.textContent));
     check(
       'tag filter bar shows chips for All + each tag once a lane is tagged',
       barDisplay === 'flex' && chipTexts.includes('All') && chipTexts.some(t => t.startsWith('sceneA')) && chipTexts.some(t => t.startsWith('kaleido')),
@@ -1330,7 +1332,7 @@ async function run() {
     await page.dispatchEvent(`.lane[data-id="${idA}"] input.ltags`, 'change');
     await page.waitForTimeout(50);
     await page.evaluate(() => {
-      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(b => b.textContent.startsWith('sceneA'));
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(b => b.textContent.startsWith('sceneA'));
       chip.click();
     });
     await page.waitForTimeout(50);
@@ -1896,6 +1898,151 @@ async function run() {
     const snapTick = await page.evaluate(() => window._TEST_state.ppq / 4);
     check('Shift+ArrowRight nudges by a full snap-grid step instead of 1 tick',
       afterShiftNudge === snapTick, { afterShiftNudge, snapTick });
+  });
+
+  // ---------------- CC lane Mute/Solo ----------------
+
+  await withPage(browser, async (page) => {
+    const ids = await page.evaluate(() => ({ a: window._TEST_addLane(20, 0), b: window._TEST_addLane(21, 0), c: window._TEST_addLane(22, 0) }));
+    await page.evaluate((ids) => {
+      document.querySelector(`.lane[data-id="${ids.a}"] input.ltags`).value = 'sceneA';
+      document.querySelector(`.lane[data-id="${ids.a}"] input.ltags`).dispatchEvent(new Event('change'));
+      document.querySelector(`.lane[data-id="${ids.b}"] input.ltags`).value = 'sceneA';
+      document.querySelector(`.lane[data-id="${ids.b}"] input.ltags`).dispatchEvent(new Event('change'));
+    }, ids);
+    await page.waitForTimeout(80);
+
+    // Individual mute
+    await page.click(`.lane[data-id="${ids.a}"] .mute-btn`);
+    await page.waitForTimeout(30);
+    const aMuted = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).muted, ids.a);
+    const aIconLit = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .mute-btn`).classList.contains('on'), ids.a);
+    check('clicking a lane\'s M button mutes it and lights the icon', aMuted && aIconLit, { aMuted, aIconLit });
+
+    // Individual solo on B: audibility derives correctly, A's icon is untouched by B's solo
+    await page.click(`.lane[data-id="${ids.b}"] .solo-btn`);
+    await page.waitForTimeout(30);
+    const [audibleA, audibleB, audibleC] = await Promise.all([ids.a, ids.b, ids.c].map(id => page.evaluate((id) => window._TEST_laneAudible(id), id)));
+    check('while B is soloed, only B is audible (A muted, C plain-suppressed)',
+      !audibleA && audibleB && !audibleC, { audibleA, audibleB, audibleC });
+    const [dimmedA, dimmedC, aIconStillLit] = await Promise.all([
+      page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-dimmed'), ids.a),
+      page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-dimmed'), ids.c),
+      page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .mute-btn`).classList.contains('on'), ids.a),
+    ]);
+    check('solo-suppressed rows dim, but a suppressed lane\'s own Mute icon is untouched',
+      dimmedA && dimmedC && aIconStillLit, { dimmedA, dimmedC, aIconStillLit });
+
+    // Un-solo B: everyone reverts to their own stored state
+    await page.click(`.lane[data-id="${ids.b}"] .solo-btn`);
+    await page.waitForTimeout(30);
+    const [audibleA2, audibleC2] = await Promise.all([ids.a, ids.c].map(id => page.evaluate((id) => window._TEST_laneAudible(id), id)));
+    check('un-soloing reverts every lane to its own stored Mute state', !audibleA2 && audibleC2, { audibleA2, audibleC2 });
+
+    // Rule from the spec: soloing a lane then applying tag-group Mute changes it to Muted
+    // ("whichever was clicked last dictates the lane's state").
+    await page.click(`.lane[data-id="${ids.a}"] .solo-btn`); // A: soloed, not muted
+    const beforeTag = await page.evaluate((id) => { const l = window._TEST_state.ccLanes.find(x => x.id === id); return { muted: l.muted, soloed: l.soloed }; }, ids.a);
+    const sceneAMute = async () => {
+      const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.includes('sceneA')));
+      return chip.asElement().$('.mute-btn');
+    };
+    await (await sceneAMute()).click();
+    await page.waitForTimeout(30);
+    const afterTag = await page.evaluate((ids) => [ids.a, ids.b].map(id => { const l = window._TEST_state.ccLanes.find(x => x.id === id); return { muted: l.muted, soloed: l.soloed }; }), ids);
+    check('a tag-group Mute click overrides an individually-soloed lane in that tag (last action wins)',
+      beforeTag.soloed === true && afterTag.every(l => l.muted === true && l.soloed === false),
+      { beforeTag, afterTag });
+
+    // Smart toggle: clicking again while everyone in the group matches turns it off for all
+    await (await sceneAMute()).click();
+    await page.waitForTimeout(30);
+    const afterSecond = await page.evaluate((ids) => [ids.a, ids.b].map(id => window._TEST_state.ccLanes.find(x => x.id === id).muted), ids);
+    check('clicking a tag\'s Mute again (all already muted) un-mutes the whole group',
+      afterSecond.every(m => m === false), afterSecond);
+
+    // Long-press forces a mixed group back to one state
+    await page.click(`.lane[data-id="${ids.a}"] .mute-btn`); // A muted, B not — a mixed group
+    await page.waitForTimeout(30);
+    const btnBox = await (await sceneAMute()).boundingBox();
+    await page.mouse.move(btnBox.x + btnBox.width / 2, btnBox.y + btnBox.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(600);
+    await page.mouse.up();
+    await page.waitForTimeout(30);
+    const afterLongPress = await page.evaluate((ids) => [ids.a, ids.b].map(id => window._TEST_state.ccLanes.find(x => x.id === id).muted), ids);
+    check('holding a tag\'s Mute button forces every lane in the group to Muted from a mixed state',
+      afterLongPress.every(m => m === true), afterLongPress);
+
+    // ALL button reaches every lane, including untagged ones
+    const allSoloBtn = async () => {
+      const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.trim().startsWith('All')));
+      return chip.asElement().$('.solo-btn');
+    };
+    await (await allSoloBtn()).click();
+    await page.waitForTimeout(30);
+    const allSoloed = await page.evaluate((ids) => [ids.a, ids.b, ids.c].map(id => window._TEST_state.ccLanes.find(x => x.id === id).soloed), ids);
+    check('the ALL chip\'s Solo button reaches every lane, tagged or not', allSoloed.every(s => s === true), allSoloed);
+  });
+
+  await withPage(browser, async (page) => {
+    // Live playback (buildPassEvents) skips inaudible lanes; export ignores
+    // Mute/Solo by default and only respects them via the opt-in checkboxes.
+    const ids = await page.evaluate(() => ({ a: window._TEST_addLane(30, 0), b: window._TEST_addLane(31, 0) }));
+    await page.evaluate((ids) => {
+      window._TEST_upsertPoint(ids.a, 0, 50);
+      window._TEST_upsertPoint(ids.b, 0, 90);
+      window._TEST_state.ccLanes.find(l => l.id === ids.a).muted = true;
+    }, ids);
+
+    const totalTicks = await page.evaluate(() => window._TEST_totalTicks());
+    const evs = await page.evaluate((t) => window._TEST_buildPassEvents(0, t), totalTicks);
+    const ccNumbers = [...new Set(evs.filter(e => e.msg && (e.msg[0] & 0xF0) === 0xB0).map(e => e.msg[1]))];
+    check('live playback (buildPassEvents) skips a Muted lane\'s CC data', !ccNumbers.includes(30) && ccNumbers.includes(31), ccNumbers);
+
+    const defaultBytes = await page.evaluate(() => window._TEST_buildMidi({}));
+    const defaultParsed = await page.evaluate((b) => window._TEST_parseMidi(b), defaultBytes);
+    check('export ignores Mute/Solo by default', '0_30' in defaultParsed.ccMap, Object.keys(defaultParsed.ccMap));
+
+    const exclBytes = await page.evaluate(() => window._TEST_buildMidi({ excludeMuted: true }));
+    const exclParsed = await page.evaluate((b) => window._TEST_parseMidi(b), exclBytes);
+    check('export with "Exclude Muted lanes" checked leaves the muted lane out',
+      !('0_30' in exclParsed.ccMap) && '0_31' in exclParsed.ccMap, Object.keys(exclParsed.ccMap));
+
+    await page.evaluate((id) => { window._TEST_state.ccLanes.find(l => l.id === id).soloed = true; window._TEST_state.ccLanes.find(l => l.id === id).muted = false; }, ids.a);
+    const soloBytes = await page.evaluate(() => window._TEST_buildMidi({ soloOnly: true }));
+    const soloParsed = await page.evaluate((b) => window._TEST_parseMidi(b), soloBytes);
+    check('export with "Export Solo lanes only" checked includes just the soloed lane',
+      '0_30' in soloParsed.ccMap && !('0_31' in soloParsed.ccMap), Object.keys(soloParsed.ccMap));
+
+    await page.evaluate((id) => { window._TEST_state.ccLanes.find(l => l.id === id).soloed = false; }, ids.a);
+    const soloNoneBytes = await page.evaluate(() => window._TEST_buildMidi({ soloOnly: true }));
+    const soloNoneParsed = await page.evaluate((b) => window._TEST_parseMidi(b), soloNoneBytes);
+    check('"Export Solo lanes only" with nothing soloed is a no-op (exports everything, not nothing)',
+      '0_30' in soloNoneParsed.ccMap && '0_31' in soloNoneParsed.ccMap, Object.keys(soloNoneParsed.ccMap));
+  });
+
+  await withPage(browser, async (page) => {
+    // Mute/Solo are mutually exclusive on a single lane, undoable, and
+    // persist through snapshot()/applyState() (and therefore .mmvp saves).
+    const id = await page.evaluate(() => window._TEST_addLane(40, 0));
+    await page.click(`.lane[data-id="${id}"] .solo-btn`);
+    await page.click(`.lane[data-id="${id}"] .mute-btn`);
+    await page.waitForTimeout(30);
+    const state1 = await page.evaluate((id) => { const l = window._TEST_state.ccLanes.find(x => x.id === id); return { muted: l.muted, soloed: l.soloed }; }, id);
+    check('setting Mute on a lane clears its Solo', state1.muted === true && state1.soloed === false, state1);
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(30);
+    const afterUndo = await page.evaluate((id) => { const l = window._TEST_state.ccLanes.find(x => x.id === id); return { muted: l.muted, soloed: l.soloed }; }, id);
+    check('mute/solo toggles are undoable', afterUndo.muted === false && afterUndo.soloed === true, afterUndo);
+
+    await page.evaluate((id) => { window._TEST_state.ccLanes.find(l => l.id === id).muted = true; window._TEST_state.ccLanes.find(l => l.id === id).soloed = false; }, id);
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    await page.evaluate((id) => { const l = window._TEST_state.ccLanes.find(x => x.id === id); l.muted = false; }, id);
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    const restored = await page.evaluate((id) => window._TEST_state.ccLanes.find(x => x.id === id).muted, id);
+    check('lane.muted/lane.soloed survive snapshot()/applyState() roundtrip', restored === true, restored);
   });
 
   await browser.close();
