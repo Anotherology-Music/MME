@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.3
+  MMV MIDI & CC Curve Editor v0.9.4
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -158,6 +158,44 @@
   still see the "reload audio file" reminder and load it by hand — same
   as before, just no longer silently skipped on paths that should have
   worked.
+  v0.9.4 UI polish pass. PLAY/elapsed-clock/Go-to merged into one ringed
+  "Position" cluster (same blue-ring styling as Transport/Tool/Snap); the
+  VIEW ch + timeline selects were already one ringed group and just picked
+  up the same label casing. Go-to's field now has placeholder text ("e.g.
+  12.5") — no change to what it accepts (seconds).
+  Lane tags: the always-open #tags text field is now a compact colored pill
+  showing the tag name(s) (long lists truncate with a "…" and a full-list
+  tooltip); click the pill (or Enter/Space when it has focus) to swap in the
+  same editable field as before, which still commits on blur/Enter exactly
+  as before. Tag data, the filter bar, and .mmvp save format are unchanged
+  — display only.
+  Lane icon ergonomics: the compact-row's trailing icons (Mute/Solo/Hide/
+  drag-grip/×) used to overflow the fixed 156px leftcol column and be
+  clipped/unhittable by real pointer coordinates (tests worked around it
+  with a dispatched click). They're now split into their own wrapping
+  icon-row, every icon is a real >=16px hit target with visible gaps, and ×
+  — the only destructive control — sits behind a divider at the end of the
+  row instead of next to Mute/Solo. The tag-bar chips' mini M/S buttons got
+  the same size bump. A regression test now proves every icon is hittable
+  with a genuine Playwright pointer click (no force:true, no dispatchEvent).
+  Note Info collapses to a single slim "Note Info — no selection" row
+  whenever nothing is selected (no note, no CC point), and expands back to
+  the full Note/Vel/Pos/Ch layout the moment something is — field ids and
+  editing behavior are unchanged when expanded.
+  GENERATE strip: the 12 shape buttons (Ramp/Exp/Sine/Tri/Sqr/Step x up/
+  down) are now 6 shape buttons plus one ↗/↘ direction toggle that applies
+  to all of them — generate() itself is untouched, so output for every
+  shape+direction combination is byte-identical to before (regression-
+  tested against the old per-shape up/down pairing). Shape buttons disable
+  themselves with an explanatory tooltip whenever no lane is active.
+  Small consistency fixes: a speaker icon (with a live-updating volume %
+  tooltip) next to the audio volume slider; a slim "VEL" gutter label on
+  the velocity-bars strip, since the leftcol beside it is Note Info now,
+  not a velocity label; thin dark scrollbars (~8px) on every internal
+  scroll container (lane list, piano roll, popovers, Advanced panel,
+  Effects Library drawer, ISF import table); and the remaining text-glyph
+  icons (save 💾, folder 📁, library ⚡, Undo/Redo's ↶/↷) are now inline
+  SVGs sized like the v0.9.3 metronome/chain-link/padlock icons.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -172,19 +210,30 @@
     font:13px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
   #app{display:flex;flex-direction:column;height:100vh;width:100vw;overflow:hidden;}
 
+  /* ── Thin dark scrollbars, everywhere (lane list, piano roll, popovers,
+     the Advanced panel, the Effects Library drawer, ISF import table, …) ── */
+  *{scrollbar-width:thin;scrollbar-color:#3a404e var(--panel3);}
+  *::-webkit-scrollbar{width:8px;height:8px;}
+  *::-webkit-scrollbar-track{background:var(--panel3);}
+  *::-webkit-scrollbar-thumb{background:#3a404e;border-radius:4px;}
+  *::-webkit-scrollbar-thumb:hover{background:#4a5164;}
+  *::-webkit-scrollbar-corner{background:var(--panel3);}
+
   /* ── Toolbar rows ── */
-  .toolbar{display:flex;align-items:center;gap:10px;padding:6px 10px;background:var(--panel);border-bottom:1px solid var(--line);}
+  .toolbar{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--panel);border-bottom:1px solid var(--line);}
   .toolbar-r1{flex-wrap:nowrap;}
   .toolbar-r1 .push{flex:1;}
   .toolbar-r2{background:var(--panel3);border-bottom:2px solid var(--line);padding:5px 10px;}
   .toolbar-r2 button{font-size:12px;padding:4px 8px;}
   .toolbar-r2 select,.toolbar-r2 input[type=number]{font-size:12px;padding:3px 5px;}
-  .newnote-grp,.project-grp,.tool-grp,.snap-grp,.transport-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
-  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl,.transport-grp .lbl{color:var(--accent);font-size:10px;}
-  .btnrow button.icon-btn{display:inline-flex;align-items:center;justify-content:center;padding:5px 7px;}
-  .view-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
-  .view-grp .lbl{color:var(--accent);font-size:10px;}
+  .newnote-grp,.project-grp,.tool-grp,.snap-grp,.transport-grp,.position-grp,.view-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
+  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl,.transport-grp .lbl,.position-grp .lbl,.view-grp .lbl{color:var(--accent);font-size:10px;}
+  button.icon-btn{display:inline-flex;align-items:center;justify-content:center;padding:5px 7px;}
   .view-grp .lbl2{color:#888;font-size:10px;}
+  .position-grp{gap:2px;}
+  .position-grp #gotoSec{width:52px;flex-shrink:0;}
+  .position-grp b,.position-grp .lbl2{flex-shrink:0;}
+  .position-grp .lbl2{white-space:nowrap;}
   .project-grp .group{display:flex;align-items:center;gap:5px;}
   /* ── Setup dropdown ── */
   #setupWrapper{position:relative;}
@@ -203,7 +252,7 @@
   #tsPanel.open{display:flex;}
   #tsBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
   /* ── Note Info columns (replaces velocity leftcol) ── */
-  .note-info-left{padding:4px 5px!important;justify-content:flex-start!important;}
+  .note-info-left{padding:4px 5px!important;justify-content:center!important;}
   .ni-title{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);padding-bottom:3px;white-space:nowrap;}
   .note-info-grid{display:grid;grid-template-columns:0.5fr 1fr 1fr 1fr;gap:3px;width:100%;}
   .ni-col{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;}
@@ -211,6 +260,13 @@
   .ni-input{width:100%;padding:2px 3px;font-size:10px;text-align:center;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
   .ni-disp{font-size:10px;color:var(--txt);background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:2px 1px;width:100%;text-align:center;overflow:hidden;white-space:nowrap;}
+  /* Collapsed to a single slim row when nothing is selected (item 5) — the
+     title + grid stay in the DOM (field ids/editing behavior unchanged when
+     expanded) and just hide, so nothing about the actual editing wiring
+     needs to know about collapse state. */
+  .ni-empty{display:none;font-size:10px;color:var(--txt2);white-space:nowrap;}
+  .note-info-left.ni-collapsed .ni-title,.note-info-left.ni-collapsed .note-info-grid{display:none;}
+  .note-info-left.ni-collapsed .ni-empty{display:block;}
   /* ── Lane ch-filter: auto-collapse when View Ch doesn't match ── */
   .lane.lane-ch-filtered .grip{display:none!important;}
   .lane.lane-ch-filtered .lanebody{display:none!important;}
@@ -225,7 +281,7 @@
   input[type=number]{width:56px;}
   select{max-width:170px;}
   button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
-    border-radius:5px;padding:5px 9px;font-size:12px;cursor:pointer;}
+    border-radius:5px;padding:5px 9px;font-size:12px;cursor:pointer;white-space:nowrap;}
   button:hover{border-color:var(--accent);}
   button.on{background:var(--accent);color:#06223f;border-color:var(--accent);font-weight:600;}
   button.warn:hover{border-color:#ff6b6b;}
@@ -291,13 +347,26 @@
 
   .piano-row{flex:0 0 auto;min-height:70px;height:200px;}
   .vel-row{height:84px;}
+  /* Slim gutter label identifying the velocity-bars strip itself, since the
+     leftcol next to it is Note Info (notes+CC points), not a "velocity"
+     label anymore. */
+  .vel-gutter-lbl{position:absolute;top:2px;left:4px;font-size:9px;font-weight:700;
+    letter-spacing:.06em;color:var(--txt2);opacity:.6;pointer-events:none;user-select:none;}
   .vel-row .leftcol,.lane .leftcol{display:flex;flex-direction:column;justify-content:center;gap:3px;padding:5px 6px;}
   .vel-row .leftcol .t{font-size:11px;color:var(--txt2);}
 
   .pr-splitter{height:5px;flex:0 0 5px;background:var(--panel2);border-top:1px solid var(--line);border-bottom:1px solid var(--line);cursor:ns-resize;}
   .pr-splitter:hover,.pr-splitter.dragging{background:var(--accent2);}
   .lanes{display:flex;flex-direction:column;flex:1 1 0;min-height:0;overflow-y:auto;}
-  .lane{height:92px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
+  /* min-height:0 overrides the flexbox default auto min-height (which is
+     based on content's min-content size) — without it, on short viewports
+     where .lanes (the scrolling flex column above) has to squeeze a lane
+     below its own content's natural minimum, the lane would refuse to
+     shrink and silently overflow .lanes' clipped box instead, leaving its
+     grip (and everything below the clip line) positioned outside the
+     visible/hittable area even though getBoundingClientRect still reports
+     a plausible-looking box for it. */
+  .lane{height:92px;min-height:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
   .lanebody{flex:1;display:flex;min-height:0;}
   .lane.active .leftcol{box-shadow:inset 3px 0 0 var(--accent2);}
 
@@ -324,17 +393,20 @@
   .lane-top-bar .tb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--txt2);}
   .lane-top-bar .tb-meta{flex:0 0 auto;font-size:10px;color:var(--txt2);opacity:.75;white-space:nowrap;}
 
-  /* Lane leftcol — name row on top (last to hide), compact row below */
+  /* Lane leftcol — name row on top (last to hide), compact row + icon row below */
   /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
      overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
      which *still* creates a scroll container). Any non-"visible" overflow-y
      would make this element its own sticky containing block, trapping
      .leftcol-inner's centering to the (mostly offscreen) full row height
      instead of letting it stick relative to .lanes, the true scrolling
-     ancestor. Horizontal clipping (compact-row's icon buttons can overflow
-     the 156px column) is applied on .leftcol-inner below instead — that's
+     ancestor. overflow:hidden lives on .leftcol-inner below instead — that's
      the sticky element itself, not an ancestor, so it doesn't affect the
-     containing-block search and can safely clip. */
+     containing-block search. It used to also be load-bearing for clipping
+     the compact-row's icon buttons back to the 156px column width (they
+     overflowed and were unhittable); that's fixed now by giving the icons
+     their own wrapping row instead of relying on clipping, so this is just
+     a plain safety net today. */
   .lane .leftcol{font-size:11px;justify-content:flex-start;overflow:visible;}
   /* Keeps the name/CC/val/pos controls vertically centered in whatever part of
      a tall (Alt+wheel-zoomed) lane is currently scrolled into view, instead of
@@ -345,26 +417,38 @@
      lanes shorter than the scrollport, spilling into the row above. This
      variant leans on .leftcol already being a column flexbox — auto margins
      do the centering, and pinning both edges means it can never escape its
-     own row's bounds regardless of row or scrollport size.
-     overflow:hidden here (not on .leftcol) clips compact-row's buttons back
-     to the column width without re-breaking the sticky containing-block. */
-  .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:3px;width:100%;overflow:hidden;}
+     own row's bounds regardless of row or scrollport size. */
+  .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:2px;width:100%;overflow:hidden;}
   .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
-  .lane .leftcol .name-row{padding:3px 0 1px;}
+  .lane .leftcol .name-row{padding:2px 0 1px;}
   .lane .leftcol .name-row input{flex:1;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   .lane .leftcol .name-row input.ltags{flex:0 0 42%;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
+  /* Tag pill — compact colored stand-in for the tag text field, shown until
+     clicked (or Enter/Space when focused via keyboard), which swaps it for
+     the real input (committed the same as always on blur/Enter). */
+  .lane .leftcol .tag-pill{flex:0 0 42%;min-width:0;display:inline-flex;align-items:center;gap:4px;
+    font-size:10px;color:#cfe4ff;background:#2c313b;border:1px solid #3a404e;border-radius:9px;
+    padding:2px 7px;cursor:pointer;}
+  .lane .leftcol .tag-pill:hover,.lane .leftcol .tag-pill:focus{border-color:var(--accent);outline:none;}
+  .lane .leftcol .tag-pill.empty{color:var(--txt2);font-style:italic;}
+  .lane .leftcol .tag-pill.empty .tag-pill-dot{opacity:.35;}
+  .lane .leftcol .tag-pill-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+  .lane .leftcol .tag-pill-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .lane.lane-filtered{display:none!important;}
   .lane.lane-dimmed{opacity:.4;}
   .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
   .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
-  .tag-chip{display:inline-flex;align-items:center;gap:3px;font-size:11px;padding:2px 4px 2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
+  .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px 2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
   .tag-chip:hover{border-color:#4fa3ff;}
   .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
   .tag-chip-label{background:none;border:none;color:inherit;font-size:11px;padding:0;cursor:pointer;}
-  .tag-mini-btn{font-size:8px;font-weight:700;line-height:1;padding:2px 4px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;}
+  /* >=16px hit target — same bump as the per-lane M/S/hide/delete icons below. */
+  .tag-mini-btn{font-size:9px;font-weight:700;line-height:1;min-width:16px;min-height:16px;padding:2px 5px;
+    border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;}
   .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
   .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
-  .lane .leftcol .compact-row{gap:1px;padding-bottom:2px;flex-wrap:nowrap;}
+  .lane .leftcol .compact-row{gap:4px;padding-bottom:2px;flex-wrap:nowrap;}
   .lane .leftcol .compact-row .ccn{width:22px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
   .lane .leftcol .compact-row .chn{width:16px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
   .lane .leftcol .compact-row .ccn::-webkit-outer-spin-button,
@@ -372,12 +456,28 @@
   .lane .leftcol .compact-row .chn::-webkit-outer-spin-button,
   .lane .leftcol .compact-row .chn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   .lane .leftcol .swatch{width:9px;height:12px;border-radius:3px;border:1px solid #0006;cursor:pointer;flex-shrink:0;}
-  .lane .leftcol .x{color:var(--txt2);cursor:pointer;border:none;background:none;padding:0 2px;font-size:14px;}
-  .lane .leftcol .x:hover{color:#ff6b6b;}
-  .lane .leftcol .move-btn{font-size:10px;line-height:1;padding:1px 2px;border:none;background:none;cursor:pointer;color:var(--txt2);}
+  /* Icon row: real >=17px square hit targets with visible gaps between them
+     (fixes a pre-existing bug where these icons overflowed the fixed 156px
+     leftcol column and were clipped/unhittable by real pointer coordinates).
+     Wraps if the column is ever narrower than usual instead of clipping. */
+  .lane .leftcol .icon-row{gap:3px;padding-bottom:1px;flex-wrap:wrap;row-gap:3px;}
+  .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle{
+    width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
+    display:inline-flex;align-items:center;justify-content:center;
+    border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
+    padding:0;line-height:1;flex-shrink:0;}
+  .lane .leftcol .x:hover,.lane .leftcol .move-btn:hover,.lane .leftcol .drag-handle:hover{
+    border-color:var(--line);background:var(--panel2);}
+  .lane .leftcol .move-btn{font-size:10px;cursor:pointer;}
   .lane .leftcol .move-btn:hover{color:var(--accent);}
-  .lane .leftcol .drag-handle{font-size:12px;line-height:1;padding:1px 2px;border:none;background:none;cursor:grab;color:var(--txt2);user-select:none;}
+  .lane .leftcol .drag-handle{font-size:12px;cursor:grab;user-select:none;}
   .lane .leftcol .drag-handle:active{cursor:grabbing;}
+  /* × is the only destructive control in the row — kept visually separated
+     (a thin rule, then pushed to the far end via margin-left:auto) so it's
+     never hit by accident while reaching for M/S/hide. */
+  .lane .leftcol .icon-sep{width:1px;align-self:stretch;background:var(--line);margin:0 1px;flex-shrink:0;}
+  .lane .leftcol .x{color:var(--txt2);cursor:pointer;font-size:15px;margin-left:auto;}
+  .lane .leftcol .x:hover{color:#ff6b6b;border-color:#ff6b6b55;background:rgba(255,107,107,.12);}
   .lane.drag-over-top{border-top:2px solid var(--accent);}
   .lane.drag-over-bot{border-bottom:2px solid var(--accent);}
 
@@ -400,10 +500,16 @@
   .statusbar .sf b{display:inline-block;min-width:80px;font-variant-numeric:tabular-nums;}
   .hint{color:var(--txt2);font-size:11px;}
   .pill{font-size:11px;color:var(--txt2);}
+  /* Same ring tokens (background/border/radius) as .transport-grp etc. — kept
+     as its own rule rather than merged into that shared selector because this
+     strip also needs flex-wrap and a full-width basis those groups don't. */
   .gen-grp{display:flex;align-items:center;flex-wrap:wrap;gap:4px;
     background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);
     border-radius:6px;padding:4px 10px;width:100%;box-sizing:border-box;}
   .gen-grp .lbl{color:var(--accent);font-size:10px;font-weight:700;letter-spacing:.06em;margin-right:2px;}
+  .gen-grp button[data-shape]{min-width:44px;}
+  .gen-grp button:disabled{opacity:.4;cursor:not-allowed;}
+  #genDirToggle{font-weight:700;min-width:30px;}
   .adv-sec{font-size:10px;color:var(--accent);font-weight:700;letter-spacing:.06em;margin-bottom:6px;}
   .adv-lbl{font-size:11px;color:var(--txt2);white-space:nowrap;}
   .adv-num{width:52px;min-width:52px;font-size:11px;background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:3px;padding:1px 4px;text-align:center;}
@@ -461,24 +567,21 @@
         <button id="scrollLockBtn" class="icon-btn" title="Scroll Lock: once the playhead reaches the middle of the view during playback, keep it centered there and scroll the timeline underneath it instead"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></button>
       </div>
     </div>
-    <div class="group">
-      <span class="lbl">Play</span>
+    <div class="position-grp">
+      <span class="lbl">Position</span>
       <b id="stPlay" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt);min-width:80px;display:inline-block;">1.1.1.0</b>
-      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:58px;display:inline-block;">0:00.00</b>
-    </div>
-    <div class="sep"></div>
-    <div class="group">
-      <span class="lbl">Go to</span>
-      <input type="number" id="gotoSec" min="0" step="0.01" style="width:60px;" title="Jump playhead to this position (seconds). Press Enter.">
+      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:50px;display:inline-block;">0:00.00</b>
+      <span class="lbl2" style="color:#888;font-size:10px;">Go to</span>
+      <input type="number" id="gotoSec" min="0" step="0.01" placeholder="secs" title="Jump playhead to this position, in seconds — e.g. 12.5. Press Enter.">
       <span class="pill">s</span>
     </div>
     <div class="sep"></div>
     <div class="project-grp">
       <span class="lbl">Project</span>
       <input type="text" id="projectName" placeholder="Project name" style="flex:1;min-width:120px;font-size:12px;" title="Project name — used as the filename when exporting">
-      <button id="saveProjectBtn" style="padding:3px 7px;" title="Save project as a .mmvp file (includes all notes, CC, settings — audio must be reloaded separately)">&#x1F4BE;</button>
+      <button id="saveProjectBtn" class="icon-btn" title="Save project as a .mmvp file (includes all notes, CC, settings — audio must be reloaded separately)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg></button>
       <div id="projWrapper">
-        <button id="loadProjectBtn" style="padding:3px 7px;" title="Load a previously saved .mmvp project file">&#x1F4C2;</button>
+        <button id="loadProjectBtn" class="icon-btn" title="Load a previously saved .mmvp project file"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
         <div id="projPopover">
           <div class="setup-title">Recent Projects</div>
           <div id="projList"><span class="hint">—</span></div>
@@ -512,7 +615,7 @@
     <!-- push View controls to the right -->
     <div class="push"></div>
     <div class="view-grp">
-      <span class="lbl">VIEW</span>
+      <span class="lbl">View</span>
       <span class="lbl2">ch</span>
       <select id="viewCh" title="Filter piano roll to show only notes on this channel" style="width:88px;">
       </select>
@@ -603,8 +706,8 @@
   <div class="toolbar toolbar-r2">
     <div class="group">
       <div class="btnrow">
-        <button id="undoBtn" title="Undo (Ctrl+Z)">↶ Undo</button>
-        <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">Redo ↷</button>
+        <button id="undoBtn" title="Undo (Ctrl+Z)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:3px;"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>Undo</button>
+        <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">Redo<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-left:3px;"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
       </div>
     </div>
     <div class="sep"></div>
@@ -682,7 +785,8 @@
           <button id="audioClearBtn" style="font-size:10px;padding:2px 6px;" title="Remove the loaded audio file">×</button>
         </div>
         <div style="display:flex;gap:4px;align-items:center;width:100%;">
-          <input type="range" id="audioVolume" min="0" max="100" value="100" style="flex:1;min-width:0;height:12px;" title="Audio track volume">
+          <span id="audioVolIcon" title="Volume: 100%" style="flex-shrink:0;display:inline-flex;color:var(--txt2);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 9 8 9 13 4 13 20 8 15 3 15 3 9"/><path d="M16 8.5a5 5 0 0 1 0 7"/><path d="M19 6a9 9 0 0 1 0 12"/></svg></span>
+          <input type="range" id="audioVolume" min="0" max="100" value="100" style="flex:1;min-width:0;height:12px;" title="Audio track volume: 100%">
           <button id="audioSetLoopBtn" style="font-size:9px;padding:1px 5px;flex-shrink:0;" title="Set the A/B loop markers to exactly match the loaded audio's start/end">⇥⟺</button>
         </div>
         <button id="audioOffsetBadge" style="display:none;font-size:9px;padding:1px 6px;color:var(--accent2);background:var(--panel2);" title="Audio start offset — click to reset to 0">Off +0</button>
@@ -700,7 +804,8 @@
     <div class="pr-splitter" id="prSplitter" title="Drag to resize piano roll"></div>
 
     <div class="row vel-row" id="velRow">
-      <div class="leftcol note-info-left">
+      <div class="leftcol note-info-left" id="noteInfoLeft">
+        <span class="ni-empty" id="noteInfoEmpty">Note Info — no selection</span>
         <span class="ni-title">Note Info</span>
         <div class="note-info-grid">
           <div class="ni-col">
@@ -721,7 +826,7 @@
           </div>
         </div>
       </div>
-      <div class="scroll hx" id="velScroll"><canvas id="velCanvas"></canvas></div>
+      <div class="scroll hx" id="velScroll"><canvas id="velCanvas"></canvas><span class="vel-gutter-lbl">VEL</span></div>
     </div>
 
     <div class="grip" id="gripVel" title="Drag to resize velocity lane"></div>
@@ -738,13 +843,14 @@
           <span class="lbl">GENERATE</span>
           <span style="color:var(--txt2);font-size:11px;">on active lane · loop range if set, else playhead + len</span>
           <span style="width:1px;height:16px;background:rgba(79,163,255,.3);display:inline-block;margin:0 4px;"></span>
-          <button data-gen="rampUp">Ramp ↗</button><button data-gen="rampDown">Ramp ↘</button>
-          <button data-gen="exp">Exp ↗</button><button data-gen="expDown">Exp ↘</button>
+          <button id="genDirToggle" title="Direction: Up (↗) — applies to all shape buttons. Click to switch to Down (↘).">↗</button>
+          <button data-shape="ramp" data-gen="rampUp">Ramp</button>
+          <button data-shape="exp" data-gen="exp">Exp</button>
           <span style="width:1px;height:20px;background:var(--line);display:inline-block;margin:0 2px;flex-shrink:0;"></span>
-          <button data-gen="sine">Sine ↗</button><button data-gen="sineDown">Sine ↘</button>
-          <button data-gen="tri">Tri ↗</button><button data-gen="triDown">Tri ↘</button>
-          <button data-gen="square">Sqr ↗</button><button data-gen="squareDown">Sqr ↘</button>
-          <button data-gen="step">Step ↗</button><button data-gen="stepDown">Step ↘</button>
+          <button data-shape="sine" data-gen="sine">Sine</button>
+          <button data-shape="tri" data-gen="tri">Tri</button>
+          <button data-shape="square" data-gen="square">Sqr</button>
+          <button data-shape="step" data-gen="step">Step</button>
           <span class="pill">cycles</span><input type="number" id="genCycles" value="1" min="1" max="64" style="width:48px;">
           <span class="pill">len</span><select id="genLen" style="width:72px;font-size:11px;"><option value="1/1">1/1</option><option value="1/2">1/2</option><option value="1/4" selected>1/4</option><option value="1/8">1/8</option><option value="1/16">1/16</option><option value="1/32">1/32</option><option value="1/4T">1/4T</option><option value="1/8T">1/8T</option><option value="1/16T">1/16T</option><option value="1/32T">1/32T</option><option value="2 bars">2 bars</option><option value="4 bars">4 bars</option><option value="8 bars">8 bars</option></select>
           <button id="genAdvBtn" style="margin-left:6px;">Advanced ▾</button>
@@ -1164,12 +1270,13 @@
   [rulerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
 
   // ---------- Pane resize (grips) ----------
-  // A CC lane's leftcol content is name-row + compact-row (+ val-row when
-  // there's room). LANE_MIN_H is the floor when shrinking a lane — always
-  // enough for name+compact, never less, so those two rows can never spill
-  // into the row above. LANE_FULL_H is the height at which val-row (the 3rd
-  // row) actually fits; below that it's hidden outright rather than clipped.
-  const LANE_MIN_H=63, LANE_FULL_H=84;
+  // A CC lane's leftcol content is name-row + compact-row + icon-row (+
+  // val-row when there's room). LANE_MIN_H is the floor when shrinking a
+  // lane — always enough for name+compact+icon, never less, so those rows
+  // can never spill into the row above. LANE_FULL_H is the height at which
+  // val-row (the 4th row) actually fits; below that it's hidden outright
+  // rather than clipped.
+  const LANE_MIN_H=70, LANE_FULL_H=84;
   function updateLaneCompactness(row){
     if(!row||!row.classList||!row.classList.contains('lane')) return;
     row.classList.toggle('lane-compact2', row.offsetHeight<LANE_FULL_H);
@@ -1249,7 +1356,13 @@
 
   // ---------- Drawing (virtualised: only the visible slice) ----------
   let drawQueued=false;
-  function requestDraw(){ if(drawQueued) return; drawQueued=true; requestAnimationFrame(()=>{ drawQueued=false; drawAll(); if(typeof updateAdvSelCount==='function') updateAdvSelCount(); }); }
+  // updateNoteInfo() here (not just at the handful of call sites that change
+  // note selection) is what keeps the Note Info collapse state (item 5)
+  // correct for CC point selection too — requestDraw() already runs after
+  // every interaction that could change either kind of selection, so this
+  // piggybacks on it rather than needing a call added at every ccSel
+  // mutation site individually.
+  function requestDraw(){ if(drawQueued) return; drawQueued=true; requestAnimationFrame(()=>{ drawQueued=false; drawAll(); updateNoteInfo(); if(typeof updateAdvSelCount==='function') updateAdvSelCount(); }); }
   // forceDraw: guarantees the browser composites updated canvas pixels to screen.
   // Setting canvas.width (even to the same value) clears content AND invalidates the
   // GPU texture cache — the same operation that makes "resize to refresh" work.
@@ -1675,6 +1788,11 @@
     // Channel
     const nc=$('noteInfoCh');
     if(nc){ nc.value=(!sel.length)?'':sel.every(n=>n.ch===sel[0].ch)?(sel[0].ch+1):''; }
+    // Collapse to a single slim row when nothing is selected — a note or a
+    // CC point (ccSel, defined below, tracks the latter across all lanes).
+    // Field ids/editing behavior are unchanged; only visibility toggles.
+    const nil=$('noteInfoLeft');
+    if(nil) nil.classList.toggle('ni-collapsed', sel.length===0 && (typeof ccSel==='undefined'||ccSel.size===0));
   }
   // keep old name as alias so velocity drag calls still work
   const updateVelValInput=updateNoteInfo;
@@ -2044,12 +2162,34 @@
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
     lname.placeholder=laneIsPb(lane)?'Pitch Bend':(ccName(lane.cc)||'Lane name…');
     lname.value=lane.name; lname.title=laneIsPb(lane)?'Pitch Bend (±8192, 14-bit)':ccName(lane.cc);
+    // Tags display as a compact colored pill (name + count truncated with a
+    // title tooltip) instead of an always-open text field — the field is
+    // only shown while actively editing. Same underlying data model/commit
+    // behavior as before; this is a display-only change.
     const ltags=document.createElement('input'); ltags.type='text'; ltags.className='ltags';
     ltags.placeholder='#tags'; ltags.value=laneTagList(lane).join(' ');
     ltags.title='Tags (space/comma separated) — filter lanes with the Show: bar above';
-    nameRow.appendChild(lname); nameRow.appendChild(ltags);
+    ltags.style.display='none';
+    const tagPill=document.createElement('span'); tagPill.className='tag-pill'; tagPill.tabIndex=0;
+    const tagDot=document.createElement('span'); tagDot.className='tag-pill-dot'; tagDot.style.background=lane.color;
+    const tagText=document.createElement('span'); tagText.className='tag-pill-text';
+    tagPill.appendChild(tagDot); tagPill.appendChild(tagText);
+    function renderTagPill(){
+      const tags=laneTagList(lane);
+      tagText.textContent=tags.length?tags.join(' '):'#tags';
+      tagPill.classList.toggle('empty',!tags.length);
+      tagPill.title=tags.length?('Tags: '+tags.join(', ')+' — click to edit'):'Click to add tags — filter lanes with the Show: bar above';
+    }
+    renderTagPill();
+    function enterTagEdit(){ tagPill.style.display='none'; ltags.style.display=''; ltags.focus(); ltags.select(); }
+    function exitTagEdit(){ ltags.style.display='none'; tagPill.style.display=''; renderTagPill(); }
+    tagPill.addEventListener('click',enterTagEdit);
+    tagPill.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); enterTagEdit(); } });
+    nameRow.appendChild(lname); nameRow.appendChild(tagPill); nameRow.appendChild(ltags);
 
-    // Compact row: CC#/PB + Ch + swatch + × + ▲▼
+    // Compact row: CC#/PB + Ch + swatch (identifiers only — the mute/solo/
+    // hide/drag/delete icon buttons live in their own row below so both rows
+    // fit the fixed leftcol width without clipping; see icon-row).
     const compRow=document.createElement('div'); compRow.className='lr compact-row';
     if(laneIsPb(lane)){
       const pbTag=document.createElement('span'); pbTag.textContent='PB'; pbTag.style.cssText='font-size:9px;color:var(--txt2);font-style:italic;flex-shrink:0;';
@@ -2063,22 +2203,29 @@
     const chLbl=document.createElement('span'); chLbl.textContent='Ch'; chLbl.style.flexShrink='0';
     const chn=document.createElement('input'); chn.type='number'; chn.className='chn'; chn.min=1; chn.max=16; chn.value=lane.ch+1;
     const swatch=document.createElement('span'); swatch.className='swatch'; swatch.style.background=lane.color;
-    const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
-    // Mute/Solo replace the old ▲▼ reorder buttons — the drag-handle (⠿)
-    // already reorders lanes, so ▲▼ were redundant, and this row has no
-    // spare room otherwise (a pre-existing overflow issue in this column).
+    compRow.appendChild(chLbl); compRow.appendChild(chn); compRow.appendChild(swatch);
+
+    // Icon row: Mute/Solo/Hide/drag-handle grouped together, then × (the only
+    // destructive control) at the far end behind a visual separator so it
+    // can't be hit by accident while reaching for M/S/hide. Every icon here
+    // is a real >=17px hit target with visible spacing between them — this
+    // row (and compact-row above) used to be one combined row whose trailing
+    // icons overflowed the fixed 156px leftcol column and were clipped/
+    // unhittable by real pointer coordinates; splitting them out and letting
+    // this row wrap fixes that for good.
+    const iconRow=document.createElement('div'); iconRow.className='lr icon-row';
     const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
     const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
     const hideBtn=document.createElement('button'); hideBtn.className='move-btn'; hideBtn.textContent='●'; hideBtn.title='Hide lane';
     const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
-    compRow.appendChild(chLbl); compRow.appendChild(chn); compRow.appendChild(swatch); compRow.appendChild(xBtn);
-    compRow.appendChild(muteBtn); compRow.appendChild(soloBtn); compRow.appendChild(hideBtn); compRow.appendChild(dragHandle);
+    const iconSep=document.createElement('span'); iconSep.className='icon-sep'; iconSep.setAttribute('aria-hidden','true');
+    const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
+    iconRow.appendChild(muteBtn); iconRow.appendChild(soloBtn); iconRow.appendChild(hideBtn); iconRow.appendChild(dragHandle);
+    iconRow.appendChild(iconSep); iconRow.appendChild(xBtn);
 
     // Val + Pos (+ Steps) on one row — saves vertical space when many lanes
-    // are open. Steps lives here rather than compact-row: that row's icons
-    // already overflow the fixed 156px column (a separate, pre-existing
-    // issue), and unlike those icons this input is the primary way to set
-    // a brand-new feature, so it needs to actually be usable.
+    // are open. Steps lives here rather than compact-row since it's the
+    // primary way to set a brand-new feature, so it needs its own room.
     const valRow=document.createElement('div'); valRow.className='lr val-row';
     const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input'; valInput.style.cssText='width:46px;min-width:46px;flex:0 0 46px;';
@@ -2102,7 +2249,7 @@
     // without this the name/CC/val/pos controls (naturally at the row's top)
     // scroll out of view while the lane's curve is still on screen.
     const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
-    leftInner.appendChild(nameRow); leftInner.appendChild(compRow); leftInner.appendChild(valRow);
+    leftInner.appendChild(nameRow); leftInner.appendChild(compRow); leftInner.appendChild(iconRow); leftInner.appendChild(valRow);
     left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
 
@@ -2125,12 +2272,17 @@
       tbName.textContent=lane.name||(laneIsPb(lane)?'Pitch Bend':'CC'+lane.cc);
     });
 
-    // Tags
-    ltags.addEventListener('change',()=>{
+    // Tags — commits exactly as before (same parsing, pushUndo, refreshTagBar
+    // on 'change'); blur additionally swaps the field back to the pill
+    // display. commitTags() is called from both listeners (idempotent) so
+    // the pill always reflects the final value regardless of which event
+    // order a given browser fires them in.
+    function commitTags(){
       lane.tags=ltags.value.split(/[,\s]+/).map(s=>s.trim()).filter(Boolean);
       ltags.value=lane.tags.join(' ');
-      pushUndo(); refreshTagBar();
-    });
+    }
+    ltags.addEventListener('change',()=>{ commitTags(); pushUndo(); refreshTagBar(); });
+    ltags.addEventListener('blur',()=>{ commitTags(); exitTagEdit(); });
     ltags.addEventListener('keydown',e=>{ if(e.key==='Enter') ltags.blur(); });
 
     // CC number
@@ -2164,7 +2316,7 @@
     stepsInput.addEventListener('keydown',e=>{ if(e.key==='Enter') stepsInput.blur(); });
     swatch.addEventListener('click',()=>{
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
-      swatch.style.background=lane.color; tbSwatch.style.background=lane.color; requestDraw();
+      swatch.style.background=lane.color; tbSwatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
     });
     xBtn.addEventListener('click',()=>{ if(!confirm('Delete CC Lane?')) return; pushUndo(); removeLane(lane.id); });
     lane._muteBtn=muteBtn; lane._soloBtn=soloBtn;
@@ -2284,6 +2436,7 @@
       l._row.classList.toggle('active',isActive);
       if(l._scroll) l._scroll.style.opacity=(!hasActive||isActive)?'1':'0.45';
     });
+    if(typeof updateGenerateButtonsEnabled==='function') updateGenerateButtonsEnabled();
   }
 
   // ---------- Curve generators ----------
@@ -3691,6 +3844,41 @@
   $('addLane').onclick=()=>{ pushUndo(); addLane(); };
   $('addPbLane').addEventListener('click',()=>{ pushUndo(); addPbLane(); });
   document.querySelectorAll('[data-gen]').forEach(b=>b.onclick=()=>generate(b.dataset.gen));
+
+  // GENERATE strip: 6 shape buttons + one ↗/↘ direction toggle that applies
+  // to all of them, replacing what used to be 12 separate up/down buttons.
+  // Each shape button keeps the exact same [data-gen] kind strings the old
+  // up/down button pair used (e.g. Ramp = rampUp/rampDown, Exp = exp/
+  // expDown) — the toggle just rewrites data-gen in place before a click can
+  // read it, so generate() and the Advanced-panel AB-preview wiring above
+  // (both of which read b.dataset.gen at click time) need no changes at all,
+  // and generated output for a given shape+direction is byte-identical to
+  // before (see the regression test comparing old vs new pairing).
+  const GEN_SHAPE_KINDS={ ramp:['rampUp','rampDown'], exp:['exp','expDown'], sine:['sine','sineDown'],
+    tri:['tri','triDown'], square:['square','squareDown'], step:['step','stepDown'] };
+  let genDirDown=false;
+  function applyGenDirToButtons(){
+    document.querySelectorAll('.gen-grp [data-shape]').forEach(b=>{
+      const pair=GEN_SHAPE_KINDS[b.dataset.shape]; if(!pair) return;
+      b.dataset.gen=genDirDown?pair[1]:pair[0];
+    });
+  }
+  applyGenDirToButtons();
+  $('genDirToggle').addEventListener('click',()=>{
+    genDirDown=!genDirDown; applyGenDirToButtons();
+    const btn=$('genDirToggle');
+    btn.textContent=genDirDown?'↘':'↗';
+    btn.title='Direction: '+(genDirDown?'Down (↘)':'Up (↗)')+' — applies to all shape buttons. Click to switch to '+(genDirDown?'Up (↗)':'Down (↘)')+'.';
+  });
+  // Shape buttons are only meaningful with a lane to generate into.
+  function updateGenerateButtonsEnabled(){
+    const has=!!activeLane();
+    document.querySelectorAll('.gen-grp [data-shape]').forEach(b=>{
+      b.disabled=!has;
+      b.title=has?'':'Select a CC or PB lane first';
+    });
+  }
+  updateGenerateButtonsEnabled();
   $('exportBtn').onclick=exportMidi; $('syncExport').onclick=exportSyncTrack;
   $('importBtn').onclick=()=>$('fileInput').click();
   $('midiIn').addEventListener('change',e=>setMidiInById(e.target.value));
@@ -3754,6 +3942,9 @@
   $('audioVolume').addEventListener('input',e=>{
     audioVolume=clamp((+e.target.value||0)/100,0,1);
     setAudioGainLive();
+    const pct=Math.round(audioVolume*100);
+    e.target.title='Audio track volume: '+pct+'%';
+    $('audioVolIcon').title='Volume: '+pct+'%';
   });
   $('audioSetLoopBtn').addEventListener('click',()=>{
     if(!audioBuf) return;
@@ -3920,6 +4111,10 @@
   // ═══════════════════════════════════════════════════════════════
   (function(){
     const LKEY='mmv_preset_library';
+    // Inline SVGs (sized like the v0.9.3 metronome/chain-link/padlock icons)
+    // replacing this feature's text-glyph icons (⚡ Library, 💾 Save Preset).
+    const LIBRARY_ICON_SVG='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>';
+    const SAVE_ICON_SVG='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>';
     function loadLib(){ try{ return JSON.parse(localStorage.getItem(LKEY)||'[]'); }catch(e){ return []; } }
     function saveLib(lib){ try{ localStorage.setItem(LKEY,JSON.stringify(lib)); }catch(e){ flash('localStorage full — export library to free space'); } }
 
@@ -3929,7 +4124,7 @@
     drawer.style.cssText='position:fixed;top:0;right:0;width:320px;height:100vh;background:#1a1d24;border-left:1px solid #2c313b;z-index:900;display:none;flex-direction:column;box-shadow:-6px 0 24px rgba(0,0,0,.7);';
     drawer.innerHTML=`
       <div style="display:flex;align-items:center;gap:6px;padding:8px 12px;background:rgba(79,163,255,.1);border-bottom:1px solid #2c313b;flex-shrink:0;">
-        <span style="color:#4fa3ff;font-size:11px;font-weight:700;letter-spacing:.06em;flex:1;">⚡ EFFECTS LIBRARY</span>
+        <span style="color:#4fa3ff;font-size:11px;font-weight:700;letter-spacing:.06em;flex:1;display:flex;align-items:center;gap:5px;">${LIBRARY_ICON_SVG} EFFECTS LIBRARY</span>
         <button id="libExportBtn" title="Export library as .json" style="font-size:10px;padding:2px 7px;">⬇ Export</button>
         <button id="libImportBtn" title="Import .json library (merges with existing)" style="font-size:10px;padding:2px 7px;">⬆ Import</button>
         <input type="file" id="libImportFile" accept=".json" style="display:none">
@@ -3939,7 +4134,7 @@
         <div style="font-size:10px;color:#8c93a1;margin-bottom:5px;">Save current loop range as a preset:</div>
         <input id="libPresetName" type="text" placeholder="Preset name…" style="width:100%;font-size:12px;margin-bottom:4px;box-sizing:border-box;">
         <input id="libPresetTags" type="text" placeholder="Tags (comma-separated)…" style="width:100%;font-size:11px;margin-bottom:5px;box-sizing:border-box;">
-        <button id="libSaveBtn" style="width:100%;font-size:11px;background:rgba(79,163,255,.18);border-color:#4fa3ff;color:#4fa3ff;font-weight:600;">💾 Save Preset from Loop Range</button>
+        <button id="libSaveBtn" style="width:100%;font-size:11px;background:rgba(79,163,255,.18);border-color:#4fa3ff;color:#4fa3ff;font-weight:600;display:flex;align-items:center;justify-content:center;gap:5px;">${SAVE_ICON_SVG} Save Preset from Loop Range</button>
       </div>
       <div style="padding:6px 12px;border-bottom:1px solid #2c313b;flex-shrink:0;">
         <input id="libFilter" type="text" placeholder="Filter by name or tag…" style="width:100%;font-size:11px;box-sizing:border-box;">
@@ -3952,8 +4147,8 @@
     const libBtn=document.createElement('button');
     libBtn.id='libraryBtn';
     libBtn.title='Effects library — save and recall multi-lane CC presets';
-    libBtn.textContent='⚡ Library';
-    libBtn.style.cssText='font-size:12px;';
+    libBtn.innerHTML=LIBRARY_ICON_SVG+' Library';
+    libBtn.style.cssText='font-size:12px;display:inline-flex;align-items:center;gap:5px;';
     const setupWrapper=document.getElementById('setupWrapper');
     setupWrapper.parentNode.insertBefore(libBtn,setupWrapper);
 

@@ -85,6 +85,7 @@ function buildTestHtml() {
       '  window._TEST_audioBufDuration = () => (typeof audioBuf !== "undefined" && audioBuf) ? audioBuf.duration : null;',
       '  window._TEST_laneAudible = (id) => laneAudible(state.ccLanes.find(l => l.id === id));',
       '  window._TEST_buildPassEvents = (a, b) => buildPassEvents(a, b);',
+      '  window._TEST_generate = (kind) => generate(kind);',
       '  init();',
     ].join('\n')
   );
@@ -102,7 +103,14 @@ function check(name, cond, detail) {
 }
 
 async function withPage(browser, fn) {
-  const page = await browser.newPage();
+  // A real desktop viewport, not Playwright's 1280x720 default: this app's
+  // toolbar/audio/piano/velocity rows alone are a fixed ~520px tall, which
+  // left so little room for the lane list at 720px tall that a single
+  // default-height lane could be squeezed below its own content's natural
+  // minimum size and silently overflow its scroll container's clipped box
+  // — a real, but purely viewport-driven, layout edge case unrelated to
+  // whatever a given test is actually exercising.
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.on('pageerror', e => console.log('  [page error]', e.message));
   await page.goto(URL);
   await page.waitForTimeout(250);
@@ -1224,12 +1232,12 @@ async function run() {
     await page.fill('.lane .compact-row .chn', '3');
     await page.dispatchEvent('.lane .compact-row .chn', 'input');
     await page.waitForTimeout(50);
-    // Dispatched, not page.click(): the compact-row's trailing icons
-    // (including this hide button) overflow the fixed 156px leftcol column
-    // and are clipped/unhittable by real pointer coordinates — a real,
-    // pre-existing layout bug (confirmed present on main before this
-    // change) that's a separate fix from what's under test here.
-    await page.evaluate(() => document.querySelector('.lane .move-btn[title="Hide lane"]').click());
+    // Real pointer click, not a dispatched one: the compact-row's trailing
+    // icons used to overflow the fixed 156px leftcol column and be clipped/
+    // unhittable by real pointer coordinates (a pre-existing layout bug —
+    // see the "hittable at real pointer coordinates" test below, which
+    // proves this is fixed for every icon in the row).
+    await page.click('.lane .move-btn[title="Hide lane"]');
     await page.waitForTimeout(50);
     const info = await page.evaluate(() => {
       const row = document.querySelector('.lane');
@@ -1241,6 +1249,64 @@ async function run() {
     });
     check('minimized lane top-bar shows custom name plus CC# and Channel',
       info.hidden && info.name === 'sequenceProgress' && /CC\d+/.test(info.meta) && info.meta.includes('Ch3'), info);
+  });
+
+  // ---------------- Lane icon ergonomics (item 4) ----------------
+
+  await withPage(browser, async (page) => {
+    // Every per-lane icon button (M, S, hide ●, drag grip, and the separated
+    // × delete) must be a real, unclipped, >=16px hit target that a genuine
+    // pointer click can land on — proving the old "compact-row's trailing
+    // icons overflow the fixed 156px column and are clipped" bug is fixed.
+    const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
+    await page.waitForTimeout(50);
+    const sel = {
+      mute: `.lane[data-id="${laneId}"] .mute-btn`,
+      solo: `.lane[data-id="${laneId}"] .solo-btn`,
+      hide: `.lane[data-id="${laneId}"] .move-btn[title="Hide lane"]`,
+      drag: `.lane[data-id="${laneId}"] .drag-handle`,
+      del: `.lane[data-id="${laneId}"] .x`,
+    };
+
+    const hittable = await page.evaluate((sel) => {
+      const out = {};
+      for (const [k, s] of Object.entries(sel)) {
+        const el = document.querySelector(s);
+        if (!el) { out[k] = false; continue; }
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) { out[k] = false; continue; }
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const hit = document.elementFromPoint(cx, cy);
+        out[k] = !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+      }
+      return out;
+    }, sel);
+    check('every per-lane icon (M/S/hide/drag/×) has a real, unclipped hit target at its own screen coordinates',
+      Object.values(hittable).every(Boolean), hittable);
+
+    const sizes = await page.evaluate((sel) => {
+      const out = {};
+      for (const k of ['mute', 'solo', 'hide', 'drag', 'del']) {
+        const r = document.querySelector(sel[k]).getBoundingClientRect();
+        out[k] = { w: Math.round(r.width), h: Math.round(r.height) };
+      }
+      return out;
+    }, sel);
+    check('per-lane M/S/hide/drag/× icons are all >=16px hit targets',
+      Object.values(sizes).every(s => s.w >= 16 && s.h >= 16), sizes);
+
+    // Real Playwright pointer clicks (no force:true, no dispatchEvent) must
+    // actually land and trigger the real behavior, not just report a
+    // non-empty bounding box.
+    await page.click(sel.mute);
+    const mutedAfterRealClick = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).muted, laneId);
+    check('a real pointer click on the Mute icon actually toggles mute (not force-clicked, not dispatched)',
+      mutedAfterRealClick === true, mutedAfterRealClick);
+
+    await page.click(sel.hide);
+    const hiddenAfterRealClick = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'), laneId);
+    check('a real pointer click on the Hide icon actually hides the lane (not force-clicked, not dispatched)',
+      hiddenAfterRealClick === true, hiddenAfterRealClick);
   });
 
   await withPage(browser, async (page) => {
@@ -1445,6 +1511,99 @@ async function run() {
       ccVals.length > 0 && ccVals.every(v => Number.isInteger(v) && v >= 0 && v <= 127), ccVals.slice(0, 5));
   });
 
+  // ---------------- GENERATE strip: 6 shapes + direction toggle (item 6) ----------------
+
+  await withPage(browser, async (page) => {
+    // The old strip was 12 buttons (Ramp/Exp/Sine/Tri/Sqr/Step x up/down);
+    // the new one is 6 shape buttons plus a single #genDirToggle that
+    // applies to all of them. generate(kind) itself didn't change — the
+    // buttons just keep their [data-gen] kind string in sync with the
+    // toggle — so for every shape+direction combo, clicking the shape
+    // button through the real UI must produce byte-identical points to
+    // calling generate() directly with the old kind string.
+    const laneId = await page.evaluate(() => window._TEST_addLane(20, 0));
+    await page.waitForTimeout(50);
+    await page.evaluate((laneId) => {
+      window._TEST_state.activeLaneId = laneId;
+      window._TEST_state.locStart = 0;
+      window._TEST_state.locEnd = 1920; // fixed range, independent of playhead
+    }, laneId);
+
+    const OLD_PAIRS = {
+      ramp: ['rampUp', 'rampDown'],
+      exp: ['exp', 'expDown'],
+      sine: ['sine', 'sineDown'],
+      tri: ['tri', 'triDown'],
+      square: ['square', 'squareDown'],
+      step: ['step', 'stepDown'],
+    };
+    async function resetLanePoints(laneId) {
+      await page.evaluate((id) => {
+        const l = window._TEST_state.ccLanes.find(x => x.id === id);
+        l.points = [{ t: 0, v: 0 }];
+      }, laneId);
+    }
+    async function lanePointsJson(laneId) {
+      return page.evaluate((id) => JSON.stringify(window._TEST_state.ccLanes.find(x => x.id === id).points), laneId);
+    }
+    async function directGenerate(kind, laneId) {
+      await resetLanePoints(laneId);
+      await page.evaluate((kind) => window._TEST_generate(kind), kind);
+      return lanePointsJson(laneId);
+    }
+    async function uiGenerate(shape, laneId) {
+      await resetLanePoints(laneId);
+      await page.click(`.gen-grp [data-shape="${shape}"]`);
+      return lanePointsJson(laneId);
+    }
+
+    const mismatches = [];
+    // Direction starts at Up (↗) by default — verify all 6 shapes there first.
+    for (const [shape, [upKind]] of Object.entries(OLD_PAIRS)) {
+      const expected = await directGenerate(upKind, laneId);
+      const actual = await uiGenerate(shape, laneId);
+      if (expected !== actual) mismatches.push({ shape, dir: 'up', expected, actual });
+    }
+    // Flip the single toggle once, then verify all 6 shapes Down (↘).
+    await page.click('#genDirToggle');
+    const toggleLabel = await page.evaluate(() => document.getElementById('genDirToggle').textContent.trim());
+    check('the direction toggle button shows ↘ after one click', toggleLabel === '↘', toggleLabel);
+    for (const [shape, [, downKind]] of Object.entries(OLD_PAIRS)) {
+      const expected = await directGenerate(downKind, laneId);
+      const actual = await uiGenerate(shape, laneId);
+      if (expected !== actual) mismatches.push({ shape, dir: 'down', expected, actual });
+    }
+    check('every shape+direction combination produces byte-identical points to the old 12-button pairing',
+      mismatches.length === 0, mismatches);
+  });
+
+  await withPage(browser, async (page) => {
+    // With no active lane, the shape buttons must be disabled with an
+    // explanatory tooltip — deleting the only lane (going through the real
+    // removeLane()/refreshActive() path, not a manual state edit) drops
+    // activeLaneId back to null and should disable them again.
+    const before = await page.evaluate(() => ({
+      disabled: document.querySelector('.gen-grp [data-shape="ramp"]').disabled,
+      hasActiveLane: !!window._TEST_state.ccLanes.find(l => l.id === window._TEST_state.activeLaneId),
+    }));
+    check('GENERATE shape buttons start enabled with the app\'s default active lane',
+      before.hasActiveLane && before.disabled === false, before);
+
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    page.once('dialog', d => d.accept());
+    await page.click(`.lane[data-id="${laneId}"] .x`);
+    await page.waitForTimeout(50);
+
+    const after = await page.evaluate(() => ({
+      lanesLeft: window._TEST_state.ccLanes.length,
+      activeLaneId: window._TEST_state.activeLaneId,
+      disabled: document.querySelector('.gen-grp [data-shape="ramp"]').disabled,
+      title: document.querySelector('.gen-grp [data-shape="ramp"]').title,
+    }));
+    check('deleting the only lane disables the GENERATE shape buttons and explains why',
+      after.lanesLeft === 0 && after.activeLaneId === null && after.disabled === true && /lane/i.test(after.title), after);
+  });
+
   // ---------------- Lane tags / filter bar ----------------
 
   await withPage(browser, async (page) => {
@@ -1455,6 +1614,9 @@ async function run() {
 
   await withPage(browser, async (page) => {
     const id = await page.evaluate(() => window._TEST_addLane(21, 0));
+    // The tag field is now a compact pill until clicked (item 3) — a real
+    // click swaps it for the editable input, same as a user would do.
+    await page.click(`.lane[data-id="${id}"] .tag-pill`);
     await page.fill(`.lane[data-id="${id}"] input.ltags`, 'sceneA, kaleido');
     await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'change');
     await page.waitForTimeout(50);
@@ -1472,6 +1634,7 @@ async function run() {
   await withPage(browser, async (page) => {
     const idA = await page.evaluate(() => window._TEST_addLane(22, 0));
     const idB = await page.evaluate(() => window._TEST_addLane(23, 0));
+    await page.click(`.lane[data-id="${idA}"] .tag-pill`);
     await page.fill(`.lane[data-id="${idA}"] input.ltags`, 'sceneA');
     await page.dispatchEvent(`.lane[data-id="${idA}"] input.ltags`, 'change');
     await page.waitForTimeout(50);
@@ -1496,6 +1659,7 @@ async function run() {
 
   await withPage(browser, async (page) => {
     const id = await page.evaluate(() => window._TEST_addLane(25, 0));
+    await page.click(`.lane[data-id="${id}"] .tag-pill`);
     await page.fill(`.lane[data-id="${id}"] input.ltags`, 'persistTag');
     await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'change');
     await page.waitForTimeout(50);
