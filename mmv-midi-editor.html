@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.2
+  MMV MIDI & CC Curve Editor v0.9.3
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -128,6 +128,36 @@
   and effectively vanish once several were minimized at once (a flex-
   shrink CSS defect, not a scrolling issue) — minimized lanes now keep a
   fixed, protected height regardless of how many siblings are minimized.
+  v0.9.3 UI tidy-up + fixes. Play/Stop/Record/Metronome/Follow MMV/Scroll
+  Lock now share one ringed "Transport" cluster (same blue-ring styling as
+  Tool/Snap/Project/New Note): Follow MMV and Scroll Lock shrank from big
+  two-line text buttons to compact icon toggles (chain-link, padlock)
+  right next to the metronome, keeping their tooltips, lit/on state and
+  the same #syncFollow/#scrollLockBtn ids/semantics. The metronome button
+  now shows an inline SVG metronome icon instead of the bell emoji, which
+  used to render inconsistently across platforms/fonts.
+  Fixed: turning the metronome on/off no longer requires stopping and
+  restarting playback to take effect — toggling it (button or the "c" key)
+  while a track is already playing now regenerates the rest of the
+  current pass's schedule on the spot, so clicks start or stop on the very
+  next scheduler tick either way.
+  Fixed: the ruler's intra-bar subdivision labels ("2 3 4") were always
+  beat numbers, even when the timeline selector was set to mm:ss/hh:mm:ss/
+  ssss.ss — they now show times in the selected format (skipped wherever
+  a time label would either collide with a neighboring one or repeat the
+  bar-start label, instead of overlapping or cluttering the ruler).
+  Auto-loading a sibling audio file on project load — previously wired up
+  ad hoc per call site — now lives inside loadProject() itself, so it
+  fires the same way no matter how a project was opened (Recent Projects
+  list, Browse for file, or the plain Load button in browsers without
+  File System Access), and prefers the project's own saved audio filename
+  before falling back to a same-basename match. This still requires a
+  Projects Folder to have been granted at least once via "Choose Projects
+  Folder…": a plain <input type=file> picker genuinely cannot see sibling
+  files on disk (browser sandbox), so first-time or Firefox/Safari users
+  still see the "reload audio file" reminder and load it by hand — same
+  as before, just no longer silently skipped on paths that should have
+  worked.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -149,8 +179,9 @@
   .toolbar-r2{background:var(--panel3);border-bottom:2px solid var(--line);padding:5px 10px;}
   .toolbar-r2 button{font-size:12px;padding:4px 8px;}
   .toolbar-r2 select,.toolbar-r2 input[type=number]{font-size:12px;padding:3px 5px;}
-  .newnote-grp,.project-grp,.tool-grp,.snap-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
-  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl{color:var(--accent);font-size:10px;}
+  .newnote-grp,.project-grp,.tool-grp,.snap-grp,.transport-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
+  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl,.transport-grp .lbl{color:var(--accent);font-size:10px;}
+  .btnrow button.icon-btn{display:inline-flex;align-items:center;justify-content:center;padding:5px 7px;}
   .view-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
   .view-grp .lbl{color:var(--accent);font-size:10px;}
   .view-grp .lbl2{color:#888;font-size:10px;}
@@ -393,7 +424,8 @@
 
   <!-- ═══ ROW 1: Transport + Project + View ═══ -->
   <div class="toolbar toolbar-r1">
-    <div class="group">
+    <div class="transport-grp">
+      <span class="lbl">Transport</span>
       <div class="btnrow">
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
@@ -424,7 +456,9 @@
             <div id="recCh16Warn" style="display:none;font-size:10px;color:#ffb454;">&#9888; Channel 16 is reserved for the Follow MMV sync-track — notes recorded here are silently dropped.</div>
           </div>
         </div>
-        <button id="metroBtn" title="Metronome click during playback (C)">&#x1F514;</button>
+        <button id="metroBtn" class="icon-btn" title="Metronome click during playback (C)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6l5 18H4L9 3z"/><path d="M8 15h8"/><path d="M12 5.5v9"/></svg></button>
+        <button id="syncFollow" class="icon-btn" title="Follow MMV: when Ch16 sync-track notes arrive, move playhead to match MMV position"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
+        <button id="scrollLockBtn" class="icon-btn" title="Scroll Lock: once the playhead reaches the middle of the view during playback, keep it centered there and scroll the timeline underneath it instead"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></button>
       </div>
     </div>
     <div class="group">
@@ -433,12 +467,6 @@
       <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:58px;display:inline-block;">0:00.00</b>
     </div>
     <div class="sep"></div>
-    <div class="group">
-      <button id="syncFollow" title="Follow MMV: when Ch16 sync-track notes arrive, move playhead to match MMV position">Follow MMV</button>
-    </div>
-    <div class="group">
-      <button id="scrollLockBtn" title="Scroll Lock: once the playhead reaches the middle of the view during playback, keep it centered there and scroll the timeline underneath it instead">&#8646; Scroll Lock</button>
-    </div>
     <div class="group">
       <span class="lbl">Go to</span>
       <input type="number" id="gotoSec" min="0" step="0.01" style="width:60px;" title="Jump playhead to this position (seconds). Press Enter.">
@@ -1059,6 +1087,14 @@
   function effectiveAudioOffsetTicks(){ return (state.audioOffset||0)-secondsToTicks((state.audioLatencyMs||0)/1000); }
   function songSeconds(){ return tickToSeconds(totalTicks()); }
   function p2(n){ return String(n).padStart(2,'0'); }
+  // Formats a seconds value the same way for every non-"bars" ruler mode —
+  // shared by the bar-start labels and (since v0.9.3) the intra-bar
+  // subdivision labels, so both honor whatever timeline format is selected.
+  function formatRulerTime(sec){
+    if(state.rulerMode==='mmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60); return m+':'+p2(s); }
+    if(state.rulerMode==='hhmmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60)%60,h2=Math.floor(sec/3600); return p2(h2)+':'+p2(m)+':'+p2(s); }
+    return sec.toFixed(2);
+  }
   function fmtHMS(sec){ const cs=Math.floor((sec*100)%100), s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return p2(h)+':'+p2(m)+':'+p2(s)+':'+p2(cs); }
   function fmtSecs(sec){ return String(Math.floor(sec)).padStart(4,'0')+':'+p2(Math.floor((sec*100)%100)); }
   function fmtClock(sec){ const s=Math.floor(sec)%60, m=Math.floor(sec/60)%60, h=Math.floor(sec/3600); return (h>0?h+':'+p2(m):m)+':'+p2(s); }
@@ -1283,12 +1319,9 @@
       ctx.lineWidth=change?2:1; ctx.strokeStyle=change?tsColor:getCss('--gridBar');
       ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
       ctx.lineWidth=1;
-      if(b.barIdx%every===0){ const sec=tickToSeconds(t); let lbl;
-        if(state.rulerMode==='bars') lbl=String(b.barIdx+1);
-        else if(state.rulerMode==='mmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60); lbl=m+':'+p2(s); }
-        else if(state.rulerMode==='hhmmss'){ const s=Math.floor(sec)%60,m=Math.floor(sec/60)%60,h2=Math.floor(sec/3600); lbl=p2(h2)+':'+p2(m)+':'+p2(s); }
-        else{ lbl=sec.toFixed(2); }
-        ctx.fillStyle=getCss('--txt'); ctx.fillText(lbl,x+4,h/2); }
+      let barLbl=null;
+      if(b.barIdx%every===0){ barLbl=state.rulerMode==='bars'?String(b.barIdx+1):formatRulerTime(tickToSeconds(t));
+        ctx.fillStyle=getCss('--txt'); ctx.fillText(barLbl,x+4,h/2); }
       // Time-signature change marker: the bar line itself turns orange (visible
       // at any zoom), and once bars are wide enough for per-bar labels, the new
       // signature is also spelled out to the LEFT of the line — the opposite
@@ -1298,11 +1331,28 @@
         ctx.fillText(change.num+'/'+change.den, x-4, h/2);
         ctx.textAlign='left';
       }
-      // Beat-number labels fill in once there's enough room per beat, giving
-      // more populated position markers as you zoom further in.
+      // Intra-bar subdivision labels fill in once there's enough room per
+      // beat, giving more populated position markers as you zoom further in.
+      // In "bars" mode these are plain beat numbers (2, 3, 4…); in any time
+      // format they instead show that beat's actual time, honoring the same
+      // format as the bar-start labels — skipped whenever it would either
+      // not fit in the available space or just repeat the previous label
+      // (e.g. several beats landing within the same displayed second).
       if(every===1 && b.tpe*state.pxPerTick>24){
         ctx.fillStyle=getCss('--txt2'); ctx.font='9px system-ui';
-        for(let i=1,tt=t+b.tpe; tt<t+b.tpb-1e-6; tt+=b.tpe,i++){ if(tt<t0||tt>t1) continue; ctx.fillText(String(i+1),tickToX(tt)+2,h/2); }
+        const stepPx=b.tpe*state.pxPerTick;
+        let prevLbl=barLbl;
+        for(let i=1,tt=t+b.tpe; tt<t+b.tpb-1e-6; tt+=b.tpe,i++){
+          if(tt<t0||tt>t1) continue;
+          let lbl2;
+          if(state.rulerMode==='bars') lbl2=String(i+1);
+          else{
+            lbl2=formatRulerTime(tickToSeconds(tt));
+            if(lbl2===prevLbl || ctx.measureText(lbl2).width+6>stepPx) continue;
+          }
+          ctx.fillText(lbl2,tickToX(tt)+2,h/2);
+          prevLbl=lbl2;
+        }
         ctx.font='11px system-ui';
       }
     });
@@ -2721,19 +2771,46 @@
       renderProjList();
     }catch(e){ if(e.name!=='AbortError') flash('Could not set projects folder: '+e.message); }
   }
-  const AUDIO_EXTS=['mp3','wav','ogg','m4a','flac','aac'];
+  const AUDIO_EXTS=['wav','mp3','ogg','flac','m4a','aac'];
+  // Returns true/false so callers (notably autoLoadProjectAudio below) can
+  // fall back to a different name to try, or skip the "reload it yourself"
+  // flash once this already succeeded.
   async function tryAutoLoadAudio(baseName){
-    if(!projDirHandle) return;
-    if(!await verifyDirPermission(projDirHandle,false)) return;
+    if(!projDirHandle) return false;
+    if(!await verifyDirPermission(projDirHandle,false)) return false;
     for(const ext of AUDIO_EXTS){
       try{
         const fh=await projDirHandle.getFileHandle(baseName+'.'+ext);
         const file=await fh.getFile();
         await loadAudio(file);
         flash('Auto-loaded audio: '+file.name);
-        return;
+        return true;
       }catch(e){ /* not found with this extension — try the next one */ }
     }
+    return false;
+  }
+  // Called whenever a project finishes loading (see loadProject below) — the
+  // single place that decides whether a sibling audio file can be found and
+  // loaded automatically. Requires a Projects Folder handle to already have
+  // been granted (via "Choose Projects Folder…"): a plain <input type=file>
+  // picker never exposes sibling files to the page, so without that handle
+  // this is a documented, silent no-op and the user reloads audio by hand,
+  // same as before. When a handle IS available, it's tried regardless of how
+  // the project itself was opened — Recent Projects list, Browse for file,
+  // or the plain Load button fallback in browsers without File System Access.
+  // Prefers the project's own saved audioFile name (so a renamed/relocated
+  // basename still resolves), then falls back to a file sharing the
+  // project's own basename across the usual audio extensions.
+  async function autoLoadProjectAudio(data,baseName){
+    if(!projDirHandle) return false;
+    if(data&&data.audioFile){
+      const savedBase=data.audioFile.replace(/\.[^./\\]+$/,'');
+      if(savedBase && await tryAutoLoadAudio(savedBase)) return true;
+    }
+    if(baseName && (!data||!data.audioFile||data.audioFile.replace(/\.[^./\\]+$/,'')!==baseName)){
+      if(await tryAutoLoadAudio(baseName)) return true;
+    }
+    return false;
   }
   async function listProjectFiles(){
     if(!projDirHandle) return [];
@@ -2766,7 +2843,6 @@
         $('projPopover').classList.remove('open');
         const file=await f.handle.getFile();
         loadProject(file);
-        await tryAutoLoadAudio(f.name.replace(/\.mmvp$/i,''));
       });
       list.appendChild(b);
     }
@@ -2787,7 +2863,7 @@
     a.download=projFilename('.mmvp'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
   }
   function loadProject(file){
-    const fr=new FileReader(); fr.onload=()=>{
+    const fr=new FileReader(); fr.onload=async()=>{
       try{
         const data=JSON.parse(fr.result);
         if(!data.version||!data.snapshot) throw new Error('Not a valid project file');
@@ -2796,8 +2872,17 @@
         applyState(JSON.stringify(data.snapshot));
         state.projectName=data.projectName||'';
         if($('projectName')) $('projectName').value=state.projectName;
-        if(data.audioFile) flash('Project loaded. Reload audio file: '+data.audioFile);
-        else flash('Project loaded');
+        // Auto-audio-load happens here, inside the FileReader callback, so it
+        // can never race clearAudio()/applyState() above (a caller that fired
+        // this off-thread right after loadProject() returned — before the
+        // read actually finished — could otherwise have its freshly loaded
+        // audio wiped out a moment later when this callback ran).
+        const baseName=(file.name||'').replace(/\.mmvp$/i,'');
+        const audioLoaded=await autoLoadProjectAudio(data,baseName);
+        if(!audioLoaded){
+          if(data.audioFile) flash('Project loaded. Reload audio file: '+data.audioFile);
+          else flash('Project loaded');
+        }
       }catch(e){ alert('Could not load project: '+e.message); }
     };
     fr.readAsText(file);
@@ -3450,7 +3535,28 @@
   function updateTransportBtns(){ $('playBtn').textContent=state.playing?'⏸':'▶'; $('playBtn').classList.toggle('on',state.playing);
     const rb=$('recordBtn'); if(rb){ rb.classList.toggle('rec-armed',state.recArmed); rb.classList.toggle('rec-on',state.recording); }
   }
-  function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn); }
+  // The current pass's event list (sched.evs, which interleaves note/CC/click
+  // events) is built once per loop pass by buildPassEvents() and only rebuilt
+  // when a pass rolls over — so toggling the metronome mid-pass used to have
+  // no effect until the loop happened to restart (which, for a long or
+  // non-looping song, could be never). Regenerating the tail of the current
+  // pass right after the toggle — keeping everything at/after "now", so
+  // already-fired note/CC events are never re-sent — makes the change take
+  // effect on the very next scheduler tick instead.
+  function rescheduleCurrentPass(){
+    if(!sched) return;
+    const s=sched, now=performance.now();
+    const newEvs=buildPassEvents(s.a,s.b);
+    // Mirrors schedulerTick's own t=... formula (rather than inverting it to
+    // a tick position) so this stays correct even when s.passIndex has
+    // already moved on from 0 — using the exact math the very next
+    // schedulerTick() call will use to decide what's due keeps the two in
+    // lockstep no matter how far into the pass we already are.
+    let idx=0; while(idx<newEvs.length && s.t0+(s.passIndex*s.span+newEvs[idx].tick-s.startTick)*s.mpt<now) idx++;
+    s.evs=newEvs; s.idx=idx;
+  }
+  function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn);
+    if(state.playing) rescheduleCurrentPass(); }
   function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockHundredths(tickToSeconds(state.playhead)); }
   function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
@@ -3605,7 +3711,7 @@
   $('projPickFolderBtn').addEventListener('click',pickProjectsFolder);
   $('projBrowseBtn').addEventListener('click',()=>{ $('projPopover').classList.remove('open'); $('projectFileInput').click(); });
   $('projectFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; loadProject(f);
-    tryAutoLoadAudio(f.name.replace(/\.mmvp$/i,'')); e.target.value=''; });
+    e.target.value=''; });
   restoreProjDir();
 
   // ---------- Audio track ----------

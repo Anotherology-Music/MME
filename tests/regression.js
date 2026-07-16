@@ -623,6 +623,150 @@ async function run() {
     check('metronome toggles via button and "c" key', onAfterClick === true && onAfterKey === false, { onAfterClick, onAfterKey });
   });
 
+  // ---------------- v0.9.3: ringed transport cluster (metronome/follow/scroll-lock) ----------------
+
+  await withPage(browser, async (page) => {
+    // Play/Stop/Record/Metronome/Follow MMV/Scroll Lock now all live inside
+    // one ringed .transport-grp (same styling as .tool-grp/.snap-grp), in
+    // that order, and the old big standalone "Follow MMV"/"Scroll Lock" text
+    // buttons are gone.
+    const info = await page.evaluate(() => {
+      const grp = document.querySelector('.transport-grp');
+      const ids = ['playBtn', 'stopBtn', 'recordBtn', 'metroBtn', 'syncFollow', 'scrollLockBtn'];
+      const allInGroup = grp ? ids.every(id => grp.contains(document.getElementById(id))) : false;
+      const order = grp ? [...grp.querySelectorAll('button, #recWrapper button')].map(el => el.id).filter(Boolean) : [];
+      return {
+        hasTransportGrp: !!grp,
+        grpClasses: grp ? [...grp.classList] : [],
+        allInGroup,
+        metroBeforeFollow: order.indexOf('metroBtn') >= 0 && order.indexOf('metroBtn') < order.indexOf('syncFollow'),
+        followBeforeScrollLock: order.indexOf('syncFollow') >= 0 && order.indexOf('syncFollow') < order.indexOf('scrollLockBtn'),
+        noBigFollowText: ![...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Follow MMV'),
+        noBigScrollLockText: ![...document.querySelectorAll('button')].some(b => b.textContent.includes('Scroll Lock')),
+      };
+    });
+    check('transport cluster (play/stop/record/metronome/follow/scroll-lock) is wrapped in the ringed .transport-grp',
+      info.hasTransportGrp && info.grpClasses.includes('transport-grp') && info.allInGroup, info);
+    check('metronome sits before Follow MMV, which sits before Scroll Lock, in the transport cluster',
+      info.metroBeforeFollow && info.followBeforeScrollLock, info);
+    check('the old big "Follow MMV" / "Scroll Lock" text buttons are gone (now compact icons)',
+      info.noBigFollowText && info.noBigScrollLockText, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // Metronome button now shows an inline SVG icon (cross-platform-safe),
+    // not the old bell emoji glyph.
+    const metro = await page.evaluate(() => {
+      const btn = document.getElementById('metroBtn');
+      return { hasSvg: !!btn.querySelector('svg'), text: btn.textContent.trim() };
+    });
+    check('metronome button uses an inline SVG icon instead of the bell emoji', metro.hasSvg && metro.text === '', metro);
+  });
+
+  await withPage(browser, async (page) => {
+    // Follow MMV: now icon-only but still the same toggle on the same id.
+    const before = await page.evaluate(() => ({ state: window._TEST_state.syncFollow, on: document.getElementById('syncFollow').classList.contains('on') }));
+    await page.click('#syncFollow');
+    const afterOn = await page.evaluate(() => ({ state: window._TEST_state.syncFollow, on: document.getElementById('syncFollow').classList.contains('on') }));
+    await page.click('#syncFollow');
+    const afterOff = await page.evaluate(() => ({ state: window._TEST_state.syncFollow, on: document.getElementById('syncFollow').classList.contains('on') }));
+    check('Follow MMV toggle button still works (compact icon form)',
+      before.state === false && !before.on && afterOn.state === true && afterOn.on && afterOff.state === false && !afterOff.on,
+      { before, afterOn, afterOff });
+  });
+
+  await withPage(browser, async (page) => {
+    // Scroll Lock: now icon-only but the same #scrollLockBtn id/semantics.
+    const before = await page.evaluate(() => ({ state: window._TEST_state.scrollLock, on: document.getElementById('scrollLockBtn').classList.contains('on') }));
+    await page.click('#scrollLockBtn');
+    const afterOn = await page.evaluate(() => ({ state: window._TEST_state.scrollLock, on: document.getElementById('scrollLockBtn').classList.contains('on') }));
+    await page.click('#scrollLockBtn');
+    const afterOff = await page.evaluate(() => ({ state: window._TEST_state.scrollLock, on: document.getElementById('scrollLockBtn').classList.contains('on') }));
+    check('Scroll Lock toggle button still works (compact icon form)',
+      before.state === false && !before.on && afterOn.state === true && afterOn.on && afterOff.state === false && !afterOff.on,
+      { before, afterOn, afterOff });
+  });
+
+  await withPage(browser, async (page) => {
+    // Toggling the metronome mid-playback must start (or stop) producing
+    // clicks on the very next scheduler pass, not only once the loop happens
+    // to restart. Spy on OscillatorNode.prototype.start (playClickTone is
+    // closure-scoped and otherwise unreachable) to observe actual click
+    // scheduling.
+    await page.evaluate(() => {
+      window.__oscStarts = [];
+      const orig = OscillatorNode.prototype.start;
+      OscillatorNode.prototype.start = function (when) {
+        window.__oscStarts.push(when);
+        return orig.call(this, when);
+      };
+      window._TEST_state.metronomeOn = false;
+      // A long note spanning the whole test window — "a track is already
+      // playing" (the user's report) implies real content in the pass;
+      // without it the pass's event list would be empty from tick 0, which
+      // hits an unrelated pre-existing scheduler quirk (immediate pass
+      // rollover with no events to actually play) that isn't what's under
+      // test here.
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 60, start: 0, length: window._TEST_state.ppq * 64, vel: 100, ch: 0 });
+    });
+
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(150);
+    const beforeToggle = await page.evaluate(() => window.__oscStarts.length);
+    check('no clicks are scheduled while the metronome is off during playback', beforeToggle === 0, beforeToggle);
+
+    await page.click('#metroBtn'); // toggle ON mid-playback
+    await page.waitForTimeout(700);
+    const afterToggleOn = await page.evaluate(() => window.__oscStarts.length);
+    check('toggling the metronome ON mid-playback starts producing clicks without stopping/restarting playback',
+      afterToggleOn > 0, afterToggleOn);
+
+    await page.click('#metroBtn'); // toggle OFF mid-playback
+    await page.waitForTimeout(300); // let any already-committed lookahead clicks flush through
+    const settleCount = await page.evaluate(() => window.__oscStarts.length);
+    await page.waitForTimeout(700);
+    const afterToggleOff = await page.evaluate(() => window.__oscStarts.length);
+    await page.evaluate(() => window._TEST_stop());
+    check('toggling the metronome OFF mid-playback stops further clicks from being scheduled',
+      afterToggleOff === settleCount, { settleCount, afterToggleOff });
+  });
+
+  // ---------------- v0.9.3: ruler segment labels honor the timeline format ----------------
+
+  await withPage(browser, async (page) => {
+    async function subLabels(mode) {
+      await page.evaluate((m) => { window._TEST_state.pxPerTick = 0.5; }, mode);
+      await page.selectOption('#rulerMode', mode);
+      return page.evaluate(() => {
+        const ctx = document.getElementById('rulerCanvas').getContext('2d');
+        const out = [];
+        const origFillText = ctx.fillText.bind(ctx);
+        ctx.fillText = (text, x, y) => { out.push(text); return origFillText(text, x, y); };
+        window.dispatchEvent(new Event('resize'));
+        return new Promise(resolve => setTimeout(() => resolve(out), 200));
+      });
+    }
+    const mmss = await subLabels('mmss');
+    const noBeatNumbersMmss = !['2', '3', '4'].some(n => mmss.includes(n));
+    const hasMmssLabel = mmss.some(t => /^\d+:\d{2}$/.test(t));
+    check('ruler mm:ss format: intra-bar labels show times (m:ss), not bare beat numbers', noBeatNumbersMmss && hasMmssLabel, mmss);
+
+    const hhmmss = await subLabels('hhmmss');
+    const noBeatNumbersHms = !['2', '3', '4'].some(n => hhmmss.includes(n));
+    const hasHmsLabel = hhmmss.some(t => /^\d{2}:\d{2}:\d{2}$/.test(t));
+    check('ruler hh:mm:ss format: intra-bar labels show times (hh:mm:ss), not bare beat numbers', noBeatNumbersHms && hasHmsLabel, hhmmss);
+
+    const secs = await subLabels('secs');
+    const noBeatNumbersSecs = !['2', '3', '4'].some(n => secs.includes(n));
+    const hasSecsLabel = secs.some(t => /^\d+\.\d{2}$/.test(t));
+    check('ruler seconds format: intra-bar labels show times (ssss.ss), not bare beat numbers', noBeatNumbersSecs && hasSecsLabel, secs);
+
+    // Switching back to bars mode restores plain beat numbers (no regression).
+    const bars = await subLabels('bars');
+    check('switching back to bars mode restores plain beat-number labels (2/3/4)',
+      ['2', '3', '4'].every(n => bars.includes(n)), bars);
+  });
+
   // ---------------- Note editing: left/right edge resize ----------------
 
   async function dragNoteEdge(page, note, edge, deltaTicks) {
@@ -1494,7 +1638,7 @@ async function run() {
         }
         async *entries() { for (const [name, handle] of this._files) yield [name, handle]; }
       }
-      const proj = (name) => JSON.stringify({ version: 1, projectName: name, snapshot: { notes: [], ccLanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: name, locS: null, locE: null } });
+      const proj = (name) => JSON.stringify({ version: 1, projectName: name, snapshot: { notes: [], lanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: name, locS: null, locE: null } });
       // A minimal (silent, 4-sample) valid WAV so decodeAudioData actually
       // succeeds — a zero-length data chunk gets rejected as invalid audio.
       const wavBytes = new Uint8Array([
@@ -1522,14 +1666,16 @@ async function run() {
       const fh = window.__mockDir._files.get('song-a.mmvp');
       window._TEST_loadProject(await fh.getFile());
     });
-    await page.waitForTimeout(80);
+    await page.waitForTimeout(150);
     const projectName = await page.evaluate(() => window._TEST_state.projectName);
     check('opening a project from the Recent Projects list loads it', projectName === 'song-a', projectName);
 
-    await page.evaluate(() => window._TEST_tryAutoLoadAudio('song-a'));
-    await page.waitForTimeout(150);
+    // v0.9.3: loadProject() now auto-locates matching audio itself (no
+    // separate window._TEST_tryAutoLoadAudio(...) call needed here) — every
+    // way of opening a project gets the same auto-audio-load behavior.
     const audioName = await page.evaluate(() => window._TEST_audioFileName());
-    check('auto-locates and loads a same-named audio file next to the opened project', audioName === 'song-a.wav', audioName);
+    check('opening a project auto-locates and loads a same-named audio file next to it, with no separate call needed',
+      audioName === 'song-a.wav', audioName);
 
     await page.evaluate(() => { window._TEST_state.projectName = 'brand-new-song'; });
     await page.evaluate(() => window._TEST_saveProject());
@@ -1538,6 +1684,84 @@ async function run() {
     check('Save Project writes directly into the remembered folder when one is set', savedInDir === true, savedInDir);
 
     await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  await withPage(browser, async (page) => {
+    // v0.9.3: auto-audio-load prefers the project's own saved audioFile name
+    // over a basename match — covers a project whose audio was renamed or
+    // never shared its own basename. Also proves the auto-load fires on the
+    // plain "Browse for file" / <input type=file> path, not just the Recent
+    // Projects list — loadProject() itself now owns this, so every entry
+    // point gets it for free.
+    const seeded = await page.evaluate(() => {
+      class MockFileHandle {
+        constructor(name, content, lastModified) { this.kind = 'file'; this.name = name; this._content = content; this._lastModified = lastModified; }
+        async getFile() { return new File([this._content], this.name, { lastModified: this._lastModified }); }
+      }
+      class MockDirHandle {
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); }
+        async queryPermission() { return 'granted'; }
+        async requestPermission() { return 'granted'; }
+        async getFileHandle(name) {
+          if (!this._files.has(name)) { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          return this._files.get(name);
+        }
+      }
+      const wavBytes = new Uint8Array([
+        0x52,0x49,0x46,0x46, 0x2c,0x00,0x00,0x00, 0x57,0x41,0x56,0x45,
+        0x66,0x6d,0x74,0x20, 0x10,0x00,0x00,0x00, 0x01,0x00, 0x01,0x00,
+        0x44,0xac,0x00,0x00, 0x88,0x58,0x01,0x00, 0x02,0x00, 0x10,0x00,
+        0x64,0x61,0x74,0x61, 0x08,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      ]);
+      const dir = new MockDirHandle('MyProjects');
+      // Both a basename-matching decoy AND the project's real (differently
+      // named) audioFile are present — the audioFile name must win.
+      dir._files.set('mysong.wav', new MockFileHandle('mysong.wav', wavBytes, Date.now()));
+      dir._files.set('special-track.wav', new MockFileHandle('special-track.wav', wavBytes, Date.now()));
+      window._TEST_setProjDirHandle(dir);
+      window.__mockDir2 = dir;
+      return true;
+    });
+    check('mock projects folder (preference test) seeded', seeded === true, seeded);
+
+    const projJson = JSON.stringify({
+      version: 1, projectName: 'mysong', audioFile: 'special-track.wav',
+      snapshot: { notes: [], lanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: 'mysong', locS: null, locE: null },
+    });
+    // Loaded as a plain File — simulating the <input type=file> "Browse for
+    // file…"/plain-Load-button path, not the Recent Projects list handle.
+    await page.evaluate((json) => {
+      const file = new File([json], 'mysong.mmvp', { type: 'application/json' });
+      return window._TEST_loadProject(file);
+    }, projJson);
+    await page.waitForTimeout(150);
+    const audioName = await page.evaluate(() => window._TEST_audioFileName());
+    check('auto-load prefers the project\'s saved audioFile name over a basename match, even via plain file-picker load',
+      audioName === 'special-track.wav', audioName);
+
+    await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  await withPage(browser, async (page) => {
+    // Without a Projects Folder handle ever having been granted, a plain
+    // <input type=file> genuinely cannot see sibling files (browser
+    // sandbox) — auto-load must no-op gracefully (no throw) and the old
+    // "reload it yourself" flash message still tells the user what to do.
+    const projJson = JSON.stringify({
+      version: 1, projectName: 'no-folder-song', audioFile: 'no-folder-song.wav',
+      snapshot: { notes: [], lanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: 'no-folder-song', locS: null, locE: null },
+    });
+    await page.evaluate((json) => {
+      const file = new File([json], 'no-folder-song.mmvp', { type: 'application/json' });
+      return window._TEST_loadProject(file);
+    }, projJson);
+    await page.waitForTimeout(120);
+    const audioName = await page.evaluate(() => window._TEST_audioFileName());
+    const flashMsg = await page.evaluate(() => document.getElementById('stCtx').textContent);
+    check('with no Projects Folder ever granted, loading a project with a saved audioFile does not throw and leaves audio unloaded',
+      audioName === 'No audio', audioName);
+    check('...and still flashes the "reload audio file" message so the user knows to do it manually',
+      flashMsg === 'Project loaded. Reload audio file: no-folder-song.wav', flashMsg);
   });
 
   await withPage(browser, async (page) => {
@@ -2075,7 +2299,7 @@ async function run() {
 
     const projB = JSON.stringify({
       version: 1, projectName: 'project-b', audioFile: '',
-      snapshot: { notes: [], ccLanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: 'project-b', locS: null, locE: null, audioOffset: 0 },
+      snapshot: { notes: [], lanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: 'project-b', locS: null, locE: null, audioOffset: 0 },
     });
     await page.evaluate((json) => {
       const file = new File([json], 'projB.mmvp', { type: 'application/json' });
