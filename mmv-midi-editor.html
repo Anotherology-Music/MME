@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.5
+  MMV MIDI & CC Curve Editor v0.9.6
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -217,6 +217,30 @@
   suppressed on those tiny buttons, and a stale "just long-pressed" flag
   can no longer swallow the next tap on platforms where a touch long-press
   produces no trailing click event.
+  v0.9.6 CC lane leftcol redesigned from 4 rows to 3: row 1 is CC#/PB, Name,
+  Channel, the Tag pill, and Minimize/Hide all on one line; row 2 is × (the
+  only destructive control) alone on the left with Mute/Solo/drag-grip
+  grouped on the right (a deliberate split from the old layout, where × sat
+  at the far right behind a divider); row 3 is the unchanged Val/Pos/Steps
+  row. The lane color swatch button is gone — a lane's color is now a thin
+  clickable stripe on the leftcol's own left edge (same click-to-cycle
+  behavior), positioned so it never covers the separate active-lane accent
+  indicator; both stay visible on an active lane. Shrinking a lane via the
+  grip or Alt+wheel now floors at rows 1+2, with row 3 hiding first, same
+  policy as before just with one fewer row. The leftcol's default width is
+  now 300px (was 156px) — most of the extra room is what makes row 1 fit
+  comfortably with five controls on it.
+  Lane tags now split ONLY on commas, not commas-or-whitespace — a tag may
+  contain internal spaces (e.g. renaming an ISF-imported "Chaser_Stage_
+  Lights" tag to "chaser stage lights"). The tag pill/field's display join
+  delimiter changed from a space to ", " to match, so the space/comma-joined
+  display always re-parses losslessly through the same comma-only splitter
+  (a tag still can't contain a literal comma — it's the delimiter). Tags can
+  now be renamed: right-click a tag chip's label in the Show: filter bar for
+  a rename prompt pre-filled with the current name; confirming rewrites that
+  exact tag on every lane that has it (deduping against a tag the lane
+  already carries), keeps an active filter selection pointed at the renamed
+  tag instead of clearing it, and is a single undo step.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -225,7 +249,7 @@
     --grid:#272c35; --gridBar:#3a414f; --gridBeat:#323844;
     --txt:#d7dbe2; --txt2:#8c93a1; --accent:#4fa3ff; --accent2:#ffb454;
     --sel:#ffe08a; --white:#e9edf3; --black:#1a1d23; --play:#ff5d6c;
-    --keys-w:156px;
+    --keys-w:300px;
   }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
     font:13px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
@@ -403,9 +427,10 @@
      height and refusing to shrink at all fixes that regardless of how many
      lanes (minimized or not) are stacked above/below it. */
   .lane.lane-hidden{height:auto!important;min-height:22px!important;flex-shrink:0!important;}
-  /* Below the height that fits all 3 leftcol rows, hide val-row outright
-     rather than let it clip mid-row — keeps name-row and compact-row always
-     fully visible within the lane's own bounds. */
+  /* Below the height that fits all 3 leftcol rows, hide val-row (row 3 —
+     Val/Pos/Steps, the lowest-priority row) outright rather than let it clip
+     mid-row — keeps row 1 (CC/Name/Ch/Tag/Hide) and row 2 (×/Mute/Solo/grip)
+     always fully visible within the lane's own bounds. */
   .lane.lane-compact2 .val-row{display:none!important;}
   .lane-top-bar{height:22px;display:none;align-items:center;gap:5px;padding:0 6px;background:var(--panel);border-bottom:1px solid var(--line);}
   .lane.lane-hidden .lane-top-bar{display:flex;}
@@ -414,7 +439,9 @@
   .lane-top-bar .tb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--txt2);}
   .lane-top-bar .tb-meta{flex:0 0 auto;font-size:10px;color:var(--txt2);opacity:.75;white-space:nowrap;}
 
-  /* Lane leftcol — name row on top (last to hide), compact row + icon row below */
+  /* Lane leftcol — 3 rows: row 1 (CC#/PB, Name, Channel, Tag pill, Hide) on
+     top and last to hide, row 2 (× on the left; Mute/Solo/drag-grip on the
+     right) below it, row 3 (Val/Pos/Steps) hides first as a lane shrinks. */
   /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
      overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
      which *still* creates a scroll container). Any non-"visible" overflow-y
@@ -441,13 +468,24 @@
      own row's bounds regardless of row or scrollport size. */
   .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:2px;width:100%;overflow:hidden;}
   .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
-  .lane .leftcol .name-row{padding:2px 0 1px;}
-  .lane .leftcol .name-row input{flex:1;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
-  .lane .leftcol .name-row input.ltags{flex:0 0 42%;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
+  /* Row 1: CC#/PB, Name, Channel, Tag pill, Hide — all on one line. lname
+     gets the lion's share of extra space (flex weight 2); the tag pill/input
+     share what's left (weight 1) so both shrink together as the column
+     narrows instead of one starving the other. */
+  .lane .leftcol .name-row{padding:2px 0 1px;flex-wrap:nowrap;}
+  .lane .leftcol .name-row input.lname{flex:2 1 50px;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
+  .lane .leftcol .name-row input.ltags{flex:1 1 50px;min-width:0;padding:2px 4px;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
+  .lane .leftcol .name-row .ccn{flex:0 0 24px;width:24px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
+  .lane .leftcol .name-row .chn{flex:0 0 20px;width:20px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
+  .lane .leftcol .name-row .ccn::-webkit-outer-spin-button,
+  .lane .leftcol .name-row .ccn::-webkit-inner-spin-button,
+  .lane .leftcol .name-row .chn::-webkit-outer-spin-button,
+  .lane .leftcol .name-row .chn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  .lane .leftcol .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
   /* Tag pill — compact colored stand-in for the tag text field, shown until
      clicked (or Enter/Space when focused via keyboard), which swaps it for
      the real input (committed the same as always on blur/Enter). */
-  .lane .leftcol .tag-pill{flex:0 0 42%;min-width:0;display:inline-flex;align-items:center;gap:4px;
+  .lane .leftcol .tag-pill{flex:1 1 50px;min-width:0;display:inline-flex;align-items:center;gap:4px;
     font-size:10px;color:#cfe4ff;background:#2c313b;border:1px solid #3a404e;border-radius:9px;
     padding:2px 7px;cursor:pointer;}
   .lane .leftcol .tag-pill:hover,.lane .leftcol .tag-pill:focus{border-color:var(--accent);outline:none;}
@@ -470,19 +508,21 @@
     display:inline-flex;align-items:center;justify-content:center;}
   .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
   .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
-  .lane .leftcol .compact-row{gap:4px;padding-bottom:2px;flex-wrap:nowrap;}
-  .lane .leftcol .compact-row .ccn{width:22px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
-  .lane .leftcol .compact-row .chn{width:16px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
-  .lane .leftcol .compact-row .ccn::-webkit-outer-spin-button,
-  .lane .leftcol .compact-row .ccn::-webkit-inner-spin-button,
-  .lane .leftcol .compact-row .chn::-webkit-outer-spin-button,
-  .lane .leftcol .compact-row .chn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
-  .lane .leftcol .swatch{width:9px;height:12px;border-radius:3px;border:1px solid #0006;cursor:pointer;flex-shrink:0;}
-  /* Icon row: real >=17px square hit targets with visible gaps between them
-     (fixes a pre-existing bug where these icons overflowed the fixed 156px
-     leftcol column and were clipped/unhittable by real pointer coordinates).
-     Wraps if the column is ever narrower than usual instead of clipping. */
-  .lane .leftcol .icon-row{gap:3px;padding-bottom:1px;flex-wrap:wrap;row-gap:3px;}
+  /* Lane color — a thin (~3px) clickable stripe positioned just inside the
+     leftcol's own left edge, adjacent to (never overlapping) the separate
+     .lane.active .leftcol inset box-shadow accent indicator at x=0-3px, so
+     "this lane is active" and "this lane's color" both stay visible at once
+     instead of one hiding the other. Replaces the old compact-row swatch
+     button — same click-to-cycle-LANE_COLORS behavior. */
+  .lane .leftcol .lane-color-stripe{position:absolute;left:3px;top:0;bottom:0;width:3px;cursor:pointer;z-index:1;}
+  .lane .leftcol .lane-color-stripe:hover{filter:brightness(1.35);}
+  /* Row 2: × (delete — the only destructive control) sits alone on the left
+     edge; Mute/Solo/drag-grip group together on the right via
+     .icon-row-right. The space-between split is the visual separation now
+     (replacing the old inline divider) — × can't be hit by accident while
+     reaching for the other icons. Every icon is a real >=16px hit target. */
+  .lane .leftcol .icon-row{gap:3px;padding-bottom:1px;justify-content:space-between;}
+  .lane .leftcol .icon-row-right{display:flex;align-items:center;gap:3px;}
   .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle{
     width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
     display:inline-flex;align-items:center;justify-content:center;
@@ -494,11 +534,7 @@
   .lane .leftcol .move-btn:hover{color:var(--accent);}
   .lane .leftcol .drag-handle{font-size:12px;cursor:grab;user-select:none;}
   .lane .leftcol .drag-handle:active{cursor:grabbing;}
-  /* × is the only destructive control in the row — kept visually separated
-     (a thin rule, then pushed to the far end via margin-left:auto) so it's
-     never hit by accident while reaching for M/S/hide. */
-  .lane .leftcol .icon-sep{width:1px;align-self:stretch;background:var(--line);margin:0 1px;flex-shrink:0;}
-  .lane .leftcol .x{color:var(--txt2);cursor:pointer;font-size:15px;margin-left:auto;}
+  .lane .leftcol .x{color:var(--txt2);cursor:pointer;font-size:15px;}
   .lane .leftcol .x:hover{color:#ff6b6b;border-color:#ff6b6b55;background:rgba(255,107,107,.12);}
   .lane.drag-over-top{border-top:2px solid var(--accent);}
   .lane.drag-over-bot{border-bottom:2px solid var(--accent);}
@@ -1087,7 +1123,7 @@
     sweepOn:false, sweepFreqStart:'1/8', sweepFreqEnd:'2 bars',
     sweepAmpLoStart:0, sweepAmpLoEnd:0, sweepAmpHiStart:30, sweepAmpHiEnd:127,
     durMode:'hms', rulerMode:'bars',
-    notes:[], ccLanes:[], nextId:1, pitchNames:{}, keysW:156, projectName:'',
+    notes:[], ccLanes:[], nextId:1, pitchNames:{}, keysW:300, projectName:'',
     channelNames:Array(16).fill(''),
     activeLaneId:null, selection:new Set(), focus:'piano',
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
@@ -1289,13 +1325,13 @@
   [rulerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
 
   // ---------- Pane resize (grips) ----------
-  // A CC lane's leftcol content is name-row + compact-row + icon-row (+
-  // val-row when there's room). LANE_MIN_H is the floor when shrinking a
-  // lane — always enough for name+compact+icon, never less, so those rows
-  // can never spill into the row above. LANE_FULL_H is the height at which
-  // val-row (the 4th row) actually fits; below that it's hidden outright
+  // A CC lane's leftcol content is row 1 (CC/Name/Ch/Tag/Hide) + row 2
+  // (×/Mute/Solo/grip) + row 3 (Val/Pos/Steps, when there's room). LANE_MIN_H
+  // is the floor when shrinking a lane — always enough for rows 1+2, never
+  // less, so those rows can never spill into the row above. LANE_FULL_H is
+  // the height at which row 3 actually fits; below that it's hidden outright
   // rather than clipped.
-  const LANE_MIN_H=70, LANE_FULL_H=84;
+  const LANE_MIN_H=60, LANE_FULL_H=80;
   function updateLaneCompactness(row){
     if(!row||!row.classList||!row.classList.contains('lane')) return;
     row.classList.toggle('lane-compact2', row.offsetHeight<LANE_FULL_H);
@@ -2048,6 +2084,27 @@
   const tagFilter=new Set(); // empty = show all lanes
   function laneTagList(l){ return Array.isArray(l.tags)?l.tags:[]; }
   function laneMatchesFilter(l){ if(tagFilter.size===0) return true; return laneTagList(l).some(t=>tagFilter.has(t)); }
+  // Right-click a tag chip's label to rename that tag everywhere it's used.
+  // Rewrites the exact string on every lane's tags array (deduping if the
+  // new name collides with a tag already on that lane), keeps an active
+  // tagFilter selection pointed at the renamed tag instead of silently
+  // losing it, and is a single undo step like any other tag edit.
+  function renameTag(oldTag){
+    const input=prompt('Rename tag "'+oldTag+'" to:',oldTag);
+    if(input==null) return; // cancelled
+    const newTag=input.trim();
+    if(!newTag||newTag===oldTag) return; // empty or unchanged — no-op
+    pushUndo();
+    state.ccLanes.forEach(l=>{
+      if(!Array.isArray(l.tags)||!l.tags.includes(oldTag)) return;
+      const seen=new Set(); const next=[];
+      l.tags.forEach(t=>{ const v=t===oldTag?newTag:t; if(!seen.has(v)){ seen.add(v); next.push(v); } });
+      l.tags=next;
+    });
+    if(tagFilter.has(oldTag)){ tagFilter.delete(oldTag); tagFilter.add(newTag); }
+    rebuildLanesDom();
+    refreshTagBar();
+  }
   function applyTagFilter(){
     state.ccLanes.forEach(l=>{ if(l._row) l._row.classList.toggle('lane-filtered',!laneMatchesFilter(l)); });
     resizeCanvases(); requestDraw();
@@ -2130,10 +2187,12 @@
     // filter toggle) plus M/S mini-buttons that bulk mute/solo every lane
     // in that group (a #tag, or every lane for "All") — lit when every
     // lane in the group currently shares that state.
-    function chip(label,on,fn,title,lanesForGroup){
+    function chip(label,on,fn,title,lanesForGroup,tagName){
       const wrap=document.createElement('span'); wrap.className='tag-chip'+(on?' on':'');
       const b=document.createElement('button'); b.className='tag-chip-label'; b.textContent=label;
       if(title) b.title=title; b.addEventListener('click',fn); wrap.appendChild(b);
+      // Right-click to rename — only real tags have one (not the "All" chip).
+      if(tagName!=null) b.addEventListener('contextmenu',e=>{ e.preventDefault(); renameTag(tagName); });
       const allMuted=lanesForGroup.length>0&&lanesForGroup.every(l=>l.muted);
       const allSoloed=lanesForGroup.length>0&&lanesForGroup.every(l=>l.soloed);
       const mBtn=document.createElement('button'); mBtn.className='tag-mini-btn mute-btn'+(allMuted?' on':'');
@@ -2149,7 +2208,7 @@
     [...all].sort((a,b)=>a.localeCompare(b)).forEach(t=>{
       const lanesForTag=state.ccLanes.filter(l=>laneTagList(l).includes(t));
       chip(t+' ('+lanesForTag.length+')',tagFilter.has(t),()=>{ tagFilter.has(t)?tagFilter.delete(t):tagFilter.add(t); refreshTagBar(); },
-        'Toggle lanes tagged "'+t+'" — multiple tags show the union',lanesForTag);
+        'Toggle lanes tagged "'+t+'" — multiple tags show the union (right-click to rename)',lanesForTag,t);
     });
     applyTagFilter();
   }
@@ -2185,18 +2244,44 @@
     const body=document.createElement('div'); body.className='lanebody';
     const left=document.createElement('div'); left.className='leftcol';
 
-    // Name row (top — last to disappear as lane shrinks)
+    // Lane color used to live as a swatch button inside the row content; it's
+    // now a thin clickable stripe on the leftcol's own left edge (see
+    // .lane-color-stripe), positioned just inside the active-lane accent
+    // indicator (.lane.active .leftcol's inset box-shadow) so both signals —
+    // "this is the active lane" and "this is this lane's color" — stay
+    // visible at the same time instead of one overriding the other.
+    const colorStripe=document.createElement('div'); colorStripe.className='lane-color-stripe';
+    colorStripe.style.background=lane.color; colorStripe.title='Lane color — click to change';
+
+    // Row 1 (top — last to disappear as lane shrinks): CC#/PB, Name, Channel,
+    // Tag pill, then the Minimize/Hide icon. This is the lane's primary
+    // identifier row; it fits comfortably now that the leftcol defaults to
+    // a much wider 300px column.
     const nameRow=document.createElement('div'); nameRow.className='lr name-row';
+    let ccn=null;
+    if(laneIsPb(lane)){
+      const pbTag=document.createElement('span'); pbTag.className='pb-tag'; pbTag.textContent='PB';
+      pbTag.title='Pitch Bend (±8192, 14-bit)';
+      nameRow.appendChild(pbTag);
+    } else {
+      ccn=document.createElement('input'); ccn.type='number'; ccn.className='ccn'; ccn.min=0; ccn.max=127; ccn.value=lane.cc;
+      ccn.title='CC '+lane.cc+(ccName(lane.cc)?' – '+ccName(lane.cc):'');
+      nameRow.appendChild(ccn);
+    }
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
     lname.placeholder=laneIsPb(lane)?'Pitch Bend':(ccName(lane.cc)||'Lane name…');
     lname.value=lane.name; lname.title=laneIsPb(lane)?'Pitch Bend (±8192, 14-bit)':ccName(lane.cc);
+    nameRow.appendChild(lname);
+    const chn=document.createElement('input'); chn.type='number'; chn.className='chn'; chn.min=1; chn.max=16; chn.value=lane.ch+1;
+    chn.title='MIDI Channel';
+    nameRow.appendChild(chn);
     // Tags display as a compact colored pill (name + count truncated with a
     // title tooltip) instead of an always-open text field — the field is
     // only shown while actively editing. Same underlying data model/commit
     // behavior as before; this is a display-only change.
     const ltags=document.createElement('input'); ltags.type='text'; ltags.className='ltags';
-    ltags.placeholder='#tags'; ltags.value=laneTagList(lane).join(' ');
-    ltags.title='Tags (space/comma separated) — filter lanes with the Show: bar above';
+    ltags.placeholder='#tags'; ltags.value=laneTagList(lane).join(', ');
+    ltags.title='Tags (comma separated) — filter lanes with the Show: bar above';
     ltags.style.display='none';
     const tagPill=document.createElement('span'); tagPill.className='tag-pill'; tagPill.tabIndex=0;
     const tagDot=document.createElement('span'); tagDot.className='tag-pill-dot'; tagDot.style.background=lane.color;
@@ -2204,7 +2289,7 @@
     tagPill.appendChild(tagDot); tagPill.appendChild(tagText);
     function renderTagPill(){
       const tags=laneTagList(lane);
-      tagText.textContent=tags.length?tags.join(' '):'#tags';
+      tagText.textContent=tags.length?tags.join(', '):'#tags';
       tagPill.classList.toggle('empty',!tags.length);
       tagPill.title=tags.length?('Tags: '+tags.join(', ')+' — click to edit'):'Click to add tags — filter lanes with the Show: bar above';
     }
@@ -2213,47 +2298,27 @@
     function exitTagEdit(){ ltags.style.display='none'; tagPill.style.display=''; renderTagPill(); }
     tagPill.addEventListener('click',enterTagEdit);
     tagPill.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); enterTagEdit(); } });
-    nameRow.appendChild(lname); nameRow.appendChild(tagPill); nameRow.appendChild(ltags);
+    nameRow.appendChild(tagPill); nameRow.appendChild(ltags);
+    const hideBtn=document.createElement('button'); hideBtn.className='move-btn'; hideBtn.textContent='●'; hideBtn.title='Hide lane';
+    nameRow.appendChild(hideBtn);
 
-    // Compact row: CC#/PB + Ch + swatch (identifiers only — the mute/solo/
-    // hide/drag/delete icon buttons live in their own row below so both rows
-    // fit the fixed leftcol width without clipping; see icon-row).
-    const compRow=document.createElement('div'); compRow.className='lr compact-row';
-    if(laneIsPb(lane)){
-      const pbTag=document.createElement('span'); pbTag.textContent='PB'; pbTag.style.cssText='font-size:9px;color:var(--txt2);font-style:italic;flex-shrink:0;';
-      compRow.appendChild(pbTag);
-    } else {
-      const ccLbl=document.createElement('span'); ccLbl.textContent='CC'; ccLbl.style.flexShrink='0';
-      const ccn=document.createElement('input'); ccn.type='number'; ccn.className='ccn'; ccn.min=0; ccn.max=127; ccn.value=lane.cc;
-      ccn.title='CC '+lane.cc+(ccName(lane.cc)?' – '+ccName(lane.cc):'');
-      compRow.appendChild(ccLbl); compRow.appendChild(ccn);
-    }
-    const chLbl=document.createElement('span'); chLbl.textContent='Ch'; chLbl.style.flexShrink='0';
-    const chn=document.createElement('input'); chn.type='number'; chn.className='chn'; chn.min=1; chn.max=16; chn.value=lane.ch+1;
-    const swatch=document.createElement('span'); swatch.className='swatch'; swatch.style.background=lane.color;
-    compRow.appendChild(chLbl); compRow.appendChild(chn); compRow.appendChild(swatch);
-
-    // Icon row: Mute/Solo/Hide/drag-handle grouped together, then × (the only
-    // destructive control) at the far end behind a visual separator so it
-    // can't be hit by accident while reaching for M/S/hide. Every icon here
-    // is a real >=17px hit target with visible spacing between them — this
-    // row (and compact-row above) used to be one combined row whose trailing
-    // icons overflowed the fixed 156px leftcol column and were clipped/
-    // unhittable by real pointer coordinates; splitting them out and letting
-    // this row wrap fixes that for good.
+    // Row 2: Delete (×) — the only destructive control — sits alone on the
+    // left edge, deliberately separated from Mute/Solo/drag-grip which group
+    // together on the right, so × can never be hit by accident while
+    // reaching for the other icons. Every icon here is a real >=16px hit
+    // target with visible spacing between them.
     const iconRow=document.createElement('div'); iconRow.className='lr icon-row';
+    const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
     const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
     const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
-    const hideBtn=document.createElement('button'); hideBtn.className='move-btn'; hideBtn.textContent='●'; hideBtn.title='Hide lane';
     const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
-    const iconSep=document.createElement('span'); iconSep.className='icon-sep'; iconSep.setAttribute('aria-hidden','true');
-    const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
-    iconRow.appendChild(muteBtn); iconRow.appendChild(soloBtn); iconRow.appendChild(hideBtn); iconRow.appendChild(dragHandle);
-    iconRow.appendChild(iconSep); iconRow.appendChild(xBtn);
+    const iconRowRight=document.createElement('span'); iconRowRight.className='icon-row-right';
+    iconRowRight.appendChild(muteBtn); iconRowRight.appendChild(soloBtn); iconRowRight.appendChild(dragHandle);
+    iconRow.appendChild(xBtn); iconRow.appendChild(iconRowRight);
 
-    // Val + Pos (+ Steps) on one row — saves vertical space when many lanes
-    // are open. Steps lives here rather than compact-row since it's the
-    // primary way to set a brand-new feature, so it needs its own room.
+    // Row 3: Val + Pos (+ Steps) — saves vertical space when many lanes are
+    // open. Steps lives here since it's the primary way to set it, so it
+    // needs its own room. Unchanged content/behavior — just row 3 of 3 now.
     const valRow=document.createElement('div'); valRow.className='lr val-row';
     const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input'; valInput.style.cssText='width:46px;min-width:46px;flex:0 0 46px;';
@@ -2277,8 +2342,8 @@
     // without this the name/CC/val/pos controls (naturally at the row's top)
     // scroll out of view while the lane's curve is still on screen.
     const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
-    leftInner.appendChild(nameRow); leftInner.appendChild(compRow); leftInner.appendChild(iconRow); leftInner.appendChild(valRow);
-    left.appendChild(leftInner);
+    leftInner.appendChild(nameRow); leftInner.appendChild(iconRow); leftInner.appendChild(valRow);
+    left.appendChild(colorStripe); left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
 
     const sc=document.createElement('div'); sc.className='scroll hx';
@@ -2306,8 +2371,13 @@
     // the pill always reflects the final value regardless of which event
     // order a given browser fires them in.
     function commitTags(){
-      lane.tags=ltags.value.split(/[,\s]+/).map(s=>s.trim()).filter(Boolean);
-      ltags.value=lane.tags.join(' ');
+      // Comma-only split (not whitespace) so a single tag may contain internal
+      // spaces (e.g. "chaser stage lights"). The join delimiter below must
+      // stay in lockstep with this — ', ' round-trips losslessly back through
+      // this same comma-only parser, whereas a space-joined display would
+      // silently re-merge two space-free tags into one on the next commit.
+      lane.tags=ltags.value.split(',').map(s=>s.trim()).filter(Boolean);
+      ltags.value=lane.tags.join(', ');
     }
     ltags.addEventListener('change',()=>{ commitTags(); pushUndo(); refreshTagBar(); });
     ltags.addEventListener('blur',()=>{ commitTags(); exitTagEdit(); });
@@ -2315,7 +2385,7 @@
 
     // CC number
     if(!laneIsPb(lane)){
-      compRow.querySelector('.ccn').addEventListener('input',ev=>{
+      ccn.addEventListener('input',ev=>{
         lane.cc=clamp(+ev.target.value||0,0,127);
         const name=ccName(lane.cc);
         ev.target.title='CC '+lane.cc+(name?' – '+name:'');
@@ -2342,9 +2412,11 @@
       pushUndo(); updateLaneValInput(lane); requestDraw();
     });
     stepsInput.addEventListener('keydown',e=>{ if(e.key==='Enter') stepsInput.blur(); });
-    swatch.addEventListener('click',()=>{
+    // Lane color cycles through LANE_COLORS on click — same interaction the
+    // old compact-row swatch button had, now on the leftcol's color stripe.
+    colorStripe.addEventListener('click',()=>{
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
-      swatch.style.background=lane.color; tbSwatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
+      colorStripe.style.background=lane.color; tbSwatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
     });
     xBtn.addEventListener('click',()=>{ if(!confirm('Delete CC Lane?')) return; pushUndo(); removeLane(lane.id); });
     lane._muteBtn=muteBtn; lane._soloBtn=soloBtn;

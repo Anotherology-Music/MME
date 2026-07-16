@@ -1104,7 +1104,9 @@ async function run() {
 
   await withPage(browser, async (page) => {
     const keysW = await page.evaluate(() => window._TEST_state.keysW);
-    check('left side-panel default width is doubled (156px, was 78px)', keysW === 156, keysW);
+    check('left side-panel defaults to its max width (300px)', keysW === 300, keysW);
+    const cssVar = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--keys-w').trim());
+    check('the --keys-w CSS var matches the 300px default at load', cssVar === '300px', cssVar);
   });
 
   await withPage(browser, async (page) => {
@@ -1192,10 +1194,10 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // Shrinking a lane via the grip has a floor of "name-row + compact-row"
-    // (2 rows) — it can never go small enough for those two rows to be cut
-    // off, and val-row (the 3rd row) hides outright once it no longer fits,
-    // instead of clipping mid-row.
+    // Shrinking a lane via the grip has a floor of "row 1 (CC/Name/Ch/Tag/
+    // Hide) + row 2 (×/Mute/Solo/grip)" — it can never go small enough for
+    // those two rows to be cut off, and row 3 (Val/Pos/Steps) hides outright
+    // once it no longer fits, instead of clipping mid-row.
     const row = await page.$('.lane');
     const grip = await page.$('.lane .grip');
     const gripBox = await grip.boundingBox();
@@ -1211,19 +1213,19 @@ async function run() {
     await page.waitForTimeout(100);
     const shrunk = await page.evaluate(() => {
       const r = document.querySelector('.lane');
-      const nameRow = r.querySelector('.name-row'), compRow = r.querySelector('.compact-row'), valRow = r.querySelector('.val-row');
+      const nameRow = r.querySelector('.name-row'), iconRow = r.querySelector('.icon-row'), valRow = r.querySelector('.val-row');
       return {
         rowHeight: r.offsetHeight,
         compact2: r.classList.contains('lane-compact2'),
         nameVisible: nameRow.getBoundingClientRect().height > 0,
-        compVisible: compRow.getBoundingClientRect().height > 0,
+        iconVisible: iconRow.getBoundingClientRect().height > 0,
         valVisible: getComputedStyle(valRow).display !== 'none',
       };
     });
-    check('shrinking a lane below the 3-row height hides val-row but keeps name/compact rows visible',
-      shrunk.compact2 && shrunk.nameVisible && shrunk.compVisible && !shrunk.valVisible, shrunk);
-    check('the grip cannot shrink a lane below the 2-row minimum height',
-      shrunk.rowHeight >= 63, shrunk.rowHeight);
+    check('shrinking a lane below the 3-row height hides row 3 (Val/Pos/Steps) but keeps rows 1+2 visible',
+      shrunk.compact2 && shrunk.nameVisible && shrunk.iconVisible && !shrunk.valVisible, shrunk);
+    check('the grip cannot shrink a lane below the row-1+row-2 minimum height',
+      shrunk.rowHeight >= 59, shrunk.rowHeight);
   });
 
   await withPage(browser, async (page) => {
@@ -1232,14 +1234,12 @@ async function run() {
     // not just the name — so a minimized lane stays identifiable.
     await page.fill('.lane input.lname', 'sequenceProgress');
     await page.dispatchEvent('.lane input.lname', 'input');
-    await page.fill('.lane .compact-row .chn', '3');
-    await page.dispatchEvent('.lane .compact-row .chn', 'input');
+    await page.fill('.lane .name-row .chn', '3');
+    await page.dispatchEvent('.lane .name-row .chn', 'input');
     await page.waitForTimeout(50);
-    // Real pointer click, not a dispatched one: the compact-row's trailing
-    // icons used to overflow the fixed 156px leftcol column and be clipped/
-    // unhittable by real pointer coordinates (a pre-existing layout bug —
-    // see the "hittable at real pointer coordinates" test below, which
-    // proves this is fixed for every icon in the row).
+    // Real pointer click, not a dispatched one: proving every icon is a
+    // real, unclipped hit target — see the "hittable at real pointer
+    // coordinates" test below, which proves this for every icon in the row.
     await page.click('.lane .move-btn[title="Hide lane"]');
     await page.waitForTimeout(50);
     const info = await page.evaluate(() => {
@@ -1257,10 +1257,12 @@ async function run() {
   // ---------------- Lane icon ergonomics (item 4) ----------------
 
   await withPage(browser, async (page) => {
-    // Every per-lane icon button (M, S, hide ●, drag grip, and the separated
-    // × delete) must be a real, unclipped, >=16px hit target that a genuine
-    // pointer click can land on — proving the old "compact-row's trailing
-    // icons overflow the fixed 156px column and are clipped" bug is fixed.
+    // Every per-lane icon button (M, S, hide ●, drag grip, delete ×, and the
+    // lane color stripe) must be a real, unclipped, >=16px (or, for the
+    // stripe, genuinely clickable) hit target that a genuine pointer click
+    // can land on. Row 2's layout is a deliberate split: × alone on the far
+    // left, Mute/Solo/grip grouped on the far right — proven here by real
+    // coordinates, not just class presence.
     const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
     await page.waitForTimeout(50);
     const sel = {
@@ -1269,6 +1271,7 @@ async function run() {
       hide: `.lane[data-id="${laneId}"] .move-btn[title="Hide lane"]`,
       drag: `.lane[data-id="${laneId}"] .drag-handle`,
       del: `.lane[data-id="${laneId}"] .x`,
+      stripe: `.lane[data-id="${laneId}"] .lane-color-stripe`,
     };
 
     const hittable = await page.evaluate((sel) => {
@@ -1284,7 +1287,7 @@ async function run() {
       }
       return out;
     }, sel);
-    check('every per-lane icon (M/S/hide/drag/×) has a real, unclipped hit target at its own screen coordinates',
+    check('every per-lane icon (M/S/hide/drag/×/color-stripe) has a real, unclipped hit target at its own screen coordinates',
       Object.values(hittable).every(Boolean), hittable);
 
     const sizes = await page.evaluate((sel) => {
@@ -1298,6 +1301,17 @@ async function run() {
     check('per-lane M/S/hide/drag/× icons are all >=16px hit targets',
       Object.values(sizes).every(s => s.w >= 16 && s.h >= 16), sizes);
 
+    // Row 2's deliberate left/right split: × sits strictly left of the
+    // Mute/Solo/grip cluster (Mute left of Solo left of grip), proving the
+    // new layout — not just that all the icons exist somewhere in the row.
+    const positions = await page.evaluate((sel) => {
+      const out = {};
+      for (const [k, s] of Object.entries(sel)) { out[k] = document.querySelector(s).getBoundingClientRect().left; }
+      return out;
+    }, sel);
+    check('row 2 layout: × is left of Mute, which is left of Solo, which is left of the drag grip',
+      positions.del < positions.mute && positions.mute < positions.solo && positions.solo < positions.drag, positions);
+
     // Real Playwright pointer clicks (no force:true, no dispatchEvent) must
     // actually land and trigger the real behavior, not just report a
     // non-empty bounding box.
@@ -1310,6 +1324,37 @@ async function run() {
     const hiddenAfterRealClick = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'), laneId);
     check('a real pointer click on the Hide icon actually hides the lane (not force-clicked, not dispatched)',
       hiddenAfterRealClick === true, hiddenAfterRealClick);
+  });
+
+  await withPage(browser, async (page) => {
+    // The lane color stripe replaces the old compact-row swatch button —
+    // same click-to-cycle-LANE_COLORS behavior, now via a real pointer click
+    // on the thin stripe at the leftcol's own left edge.
+    const laneId = await page.evaluate(() => window._TEST_addLane(40, 0));
+    await page.waitForTimeout(50);
+    const before = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
+    await page.click(`.lane[data-id="${laneId}"] .lane-color-stripe`);
+    await page.waitForTimeout(30);
+    const after = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
+    check('a real pointer click on the lane color stripe cycles the lane\'s color (same behavior as the old swatch button)',
+      after !== before, { before, after });
+
+    // Active-lane accent and lane color must both stay visible at once —
+    // the color stripe sits just inside the .lane.active box-shadow accent
+    // indicator, not on top of/replacing it.
+    await page.evaluate((id) => { const l = window._TEST_state.ccLanes.find(x => x.id === id); document.querySelector(`.lane[data-id="${id}"]`).dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); }, laneId);
+    await page.waitForTimeout(30);
+    const signals = await page.evaluate((id) => {
+      const lc = document.querySelector(`.lane[data-id="${id}"].active .leftcol`);
+      const stripe = lc && lc.querySelector('.lane-color-stripe');
+      return {
+        isActive: !!lc,
+        boxShadow: lc ? getComputedStyle(lc).boxShadow : null,
+        stripeVisible: stripe ? (stripe.getBoundingClientRect().width > 0 && getComputedStyle(stripe).backgroundColor) : null,
+      };
+    }, laneId);
+    check('the active-lane accent indicator and the lane-color stripe are both present simultaneously (neither overrides the other)',
+      signals.isActive && signals.boxShadow && signals.boxShadow !== 'none' && !!signals.stripeVisible, signals);
   });
 
   await withPage(browser, async (page) => {
@@ -1377,7 +1422,7 @@ async function run() {
   // ---------------- CC lane Steps (snap-to) ----------------
 
   await withPage(browser, async (page) => {
-    // Setting Steps via the compact-row input snaps future points to N
+    // Setting Steps via the val-row input snaps future points to N
     // evenly-spaced values across the lane's own range; turning it off (0)
     // stops snapping without retroactively touching existing points.
     const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
@@ -1624,7 +1669,7 @@ async function run() {
     await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'change');
     await page.waitForTimeout(50);
     const tags = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
-    check('lane tags parsed from comma/space separated input', JSON.stringify(tags) === JSON.stringify(['sceneA', 'kaleido']), tags);
+    check('lane tags parsed from comma-separated input', JSON.stringify(tags) === JSON.stringify(['sceneA', 'kaleido']), tags);
     const barDisplay = await page.evaluate(() => document.getElementById('tagFilterBar').style.display);
     const chipTexts = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].map(b => b.textContent));
     check(
@@ -1632,6 +1677,57 @@ async function run() {
       barDisplay === 'flex' && chipTexts.includes('All') && chipTexts.some(t => t.startsWith('sceneA')) && chipTexts.some(t => t.startsWith('kaleido')),
       chipTexts
     );
+  });
+
+  await withPage(browser, async (page) => {
+    // Tags now split ONLY on commas — a single tag may contain internal
+    // spaces (e.g. an ISF-imported tag renamed from "Chaser_Stage_Lights" to
+    // "chaser stage lights"). Typing a tag with a space, committing, and
+    // reopening the pill must show that same single tag, not two.
+    const id = await page.evaluate(() => window._TEST_addLane(26, 0));
+    await page.click(`.lane[data-id="${id}"] .tag-pill`);
+    await page.fill(`.lane[data-id="${id}"] input.ltags`, 'chaser stage lights');
+    // blur (not just 'change') so the field commits AND swaps back to the
+    // pill display, exactly like a real user typing then clicking away.
+    await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'blur');
+    await page.waitForTimeout(50);
+    const tags = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('a tag with an internal space is NOT split into multiple tags (comma is the only delimiter)',
+      JSON.stringify(tags) === JSON.stringify(['chaser stage lights']), tags);
+
+    // Reopen the pill (blur without typing anything) and re-commit — this is
+    // exactly the round-trip that used to silently merge two space-free tags
+    // into one when the display was space-joined but the parser was
+    // comma-only. Here there's only one tag, so the round-trip must be a
+    // pure no-op.
+    await page.click(`.lane[data-id="${id}"] .tag-pill`);
+    await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'blur');
+    await page.waitForTimeout(50);
+    const tagsAfterReopen = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('reopening and blurring the tag pill without editing leaves a space-containing tag intact',
+      JSON.stringify(tagsAfterReopen) === JSON.stringify(['chaser stage lights']), tagsAfterReopen);
+  });
+
+  await withPage(browser, async (page) => {
+    // The display join delimiter (', ') must stay in lockstep with the
+    // comma-only parser: two genuinely distinct single-word tags, displayed
+    // space-joined-then-reopened-and-reparsed, must NOT silently merge into
+    // one tag the way they would if the join delimiter were still a plain
+    // space (a real correctness trap the comma-only parsing change
+    // introduces if the join side isn't updated to match).
+    const id = await page.evaluate(() => window._TEST_addLane(27, 0));
+    await page.click(`.lane[data-id="${id}"] .tag-pill`);
+    await page.fill(`.lane[data-id="${id}"] input.ltags`, 'sceneA,kaleido');
+    await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'blur');
+    await page.waitForTimeout(50);
+    // Reopen the pill (no edits) and re-commit via blur — this re-parses
+    // whatever the field re-displayed after the first commit.
+    await page.click(`.lane[data-id="${id}"] .tag-pill`);
+    await page.dispatchEvent(`.lane[data-id="${id}"] input.ltags`, 'blur');
+    await page.waitForTimeout(50);
+    const tags = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('two distinct tags survive a display/reopen/recommit round-trip without merging into one',
+      JSON.stringify(tags) === JSON.stringify(['sceneA', 'kaleido']), tags);
   });
 
   await withPage(browser, async (page) => {
@@ -1669,6 +1765,91 @@ async function run() {
     const snap = await page.evaluate(() => window._TEST_snapshot());
     const roundTrip = await page.evaluate((s) => { window._TEST_applyState(s); return window._TEST_state.ccLanes.map(l => l.tags); }, snap);
     check('lane tags survive snapshot()/applyState() roundtrip', roundTrip.some(t => Array.isArray(t) && t.includes('persistTag')), roundTrip);
+  });
+
+  // ---------------- Tag rename (right-click a tag chip) ----------------
+
+  await withPage(browser, async (page) => {
+    // Right-clicking a tag chip's label opens a rename prompt; confirming
+    // rewrites that exact tag string on every lane that has it (deduping if
+    // the new name collides with a tag already on that lane), keeps an
+    // active tagFilter selection pointed at the renamed tag, and is a single
+    // undo step.
+    const idA = await page.evaluate(() => window._TEST_addLane(50, 0));
+    const idB = await page.evaluate(() => window._TEST_addLane(51, 0));
+    const idC = await page.evaluate(() => window._TEST_addLane(52, 0));
+    await page.evaluate((ids) => {
+      const a = document.querySelector(`.lane[data-id="${ids.a}"] input.ltags`);
+      a.value = 'oldName'; a.dispatchEvent(new Event('change'));
+      const b = document.querySelector(`.lane[data-id="${ids.b}"] input.ltags`);
+      b.value = 'oldName, other'; b.dispatchEvent(new Event('change'));
+    }, { a: idA, b: idB });
+    await page.waitForTimeout(80);
+
+    // Activate "oldName" as the active filter so we can prove it survives the rename.
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(b => b.textContent.startsWith('oldName'));
+      chip.click();
+    });
+    await page.waitForTimeout(50);
+    const cFilteredBefore = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-filtered'), idC);
+    check('lane C (untagged) is filtered out while the "oldName" filter is active', cFilteredBefore === true, cFilteredBefore);
+
+    // Real right-click (not a dispatched contextmenu) on the chip's label.
+    page.once('dialog', d => { check('right-clicking a tag chip opens a rename prompt pre-filled with the current name', d.type() === 'prompt' && d.defaultValue() === 'oldName', { type: d.type(), defaultValue: d.defaultValue() }); d.accept('newName'); });
+    const chipSel = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(b => b.textContent.startsWith('oldName')));
+    const chipBox = await chipSel.asElement().boundingBox();
+    await page.mouse.click(chipBox.x + chipBox.width / 2, chipBox.y + chipBox.height / 2, { button: 'right' });
+    await page.waitForTimeout(80);
+
+    const [tagsA, tagsB] = await Promise.all([idA, idB].map(id => page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id)));
+    check('renaming a tag rewrites it on every lane that has it (deduped where it collides with an existing tag)',
+      JSON.stringify(tagsA) === JSON.stringify(['newName']) && JSON.stringify(tagsB) === JSON.stringify(['newName', 'other']),
+      { tagsA, tagsB });
+
+    const cFilteredAfter = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-filtered'), idC);
+    check('the active tagFilter selection survives the rename instead of silently clearing', cFilteredAfter === true, cFilteredAfter);
+
+    const chipTextsAfter = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].map(b => b.textContent));
+    check('the tag bar shows the new name and no longer shows the old one',
+      chipTextsAfter.some(t => t.startsWith('newName')) && !chipTextsAfter.some(t => t.startsWith('oldName')), chipTextsAfter);
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(80);
+    const [tagsAafterUndo, tagsBafterUndo] = await Promise.all([idA, idB].map(id => page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id)));
+    check('undo restores the pre-rename tag name on every lane',
+      JSON.stringify(tagsAafterUndo) === JSON.stringify(['oldName']) && JSON.stringify(tagsBafterUndo) === JSON.stringify(['oldName', 'other']),
+      { tagsAafterUndo, tagsBafterUndo });
+  });
+
+  await withPage(browser, async (page) => {
+    // An empty or unchanged rename name is a no-op — the prompt's Cancel
+    // (null) and an unchanged/whitespace-only confirmed value must both
+    // leave the tag exactly as it was.
+    const id = await page.evaluate(() => window._TEST_addLane(53, 0));
+    await page.evaluate((id) => {
+      const inp = document.querySelector(`.lane[data-id="${id}"] input.ltags`);
+      inp.value = 'keepMe'; inp.dispatchEvent(new Event('change'));
+    }, id);
+    await page.waitForTimeout(50);
+
+    page.once('dialog', d => d.dismiss());
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(b => b.textContent.startsWith('keepMe'));
+      chip.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+    });
+    await page.waitForTimeout(50);
+    const afterCancel = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('cancelling the rename prompt leaves the tag unchanged', JSON.stringify(afterCancel) === JSON.stringify(['keepMe']), afterCancel);
+
+    page.once('dialog', d => d.accept('   '));
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(b => b.textContent.startsWith('keepMe'));
+      chip.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+    });
+    await page.waitForTimeout(50);
+    const afterBlank = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('confirming the rename prompt with a blank/whitespace-only name is a no-op', JSON.stringify(afterBlank) === JSON.stringify(['keepMe']), afterBlank);
   });
 
   // ---------------- Transport shortcuts, project buttons, Time Sig default, Scroll Lock ----------------
