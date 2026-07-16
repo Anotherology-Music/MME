@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.4
+  MMV MIDI & CC Curve Editor v0.9.5
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -196,6 +196,27 @@
   Effects Library drawer, ISF import table); and the remaining text-glyph
   icons (save 💾, folder 📁, library ⚡, Undo/Redo's ↶/↷) are now inline
   SVGs sized like the v0.9.3 metronome/chain-link/padlock icons.
+  v0.9.5 Autosave & crash recovery: every 30s (and whenever the tab goes
+  hidden) the current project state is autosaved to the browser's local
+  IndexedDB if anything changed. An explicit Save Project or a project load
+  marks the record "clean"; if the app starts up and finds a dirty record —
+  the previous session ended in a crash, closed tab, or power cut without
+  saving — it offers to restore that work (Cancel discards it; an accepted
+  restore is a single undo step). Entirely best-effort and local: nothing
+  leaves the browser, .mmvp files are unchanged, and if IndexedDB is
+  unavailable the app just behaves as before.
+  Fixed a scheduler bug where a pass with nothing schedulable in it (empty
+  project, everything muted, metronome off) advanced the internal pass
+  counter once per 20ms scheduler tick instead of once per real loop pass —
+  so anything appearing mid-play over an empty pass (e.g. toggling the
+  metronome on) was scheduled minutes-to-hours in the future and never
+  heard. The counter now pins to the wall clock while a pass stays empty.
+  The tag/ALL Mute-Solo buttons' press-and-hold (force on) now works from a
+  touchscreen or pen, not just a mouse: the gesture handlers use pointer
+  events, the platform context menu that a touch long-press triggers is
+  suppressed on those tiny buttons, and a stale "just long-pressed" flag
+  can no longer swallow the next tap on platforms where a touch long-press
+  produces no trailing click event.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -443,7 +464,8 @@
   .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
   .tag-chip-label{background:none;border:none;color:inherit;font-size:11px;padding:0;cursor:pointer;}
   /* >=16px hit target — same bump as the per-lane M/S/hide/delete icons below. */
-  .tag-mini-btn{font-size:9px;font-weight:700;line-height:1;min-width:16px;min-height:16px;padding:2px 5px;
+  .tag-mini-btn{touch-action:manipulation;user-select:none;-webkit-user-select:none;
+    font-size:9px;font-weight:700;line-height:1;min-width:16px;min-height:16px;padding:2px 5px;
     border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
     display:inline-flex;align-items:center;justify-content:center;}
   .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
@@ -2078,15 +2100,24 @@
     refreshMuteSoloUI();
   }
   // Attaches a short click (smart toggle) and a press-and-hold (>500ms,
-  // force-on) gesture to a tag/ALL group's M or S button. Suppresses the
-  // browser's own click event that follows a long-press release so the
-  // short-click action doesn't also fire right after.
+  // force-on) gesture to a tag/ALL group's M or S button. Uses pointer
+  // events rather than mouse events so the hold works from a touchscreen
+  // or pen too (a touch long-press fires no mouse events at all). Suppresses
+  // the browser's own click event that follows a long-press release so the
+  // short-click action doesn't also fire right after — and since a touch
+  // long-press may produce no click at all, the flag is reset at the start
+  // of every new press rather than relying on click to clear it.
   function attachTagMuteSoloBtn(btn,onShortClick,onLongPress){
     let timer=null,longFired=false;
-    btn.addEventListener('mousedown',e=>{ e.stopPropagation(); longFired=false;
+    btn.addEventListener('pointerdown',e=>{ e.stopPropagation(); longFired=false;
       timer=setTimeout(()=>{ longFired=true; timer=null; onLongPress(); },500); });
     const cancel=()=>{ if(timer){ clearTimeout(timer); timer=null; } };
-    btn.addEventListener('mouseup',cancel); btn.addEventListener('mouseleave',cancel);
+    btn.addEventListener('pointerup',cancel); btn.addEventListener('pointerleave',cancel);
+    btn.addEventListener('pointercancel',cancel);
+    // A touch long-press also triggers the platform context menu, which
+    // would interrupt the hold — these tiny M/S buttons have no right-click
+    // function, so suppress it outright.
+    btn.addEventListener('contextmenu',e=>e.preventDefault());
     btn.addEventListener('click',e=>{ e.stopPropagation(); if(longFired){ longFired=false; return; } onShortClick(); });
   }
 
@@ -3008,12 +3039,14 @@
         const fh=await projDirHandle.getFileHandle(projFilename('.mmvp'),{create:true});
         const w=await fh.createWritable(); await w.write(json); await w.close();
         flash('Saved to '+projDirHandle.name+'/'+projFilename('.mmvp'));
+        autosaveMarkClean();
         return;
       }catch(e){ flash('Could not save to folder ('+e.message+') — downloading instead'); }
     }
     const blob=new Blob([json],{type:'application/json'});
     const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
     a.download=projFilename('.mmvp'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    autosaveMarkClean();
   }
   function loadProject(file){
     const fr=new FileReader(); fr.onload=async()=>{
@@ -3025,6 +3058,7 @@
         applyState(JSON.stringify(data.snapshot));
         state.projectName=data.projectName||'';
         if($('projectName')) $('projectName').value=state.projectName;
+        autosaveMarkClean(); // the loaded state exists on disk — supersede any dirty autosave
         // Auto-audio-load happens here, inside the FileReader callback, so it
         // can never race clearAudio()/applyState() above (a caller that fired
         // this off-thread right after loadProject() returned — before the
@@ -3040,6 +3074,57 @@
     };
     fr.readAsText(file);
   }
+
+  // ---------- Autosave & crash recovery ----------
+  // Every 30s (and whenever the tab is hidden — the closest thing to a
+  // reliable "about to close" signal), the current snapshot is written to
+  // IndexedDB if anything changed since the last write. Records are flagged
+  // dirty until an explicit Save Project or project load supersedes them; on
+  // the next startup a dirty record means the previous session ended without
+  // saving (crash, closed tab, power cut) and the user is offered a restore.
+  // Everything is best-effort: if IndexedDB is unavailable the feature is
+  // silently off and the app behaves exactly as before.
+  const AUTOSAVE_EVERY_MS=30000;
+  let autosaveBaseline=null; // snapshot() JSON at the last autosave/clean point; null until init decides the starting state
+  async function autosaveTick(){
+    if(autosaveBaseline===null) return;
+    try{
+      const snap=snapshot();
+      if(snap===autosaveBaseline) return;
+      await idbSet('autosave',{time:Date.now(),projectName:state.projectName||'',dirty:true,snapshot:snap});
+      autosaveBaseline=snap;
+    }catch(e){ /* IndexedDB unavailable — autosave silently off */ }
+  }
+  // Called after an explicit save or a project load: whatever is in memory
+  // now also exists on disk, so a crash from here would lose nothing — the
+  // stored record is rewritten as clean so the next startup doesn't prompt.
+  async function autosaveMarkClean(){
+    try{
+      const snap=snapshot();
+      autosaveBaseline=snap;
+      await idbSet('autosave',{time:Date.now(),projectName:state.projectName||'',dirty:false,snapshot:snap});
+    }catch(e){}
+  }
+  async function checkAutosaveRestore(){
+    try{
+      const rec=await idbGet('autosave');
+      if(!rec||!rec.dirty||!rec.snapshot) return false;
+      const when=new Date(rec.time).toLocaleString();
+      const who=rec.projectName?(' ("'+rec.projectName+'")'):'';
+      if(confirm('Unsaved work'+who+' from '+when+' was found from a previous session.\nRestore it? (Cancel discards it)')){
+        pushUndo();
+        applyState(rec.snapshot);
+        state.projectName=rec.projectName||state.projectName;
+        if($('projectName')) $('projectName').value=state.projectName;
+        flash('Restored unsaved session from '+when);
+        await autosaveMarkClean(); // it's live in memory now — don't re-prompt next startup
+        return true;
+      }
+      await autosaveMarkClean(); // declined — discard so it doesn't nag forever
+      return false;
+    }catch(e){ return false; }
+  }
+  document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') autosaveTick(); });
 
   function parseMidi(buf){ const dv=new DataView(buf); let p=0; const rd=n=>{let v=0;for(let i=0;i<n;i++){v=(v<<8)|dv.getUint8(p++);}return v;};
     if(rd(4)!==0x4D546864) throw new Error('Not a MIDI file'); rd(4); const fmt=rd(2), ntrk=rd(2), div=rd(2);
@@ -3642,7 +3727,21 @@
       while(cg++<2000){ const ct=s.t0+s.clockIdx*s.msPerClock; if(ct>now+LOOKAHEAD) break; state.midiOut.send([0xF8],ct); s.clockIdx++; }
     }
     while(guard++<5000){
-      if(s.idx>=s.evs.length){ s.passIndex++; s.idx=0; s.evs=buildPassEvents(s.a,s.b); if(s.span<=0||!s.evs.length) break; }
+      if(s.idx>=s.evs.length){
+        const rebuilt=buildPassEvents(s.a,s.b); s.idx=0;
+        if(s.span<=0){ s.evs=rebuilt; break; }
+        if(!rebuilt.length){
+          // An empty pass has no events to pace passIndex, and the old
+          // unconditional ++ here ran once per scheduler tick — inflating
+          // passIndex far beyond the pass "now" is actually in, so events
+          // appearing mid-play (e.g. the metronome toggled on over an empty
+          // project) were scheduled minutes into the future and never heard.
+          // Pin it to the wall clock instead while the pass stays empty.
+          s.passIndex=Math.max(s.passIndex, Math.floor((now-s.t0)/(s.span*s.mpt)));
+          s.evs=rebuilt; break;
+        }
+        s.passIndex++; s.evs=rebuilt;
+      }
       const ev=s.evs[s.idx]; const t=s.t0+(s.passIndex*s.span + ev.tick - s.startTick)*s.mpt;
       if(t<=now+LOOKAHEAD){
         if(ev.click){ scheduleClickAt(t, ev.accent); }
@@ -5248,6 +5347,12 @@
     updatePlayheadEl(); updateUndoBtns(); updateLoopStatus(); updatePlayPos(); updateTransportBtns(); updateDuration();
     requestDraw();
     setupPWA();
+    // Crash recovery: offer to restore a previous session's unsaved work,
+    // then (whether restored, declined, or nothing found) lock in the
+    // resulting state as the autosave baseline and start the rolling
+    // autosave. The baseline is only set here so the pristine startup state
+    // can never be written out as a "dirty" record by an early tick.
+    checkAutosaveRestore().finally(()=>{ autosaveBaseline=snapshot(); setInterval(autosaveTick,AUTOSAVE_EVERY_MS); });
   }
   init();
 })();

@@ -86,6 +86,9 @@ function buildTestHtml() {
       '  window._TEST_laneAudible = (id) => laneAudible(state.ccLanes.find(l => l.id === id));',
       '  window._TEST_buildPassEvents = (a, b) => buildPassEvents(a, b);',
       '  window._TEST_generate = (kind) => generate(kind);',
+      '  window._TEST_autosaveTick = () => autosaveTick();',
+      '  window._TEST_autosaveMarkClean = () => autosaveMarkClean();',
+      '  window._TEST_checkAutosaveRestore = () => checkAutosaveRestore();',
       '  init();',
     ].join('\n')
   );
@@ -2593,6 +2596,175 @@ async function run() {
     const heights = await page.evaluate((ids) => ids.map(id => document.querySelector(`.lane[data-id="${id}"]`).offsetHeight), ids);
     check('every minimized lane keeps a real, non-crushed height (>=20px) even with many minimized at once',
       heights.every(h => h >= 20), heights);
+  });
+
+  // ---------------- Autosave & crash recovery ----------------
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => window._TEST_idbSet('autosave', null)); // isolate from earlier pages in this shared context
+    await page.waitForTimeout(100); // let init's baseline-setting settle
+
+    // A change followed by a tick writes a dirty record containing the change.
+    await page.evaluate(() => {
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 61, start: 480, length: 240, vel: 90, ch: 0 });
+      window._TEST_state.projectName = 'wip-song';
+      return window._TEST_autosaveTick();
+    });
+    const rec1 = await page.evaluate(() => window._TEST_idbGet('autosave'));
+    check('autosave tick after a change writes a dirty record with the change in it',
+      rec1 && rec1.dirty === true && rec1.projectName === 'wip-song' && rec1.snapshot.includes('"pitch":61'),
+      rec1 && { dirty: rec1.dirty, projectName: rec1.projectName });
+
+    // A tick with nothing new leaves the stored record untouched.
+    await page.waitForTimeout(20);
+    await page.evaluate(() => window._TEST_autosaveTick());
+    const rec2 = await page.evaluate(() => window._TEST_idbGet('autosave'));
+    check('an autosave tick with no changes does not rewrite the record', rec2.time === rec1.time, { t1: rec1.time, t2: rec2.time });
+
+    // An explicit save supersedes the dirty record.
+    await page.evaluate(() => window._TEST_saveProject());
+    await page.waitForTimeout(150);
+    const rec3 = await page.evaluate(() => window._TEST_idbGet('autosave'));
+    check('Save Project marks the autosave record clean (no restore prompt next startup)', rec3 && rec3.dirty === false, rec3 && rec3.dirty);
+  });
+
+  await withPage(browser, async (page) => {
+    // Accepting the restore prompt brings back the crashed session's work.
+    await page.evaluate(() => window._TEST_idbSet('autosave', null));
+    await page.waitForTimeout(100);
+    const crashedSnap = await page.evaluate(() => {
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 72, start: 0, length: 480, vel: 100, ch: 0 });
+      const s = window._TEST_snapshot();
+      window._TEST_state.notes = []; // "fresh session" — the work only lives in the autosave record now
+      return s;
+    });
+    await page.evaluate((s) => window._TEST_idbSet('autosave', { time: Date.now() - 60000, projectName: 'crash-proj', dirty: true, snapshot: s }), crashedSnap);
+
+    let promptMsg = null;
+    page.once('dialog', d => { promptMsg = d.message(); d.accept(); });
+    const restored = await page.evaluate(() => window._TEST_checkAutosaveRestore());
+    await page.waitForTimeout(100);
+    const after = await page.evaluate(() => ({
+      notes: window._TEST_state.notes.length,
+      projectName: window._TEST_state.projectName,
+    }));
+    const recAfter = await page.evaluate(() => window._TEST_idbGet('autosave'));
+    check('restore prompt names the crashed project and accepting it restores the work',
+      restored === true && promptMsg && promptMsg.includes('crash-proj') && after.notes === 1 && after.projectName === 'crash-proj',
+      { restored, promptMsg, notes: after.notes, projectName: after.projectName });
+    check('an accepted restore re-marks the record clean so the next startup does not re-prompt',
+      recAfter && recAfter.dirty === false, recAfter && recAfter.dirty);
+
+    // The restore itself is one undo step.
+    await page.evaluate(() => window._TEST_undo());
+    const afterUndo = await page.evaluate(() => window._TEST_state.notes.length);
+    check('an accepted restore is undoable', afterUndo === 0, afterUndo);
+  });
+
+  await withPage(browser, async (page) => {
+    // Declining the restore prompt keeps the current state and discards the record.
+    await page.evaluate(() => window._TEST_idbSet('autosave', null));
+    await page.waitForTimeout(100);
+    const crashedSnap = await page.evaluate(() => {
+      window._TEST_state.notes.push({ id: window._TEST_state.nextId++, pitch: 72, start: 0, length: 480, vel: 100, ch: 0 });
+      const s = window._TEST_snapshot();
+      window._TEST_state.notes = [];
+      return s;
+    });
+    await page.evaluate((s) => window._TEST_idbSet('autosave', { time: Date.now() - 60000, projectName: 'crash-proj', dirty: true, snapshot: s }), crashedSnap);
+    page.once('dialog', d => d.dismiss());
+    const restored = await page.evaluate(() => window._TEST_checkAutosaveRestore());
+    await page.waitForTimeout(100);
+    const notes = await page.evaluate(() => window._TEST_state.notes.length);
+    const recAfter = await page.evaluate(() => window._TEST_idbGet('autosave'));
+    check('declining the restore prompt keeps the fresh session and discards the stale record',
+      restored === false && notes === 0 && recAfter && recAfter.dirty === false, { restored, notes, dirty: recAfter && recAfter.dirty });
+
+    // Loading a project also supersedes any dirty autosave.
+    await page.evaluate((s) => window._TEST_idbSet('autosave', { time: Date.now(), projectName: 'x', dirty: true, snapshot: s }), crashedSnap);
+    const proj = JSON.stringify({ version: 1, projectName: 'loaded-proj', audioFile: '', snapshot: JSON.parse(crashedSnap) });
+    await page.evaluate((json) => {
+      const file = new File([json], 'loaded-proj.mmvp', { type: 'application/json' });
+      return window._TEST_loadProject(file);
+    }, proj);
+    await page.waitForTimeout(200);
+    const recAfterLoad = await page.evaluate(() => window._TEST_idbGet('autosave'));
+    check('loading a project marks the autosave record clean', recAfterLoad && recAfterLoad.dirty === false, recAfterLoad && recAfterLoad.dirty);
+  });
+
+  // ---------------- Scheduler: empty pass must not inflate passIndex ----------------
+
+  await withPage(browser, async (page) => {
+    // With nothing schedulable in the pass (no notes, lane muted, metronome
+    // off), passIndex used to increment once per scheduler tick instead of
+    // once per actual loop pass — so events appearing mid-play (metronome
+    // toggled on) landed minutes in the future. It must now stay pinned to
+    // the wall-clock pass (0, for a 100-bar span just started).
+    await page.evaluate(() => {
+      window._TEST_state.metronomeOn = false;
+      window._TEST_state.ccLanes.forEach(l => { l.muted = true; });
+      window.__oscStarts = [];
+      const orig = OscillatorNode.prototype.start;
+      OscillatorNode.prototype.start = function (when) { window.__oscStarts.push({ when, now: this.context.currentTime }); return orig.call(this, when); };
+    });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(500);
+    const passIndex = await page.evaluate(() => window._TEST_sched().passIndex);
+    check('an empty scheduler pass keeps passIndex pinned to the wall clock instead of inflating per tick',
+      passIndex <= 1, passIndex);
+
+    // And the metronome, toggled on over that empty pass, clicks promptly.
+    await page.click('#metroBtn');
+    await page.waitForTimeout(700);
+    const clicks = await page.evaluate(() => window.__oscStarts);
+    await page.evaluate(() => window._TEST_stop());
+    const prompt = clicks.length > 0 && clicks.every(c => c.when - c.now < 5);
+    check('metronome toggled on over an empty pass starts clicking promptly (not minutes in the future)',
+      prompt, { count: clicks.length, first: clicks[0] });
+  });
+
+  // ---------------- Touch long-press on tag/ALL Mute-Solo ----------------
+
+  await withPage(browser, async (page) => {
+    const ids = await page.evaluate(() => [window._TEST_addLane(60, 0), window._TEST_addLane(61, 0)]);
+    await page.evaluate((ids) => {
+      ids.forEach(id => {
+        const inp = document.querySelector(`.lane[data-id="${id}"] input.ltags`);
+        inp.value = 'touchgrp'; inp.dispatchEvent(new Event('change'));
+      });
+      // Mixed starting state: chips hold live lane references, so mutating
+      // after the tag bar is built is fine.
+      window._TEST_state.ccLanes.find(x => x.id === ids[0]).muted = true;
+    }, ids);
+    await page.waitForTimeout(100);
+
+    // A touch long-press fires pointer events but (on most mobile platforms)
+    // NO trailing click — force-on must fire from the pointer path alone.
+    const forced = await page.evaluate(async (ids) => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.includes('touchgrp'));
+      if (!chip) return { error: 'chip not found' };
+      const btn = chip.querySelector('.mute-btn');
+      btn.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'touch', bubbles: true }));
+      await new Promise(r => setTimeout(r, 650));
+      btn.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'touch', bubbles: true }));
+      return ids.map(id => window._TEST_state.ccLanes.find(l => l.id === id).muted);
+    }, ids);
+    check('a touch long-press (pointer events only, no click) force-mutes the whole group',
+      Array.isArray(forced) && forced.every(m => m === true), forced);
+
+    // A quick touch tap (pointerdown/up then the browser's synthesized click)
+    // still smart-toggles: all muted -> all unmuted.
+    const tapped = await page.evaluate(async (ids) => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.includes('touchgrp'));
+      const btn = chip.querySelector('.mute-btn');
+      btn.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'touch', bubbles: true }));
+      await new Promise(r => setTimeout(r, 60));
+      btn.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'touch', bubbles: true }));
+      btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return ids.map(id => window._TEST_state.ccLanes.find(l => l.id === id).muted);
+    }, ids);
+    check('a quick touch tap still smart-toggles the group (all muted -> all unmuted)',
+      Array.isArray(tapped) && tapped.every(m => m === false), tapped);
   });
 
   await browser.close();
