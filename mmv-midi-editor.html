@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.6
+  MMV MIDI & CC Curve Editor v0.9.7
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -241,6 +241,29 @@
   exact tag on every lane that has it (deduping against a tag the lane
   already carries), keeps an active filter selection pointed at the renamed
   tag instead of clearing it, and is a single undo step.
+  v0.9.7 Lane leftcol row reshuffle based on real use of v0.9.6: row 1 is now
+  CC#/PB, Name, the Tag pill, and Minimize/Hide (Channel removed — it was a
+  second bare number sitting next to CC# with nothing to tell them apart at
+  a glance); row 2 is × alone on the left, then Channel, the lane's Colour
+  swatch, Mute, and Solo on the right (the drag-to-reorder handle moved out
+  of row 2); row 3 is the unchanged Val/Pos/Steps content plus the
+  drag-to-reorder handle, now at its end. Channel is a button ("Ch N") that
+  opens a shared popover listing all 16 MIDI channels with their configured
+  names (state.channelNames[]); Channel 16 is flagged amber in that list as
+  a reminder it's reserved for the Follow-MMV sync-track, the same amber
+  used for that same warning elsewhere (Recording Setup). The v0.9.6 lane
+  color "stripe" on the leftcol's own left edge is reverted back to a
+  swatch button (now living in row 2) — it visually collided with the
+  active-lane accent indicator, showing up as two colored slivers side by
+  side; same click-to-cycle-LANE_COLORS behavior either way. Minimizing a
+  lane now shows Expand — Colour — CC# — Name — Move in its top bar
+  (Channel intentionally dropped from this view); the new Move icon is a
+  real drag-to-reorder handle, so a minimized lane can finally be
+  reordered — previously the only handle lived inside the lanebody, which
+  is hidden while minimized. The lane Name and Tags fields now opt out of
+  1Password/LastPass/Bitwarden autofill icons (autocomplete="off" plus each
+  manager's own ignore attribute), which were popping up over typed text in
+  the Name field.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -428,20 +451,31 @@
      lanes (minimized or not) are stacked above/below it. */
   .lane.lane-hidden{height:auto!important;min-height:22px!important;flex-shrink:0!important;}
   /* Below the height that fits all 3 leftcol rows, hide val-row (row 3 —
-     Val/Pos/Steps, the lowest-priority row) outright rather than let it clip
-     mid-row — keeps row 1 (CC/Name/Ch/Tag/Hide) and row 2 (×/Mute/Solo/grip)
-     always fully visible within the lane's own bounds. */
+     Val/Pos/Steps + the drag-to-reorder handle, the lowest-priority row)
+     outright rather than let it clip mid-row — keeps row 1 (CC/Name/Tag/
+     Hide) and row 2 (×/Channel/Colour/Mute/Solo) always fully visible
+     within the lane's own bounds. */
   .lane.lane-compact2 .val-row{display:none!important;}
+  /* Minimized top-bar order: Expand (tb-vis) — Colour (tb-swatch) — CC#
+     (tb-cc) — Name (tb-name, flex:1, fills remaining space) — Move
+     (tb-drag, drag-to-reorder — a minimized lane's .lanebody, and the
+     drag-handle that used to live inside it, is display:none, so without
+     this a minimized lane could never be dragged to reorder). Channel is
+     deliberately NOT shown here. */
   .lane-top-bar{height:22px;display:none;align-items:center;gap:5px;padding:0 6px;background:var(--panel);border-bottom:1px solid var(--line);}
   .lane.lane-hidden .lane-top-bar{display:flex;}
-  .lane-top-bar .tb-swatch{width:10px;height:10px;border-radius:2px;border:1px solid #0004;flex:0 0 auto;}
+  .lane-top-bar .tb-swatch{width:10px;height:10px;border-radius:2px;border:1px solid #0004;flex:0 0 auto;cursor:pointer;}
+  .lane-top-bar .tb-swatch:hover{filter:brightness(1.35);}
   .lane-top-bar .tb-vis{font-size:12px;line-height:1;padding:0 2px;border:none;background:none;cursor:pointer;color:var(--accent2);}
+  .lane-top-bar .tb-cc{flex:0 0 auto;font-size:10px;color:var(--txt2);opacity:.75;white-space:nowrap;}
   .lane-top-bar .tb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--txt2);}
-  .lane-top-bar .tb-meta{flex:0 0 auto;font-size:10px;color:var(--txt2);opacity:.75;white-space:nowrap;}
+  .lane-top-bar .tb-drag{flex:0 0 auto;font-size:12px;line-height:1;padding:0 2px;color:var(--txt2);cursor:grab;user-select:none;}
+  .lane-top-bar .tb-drag:active{cursor:grabbing;}
 
-  /* Lane leftcol — 3 rows: row 1 (CC#/PB, Name, Channel, Tag pill, Hide) on
-     top and last to hide, row 2 (× on the left; Mute/Solo/drag-grip on the
-     right) below it, row 3 (Val/Pos/Steps) hides first as a lane shrinks. */
+  /* Lane leftcol — 3 rows: row 1 (CC#/PB, Name, Tag pill, Hide) on top and
+     last to hide, row 2 (× on the left; Channel/Colour swatch/Mute/Solo on
+     the right) below it, row 3 (Val/Pos/Steps + the drag-to-reorder handle)
+     hides first as a lane shrinks. */
   /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
      overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
      which *still* creates a scroll container). Any non-"visible" overflow-y
@@ -468,19 +502,18 @@
      own row's bounds regardless of row or scrollport size. */
   .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:2px;width:100%;overflow:hidden;}
   .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
-  /* Row 1: CC#/PB, Name, Channel, Tag pill, Hide — all on one line. lname
-     gets the lion's share of extra space (flex weight 2); the tag pill/input
-     share what's left (weight 1) so both shrink together as the column
-     narrows instead of one starving the other. */
+  /* Row 1: CC#/PB, Name, Tag pill, Hide — all on one line. Channel moved to
+     row 2 (see .chn-btn below) so it's no longer a bare number sitting next
+     to CC# where the two could be confused at a glance. lname gets the
+     lion's share of extra space (flex weight 2); the tag pill/input share
+     what's left (weight 1) so both shrink together as the column narrows
+     instead of one starving the other. */
   .lane .leftcol .name-row{padding:2px 0 1px;flex-wrap:nowrap;}
   .lane .leftcol .name-row input.lname{flex:2 1 50px;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   .lane .leftcol .name-row input.ltags{flex:1 1 50px;min-width:0;padding:2px 4px;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
   .lane .leftcol .name-row .ccn{flex:0 0 24px;width:24px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
-  .lane .leftcol .name-row .chn{flex:0 0 20px;width:20px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
   .lane .leftcol .name-row .ccn::-webkit-outer-spin-button,
-  .lane .leftcol .name-row .ccn::-webkit-inner-spin-button,
-  .lane .leftcol .name-row .chn::-webkit-outer-spin-button,
-  .lane .leftcol .name-row .chn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  .lane .leftcol .name-row .ccn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   .lane .leftcol .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
   /* Tag pill — compact colored stand-in for the tag text field, shown until
      clicked (or Enter/Space when focused via keyboard), which swaps it for
@@ -508,19 +541,13 @@
     display:inline-flex;align-items:center;justify-content:center;}
   .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
   .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
-  /* Lane color — a thin (~3px) clickable stripe positioned just inside the
-     leftcol's own left edge, adjacent to (never overlapping) the separate
-     .lane.active .leftcol inset box-shadow accent indicator at x=0-3px, so
-     "this lane is active" and "this lane's color" both stay visible at once
-     instead of one hiding the other. Replaces the old compact-row swatch
-     button — same click-to-cycle-LANE_COLORS behavior. */
-  .lane .leftcol .lane-color-stripe{position:absolute;left:3px;top:0;bottom:0;width:3px;cursor:pointer;z-index:1;}
-  .lane .leftcol .lane-color-stripe:hover{filter:brightness(1.35);}
   /* Row 2: × (delete — the only destructive control) sits alone on the left
-     edge; Mute/Solo/drag-grip group together on the right via
-     .icon-row-right. The space-between split is the visual separation now
-     (replacing the old inline divider) — × can't be hit by accident while
-     reaching for the other icons. Every icon is a real >=16px hit target. */
+     edge; Channel/Colour swatch/Mute/Solo group together on the right via
+     .icon-row-right (the drag-to-reorder handle used to live here too but
+     has moved to row 3 — Channel + the reintroduced colour swatch took its
+     place). The space-between split is the visual separation — × can't be
+     hit by accident while reaching for the other icons. Every icon is a
+     real >=16px hit target. */
   .lane .leftcol .icon-row{gap:3px;padding-bottom:1px;justify-content:space-between;}
   .lane .leftcol .icon-row-right{display:flex;align-items:center;gap:3px;}
   .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle{
@@ -528,6 +555,39 @@
     display:inline-flex;align-items:center;justify-content:center;
     border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
     padding:0;line-height:1;flex-shrink:0;}
+  /* Lane colour — reverted back to a swatch button that lives in row 2
+     (between the Channel button and Mute), same click-to-cycle-LANE_COLORS
+     behavior it always had. The v0.9.6 "thin stripe on the leftcol's own
+     left edge" experiment is gone: it visually collided with the separate
+     .lane.active .leftcol inset box-shadow accent indicator, showing up as
+     two colored slivers side by side on the active lane. */
+  .lane .leftcol .swatch{width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
+    border-radius:4px;border:1px solid var(--line);cursor:pointer;padding:0;flex-shrink:0;}
+  .lane .leftcol .swatch:hover{filter:brightness(1.35);border-color:var(--accent);}
+  /* Channel — a button (not a free-typing number field) labeled "Ch N" that
+     opens the shared #chPopover listing all 16 MIDI channels by number and
+     configured name; see #chPopover below. */
+  .lane .leftcol .chn-btn{height:16px;min-width:30px;box-sizing:border-box;padding:0 5px;font-size:10px;
+    border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
+    flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
+  .lane .leftcol .chn-btn:hover{border-color:var(--accent);color:var(--accent);}
+  .lane .leftcol .chn-btn.ch16{color:#ffb454;border-color:#ffb45488;}
+  /* Shared channel-picker popover — one DOM instance for every lane (the
+     lane list can be long), repositioned via JS from the clicked chn-btn's
+     own getBoundingClientRect() each time it opens. Visual style matches
+     this app's other floating popovers (#recPopover/#tsPanel/#projPopover). */
+  #chPopover{position:fixed;width:190px;max-height:320px;overflow-y:auto;background:var(--panel);
+    border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;
+    box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:700;display:none;flex-direction:column;padding:5px;gap:1px;}
+  #chPopover.open{display:flex;}
+  #chPopover .ch-opt{display:block;width:100%;text-align:left;font-size:11px;padding:4px 8px;
+    border-radius:4px;border:1px solid transparent;background:none;color:var(--txt);cursor:pointer;}
+  #chPopover .ch-opt:hover{background:var(--panel2);border-color:var(--line);}
+  #chPopover .ch-opt.current{background:rgba(79,163,255,.18);color:var(--accent);}
+  /* Channel 16 is reserved for the Follow-MMV sync track — flagged amber
+     here for the same reason (and with the same color) it's flagged in the
+     Recording Setup channel list: #recordBtn.ch16warn / #recCh16Warn. */
+  #chPopover .ch-opt.ch16{color:#ffb454;}
   .lane .leftcol .x:hover,.lane .leftcol .move-btn:hover,.lane .leftcol .drag-handle:hover{
     border-color:var(--line);background:var(--panel2);}
   .lane .leftcol .move-btn{font-size:10px;cursor:pointer;}
@@ -2221,6 +2281,39 @@
     const lane={id,type,cc:cc??(state.ccLanes.length?state.ccLanes[state.ccLanes.length-1].cc+1:1),ch:ch??0,color,name:'',visible:true,
       tags:[...tagFilter],steps:0,muted:false,soloed:false,points:[{t:0,v:ctr}],_preview:null};
     state.ccLanes.push(lane); buildLaneDom(lane); setActiveLane(id); resizeCanvases(); refreshTagBar(); return lane; }
+  // ---------- Channel picker popover (one shared instance for every lane's
+  // Channel button — the lane list can be long, so this is appended once
+  // rather than once per lane, and repositioned via JS from the clicked
+  // button's own getBoundingClientRect() each time it opens, the same way
+  // #genAdvPanel/#recPopover/#tsPanel/#projPopover already float. ----------
+  function ensureChPopover(){
+    let pop=$('chPopover');
+    if(!pop){ pop=document.createElement('div'); pop.id='chPopover'; document.body.appendChild(pop); }
+    return pop;
+  }
+  function closeChPopover(){ const pop=$('chPopover'); if(pop) pop.classList.remove('open'); }
+  function openChPopover(lane,btnEl,onSelect){
+    const pop=ensureChPopover();
+    pop.innerHTML='';
+    for(let ch=0;ch<16;ch++){
+      const name=state.channelNames[ch];
+      const label=(ch+1)+(name?' ('+name+')':'');
+      const opt=document.createElement('button'); opt.type='button';
+      opt.className='ch-opt'+(ch===15?' ch16':'')+(ch===lane.ch?' current':'');
+      opt.textContent=label;
+      if(ch===15) opt.title='Channel 16 is reserved for the Follow MMV sync-track — notes sent here are silently dropped.';
+      opt.addEventListener('click',()=>{ lane.ch=ch; if(onSelect) onSelect(); closeChPopover(); });
+      pop.appendChild(opt);
+    }
+    pop.classList.add('open');
+    const r=btnEl.getBoundingClientRect();
+    const popW=pop.offsetWidth, popH=pop.offsetHeight;
+    let left=r.left, top=r.bottom+3;
+    if(left+popW>window.innerWidth-8) left=Math.max(8,window.innerWidth-popW-8);
+    if(top+popH>window.innerHeight-8) top=Math.max(8,r.top-popH-3);
+    pop.style.left=Math.round(left)+'px'; pop.style.top=Math.round(top)+'px';
+  }
+
   function buildLaneDom(lane){
     const row=document.createElement('div'); row.className='lane'; row.dataset.id=lane.id;
     if(lane.visible===false) row.classList.add('lane-hidden');
@@ -2228,35 +2321,32 @@
     if(!laneAudible(lane)) row.classList.add('lane-dimmed');
 
     // Top bar: always visible, shown only when lane is collapsed (minimized).
-    // Shows custom name, CC#/PB, and channel together so a minimized lane
-    // stays identifiable without un-minimizing it.
+    // Order: Expand — Colour — CC#/PB — Name — Move (drag-to-reorder). A
+    // minimized lane's .lanebody (and the row-3 drag handle inside it) is
+    // display:none, so tb-drag is the only way to reorder a minimized lane;
+    // channel is deliberately not shown here (dropped for space — Channel
+    // now lives behind the row-2 Channel button when the lane is expanded).
     const topBar=document.createElement('div'); topBar.className='lane-top-bar';
     const tbVis=document.createElement('button'); tbVis.className='tb-vis'; tbVis.title='Show lane'; tbVis.textContent='○';
     const tbSwatch=document.createElement('span'); tbSwatch.className='tb-swatch'; tbSwatch.style.background=lane.color;
+    tbSwatch.title='Lane color — click to change';
+    const tbCC=document.createElement('span'); tbCC.className='tb-cc';
+    function updateTbCC(){ tbCC.textContent=laneIsPb(lane)?'PB':'CC'+lane.cc; }
+    updateTbCC();
     const tbName=document.createElement('span'); tbName.className='tb-name';
     tbName.textContent=lane.name||(laneIsPb(lane)?'Pitch Bend':'CC'+lane.cc);
-    const tbMeta=document.createElement('span'); tbMeta.className='tb-meta';
-    function updateTbMeta(){ tbMeta.textContent=(laneIsPb(lane)?'PB':'CC'+lane.cc)+' Ch'+(lane.ch+1); }
-    updateTbMeta();
-    topBar.appendChild(tbVis); topBar.appendChild(tbSwatch); topBar.appendChild(tbName); topBar.appendChild(tbMeta);
+    const tbDrag=document.createElement('span'); tbDrag.className='tb-drag'; tbDrag.textContent='⠿'; tbDrag.title='Drag to reorder';
+    topBar.appendChild(tbVis); topBar.appendChild(tbSwatch); topBar.appendChild(tbCC); topBar.appendChild(tbName); topBar.appendChild(tbDrag);
 
     const grip=document.createElement('div'); grip.className='grip'; grip.title='Drag to resize this lane';
     const body=document.createElement('div'); body.className='lanebody';
     const left=document.createElement('div'); left.className='leftcol';
 
-    // Lane color used to live as a swatch button inside the row content; it's
-    // now a thin clickable stripe on the leftcol's own left edge (see
-    // .lane-color-stripe), positioned just inside the active-lane accent
-    // indicator (.lane.active .leftcol's inset box-shadow) so both signals —
-    // "this is the active lane" and "this is this lane's color" — stay
-    // visible at the same time instead of one overriding the other.
-    const colorStripe=document.createElement('div'); colorStripe.className='lane-color-stripe';
-    colorStripe.style.background=lane.color; colorStripe.title='Lane color — click to change';
-
-    // Row 1 (top — last to disappear as lane shrinks): CC#/PB, Name, Channel,
-    // Tag pill, then the Minimize/Hide icon. This is the lane's primary
-    // identifier row; it fits comfortably now that the leftcol defaults to
-    // a much wider 300px column.
+    // Row 1 (top — last to disappear as lane shrinks): CC#/PB, Name, Tag
+    // pill, then the Minimize/Hide icon. Channel is NOT here (see row 2's
+    // Channel button below) — with both CC# and Channel as bare numbers
+    // close together in row 1, users couldn't tell which was which at a
+    // glance; splitting them across rows fixes that.
     const nameRow=document.createElement('div'); nameRow.className='lr name-row';
     let ccn=null;
     if(laneIsPb(lane)){
@@ -2271,10 +2361,12 @@
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
     lname.placeholder=laneIsPb(lane)?'Pitch Bend':(ccName(lane.cc)||'Lane name…');
     lname.value=lane.name; lname.title=laneIsPb(lane)?'Pitch Bend (±8192, 14-bit)':ccName(lane.cc);
+    // Free-text field a password manager (1Password/LastPass/Bitwarden) can
+    // mistake for a login field, dropping an autofill icon on top of the
+    // typed text — opt out with every ignore attribute each one respects.
+    lname.autocomplete='off'; lname.setAttribute('data-1p-ignore','true');
+    lname.setAttribute('data-lpignore','true'); lname.setAttribute('data-bwignore','true');
     nameRow.appendChild(lname);
-    const chn=document.createElement('input'); chn.type='number'; chn.className='chn'; chn.min=1; chn.max=16; chn.value=lane.ch+1;
-    chn.title='MIDI Channel';
-    nameRow.appendChild(chn);
     // Tags display as a compact colored pill (name + count truncated with a
     // title tooltip) instead of an always-open text field — the field is
     // only shown while actively editing. Same underlying data model/commit
@@ -2283,6 +2375,9 @@
     ltags.placeholder='#tags'; ltags.value=laneTagList(lane).join(', ');
     ltags.title='Tags (comma separated) — filter lanes with the Show: bar above';
     ltags.style.display='none';
+    // Same free-text field, same password-manager false-positive risk.
+    ltags.autocomplete='off'; ltags.setAttribute('data-1p-ignore','true');
+    ltags.setAttribute('data-lpignore','true'); ltags.setAttribute('data-bwignore','true');
     const tagPill=document.createElement('span'); tagPill.className='tag-pill'; tagPill.tabIndex=0;
     const tagDot=document.createElement('span'); tagDot.className='tag-pill-dot'; tagDot.style.background=lane.color;
     const tagText=document.createElement('span'); tagText.className='tag-pill-text';
@@ -2303,22 +2398,37 @@
     nameRow.appendChild(hideBtn);
 
     // Row 2: Delete (×) — the only destructive control — sits alone on the
-    // left edge, deliberately separated from Mute/Solo/drag-grip which group
-    // together on the right, so × can never be hit by accident while
-    // reaching for the other icons. Every icon here is a real >=16px hit
-    // target with visible spacing between them.
+    // left edge; Channel button, Colour swatch, Mute, Solo group together
+    // on the right, so × can never be hit by accident while reaching for
+    // the other icons. Every icon here is a real >=16px hit target with
+    // visible spacing between them.
     const iconRow=document.createElement('div'); iconRow.className='lr icon-row';
     const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
+    // Channel — a button (not a free-typing number field) that opens the
+    // shared #chPopover listing all 16 MIDI channels by number + configured
+    // name (see openChPopover below).
+    const chnBtn=document.createElement('button'); chnBtn.className='chn-btn'; chnBtn.type='button';
+    function updateChnBtn(){
+      chnBtn.textContent='Ch'+(lane.ch+1);
+      chnBtn.classList.toggle('ch16',lane.ch===15);
+      chnBtn.title=lane.ch===15
+        ? 'MIDI Channel 16 — reserved for the Follow MMV sync-track. Click to change.'
+        : 'MIDI Channel — click to change';
+    }
+    updateChnBtn();
+    chnBtn.addEventListener('click',e=>{ e.stopPropagation(); openChPopover(lane,chnBtn,()=>{ updateChnBtn(); }); });
+    const swatch=document.createElement('button'); swatch.className='swatch'; swatch.type='button';
+    swatch.style.background=lane.color; swatch.title='Lane color — click to change';
     const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
     const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
-    const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
     const iconRowRight=document.createElement('span'); iconRowRight.className='icon-row-right';
-    iconRowRight.appendChild(muteBtn); iconRowRight.appendChild(soloBtn); iconRowRight.appendChild(dragHandle);
+    iconRowRight.appendChild(chnBtn); iconRowRight.appendChild(swatch); iconRowRight.appendChild(muteBtn); iconRowRight.appendChild(soloBtn);
     iconRow.appendChild(xBtn); iconRow.appendChild(iconRowRight);
 
-    // Row 3: Val + Pos (+ Steps) — saves vertical space when many lanes are
-    // open. Steps lives here since it's the primary way to set it, so it
-    // needs its own room. Unchanged content/behavior — just row 3 of 3 now.
+    // Row 3: Val + Pos (+ Steps), then the drag-to-reorder handle at the
+    // end — it's not in row 1 or row 2 anymore, so it lands here. Steps
+    // lives here since it's the primary way to set it, so it needs its own
+    // room. Val/Pos/Steps content/behavior is otherwise unchanged.
     const valRow=document.createElement('div'); valRow.className='lr val-row';
     const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input'; valInput.style.cssText='width:46px;min-width:46px;flex:0 0 46px;';
@@ -2334,8 +2444,9 @@
     const stpLbl=document.createElement('span'); stpLbl.textContent='S'; stpLbl.title='Steps (snap-to-value)'; stpLbl.style.flexShrink='0';
     const stepsInput=document.createElement('input'); stepsInput.type='number'; stepsInput.className='stepsn'; stepsInput.min=0;
     stepsInput.value=lane.steps||0; stepsInput.placeholder='0';
+    const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
     valRow.appendChild(valLbl); valRow.appendChild(valInput); valRow.appendChild(stepBadge); valRow.appendChild(posLbl); valRow.appendChild(posInput);
-    valRow.appendChild(stpLbl); valRow.appendChild(stepsInput);
+    valRow.appendChild(stpLbl); valRow.appendChild(stepsInput); valRow.appendChild(dragHandle);
 
     // Wrapped so it can be sticky-centered within the lane row: when a lane is
     // resized very tall (Alt+wheel), the row can exceed the viewport, and
@@ -2343,7 +2454,7 @@
     // scroll out of view while the lane's curve is still on screen.
     const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
     leftInner.appendChild(nameRow); leftInner.appendChild(iconRow); leftInner.appendChild(valRow);
-    left.appendChild(colorStripe); left.appendChild(leftInner);
+    left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
 
     const sc=document.createElement('div'); sc.className='scroll hx';
@@ -2392,10 +2503,9 @@
         lname.title=name;
         if(!lane.name){ lname.placeholder=name||'Lane name…'; }
         tbName.textContent=lane.name||'CC'+lane.cc;
-        updateTbMeta();
+        updateTbCC();
       });
     }
-    chn.addEventListener('input',ev=>{ lane.ch=clamp((+ev.target.value||1)-1,0,15); updateTbMeta(); });
     // Steps ("snap-to"): 0/1 = off (full granularity). Committed on
     // blur/Enter (not live on every keystroke) because the floor of 2 would
     // otherwise fight you mid-type — e.g. typing "12" would jump to 2 the
@@ -2412,20 +2522,29 @@
       pushUndo(); updateLaneValInput(lane); requestDraw();
     });
     stepsInput.addEventListener('keydown',e=>{ if(e.key==='Enter') stepsInput.blur(); });
-    // Lane color cycles through LANE_COLORS on click — same interaction the
-    // old compact-row swatch button had, now on the leftcol's color stripe.
-    colorStripe.addEventListener('click',()=>{
+    // Lane color cycles through LANE_COLORS on click — reverted from the
+    // v0.9.6 color-stripe back to a swatch button in row 2 (same
+    // click-to-cycle behavior). Every element showing this lane's color
+    // (row 2's swatch, the top-bar swatch, the tag-pill dot) stays in sync;
+    // clicking either swatch has the same effect.
+    function cycleColor(){
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
-      colorStripe.style.background=lane.color; tbSwatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
-    });
+      swatch.style.background=lane.color; tbSwatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
+    }
+    swatch.addEventListener('click',cycleColor);
+    tbSwatch.addEventListener('click',cycleColor);
     xBtn.addEventListener('click',()=>{ if(!confirm('Delete CC Lane?')) return; pushUndo(); removeLane(lane.id); });
     lane._muteBtn=muteBtn; lane._soloBtn=soloBtn;
     muteBtn.addEventListener('click',()=>toggleLaneMuted(lane));
     soloBtn.addEventListener('click',()=>toggleLaneSoloed(lane));
 
-    // Drag-to-reorder via the ⠿ handle
+    // Drag-to-reorder — via the row-3 ⠿ handle when expanded, or the
+    // top-bar's ⠿ handle when minimized (a minimized lane's .lanebody, and
+    // the row-3 handle inside it, is display:none, so without this a
+    // minimized lane could never be dragged to a new position).
     let _dragSrcId=null;
     dragHandle.addEventListener('mousedown',()=>{ row.draggable=true; });
+    tbDrag.addEventListener('mousedown',()=>{ row.draggable=true; });
     row.addEventListener('dragstart',e=>{ _dragSrcId=lane.id; e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain',lane.id); row.style.opacity='0.5'; });
     row.addEventListener('dragend',()=>{ row.draggable=false; row.style.opacity=''; document.querySelectorAll('.lane').forEach(r=>r.classList.remove('drag-over-top','drag-over-bot')); });
     row.addEventListener('dragover',e=>{ if(_dragSrcId===lane.id) return; e.preventDefault(); e.dataTransfer.dropEffect='move';
@@ -5380,11 +5499,13 @@
       el.addEventListener('input',e=>{ state[key]=clamp(+e.target.value||0,0,127); drawAbPreview(); });
     });
 
+    ensureChPopover();
     document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; }
       if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; }
       if(!$('recWrapper').contains(e.target)){ $('recPopover').classList.remove('open'); }
-      if(!$('projWrapper').contains(e.target)){ $('projPopover').classList.remove('open'); } });
-    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); } });
+      if(!$('projWrapper').contains(e.target)){ $('projPopover').classList.remove('open'); }
+      if(!$('chPopover').contains(e.target)){ closeChPopover(); } });
+    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); closeChPopover(); } });
     window.addEventListener('resize',resizeCanvases); resizeCanvases();
     attachGrip($('gripVel'), $('velRow'), ()=>velCanvas, ()=>velScroll, 'down');
     (()=>{ const sp=$('prSplitter'),pr=document.querySelector('.piano-row'); let spd=null;

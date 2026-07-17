@@ -1230,48 +1230,62 @@ async function run() {
 
   await withPage(browser, async (page) => {
     // Minimizing a lane (the ● hide button) collapses it to a single top-bar
-    // row that shows the custom name, CC number, and MIDI channel together —
-    // not just the name — so a minimized lane stays identifiable.
+    // row: Expand — Colour — CC# — Name — Move. Channel is intentionally
+    // dropped from this view (it now lives behind row 2's Channel button
+    // when expanded), so the minimized top-bar shows the custom name and
+    // CC# but no channel — and gains a real Move (drag-reorder) icon that
+    // didn't exist before (the old drag handle only lived in the
+    // now-hidden lanebody, so a minimized lane could never be reordered).
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
     await page.fill('.lane input.lname', 'sequenceProgress');
     await page.dispatchEvent('.lane input.lname', 'input');
-    await page.fill('.lane .name-row .chn', '3');
-    await page.dispatchEvent('.lane .name-row .chn', 'input');
-    await page.waitForTimeout(50);
+    // Set the channel via the popover flow (channel is no longer a
+    // fill-able number input) so we can prove it's still tracked correctly
+    // even though it's not shown while minimized.
+    await page.click('.lane .chn-btn');
+    await page.waitForTimeout(30);
+    await page.click('#chPopover .ch-opt:nth-child(3)'); // "3" (index 2 = channel 3)
+    await page.waitForTimeout(30);
     // Real pointer click, not a dispatched one: proving every icon is a
     // real, unclipped hit target — see the "hittable at real pointer
     // coordinates" test below, which proves this for every icon in the row.
     await page.click('.lane .move-btn[title="Hide lane"]');
     await page.waitForTimeout(50);
-    const info = await page.evaluate(() => {
+    const info = await page.evaluate((id) => {
       const row = document.querySelector('.lane');
       return {
         hidden: row.classList.contains('lane-hidden'),
         name: row.querySelector('.tb-name').textContent,
-        meta: row.querySelector('.tb-meta').textContent,
+        cc: row.querySelector('.tb-cc').textContent,
+        hasMoveIcon: !!row.querySelector('.tb-drag'),
+        topBarText: row.querySelector('.lane-top-bar').textContent,
+        laneCh: window._TEST_state.ccLanes.find(l => l.id === id).ch,
       };
-    });
-    check('minimized lane top-bar shows custom name plus CC# and Channel',
-      info.hidden && info.name === 'sequenceProgress' && /CC\d+/.test(info.meta) && info.meta.includes('Ch3'), info);
+    }, laneId);
+    check('minimized lane top-bar shows custom name plus CC#, and a Move icon — but no Channel',
+      info.hidden && info.name === 'sequenceProgress' && /^CC\d+$/.test(info.cc) && info.hasMoveIcon
+      && !/Ch\d/.test(info.topBarText) && info.laneCh === 2, info);
   });
 
   // ---------------- Lane icon ergonomics (item 4) ----------------
 
   await withPage(browser, async (page) => {
-    // Every per-lane icon button (M, S, hide ●, drag grip, delete ×, and the
-    // lane color stripe) must be a real, unclipped, >=16px (or, for the
-    // stripe, genuinely clickable) hit target that a genuine pointer click
-    // can land on. Row 2's layout is a deliberate split: × alone on the far
-    // left, Mute/Solo/grip grouped on the far right — proven here by real
-    // coordinates, not just class presence.
+    // Every per-lane icon/button in row 2 (Channel, Colour swatch, M, S,
+    // hide ●, delete ×) must be a real, unclipped, >=16px hit target that a
+    // genuine pointer click can land on. Row 2's layout is a deliberate
+    // split: × alone on the far left, Channel/swatch/Mute/Solo grouped on
+    // the far right — proven here by real coordinates, not just class
+    // presence. The drag-to-reorder handle is no longer in row 2 (it moved
+    // to row 3) so it's tested separately below.
     const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
     await page.waitForTimeout(50);
     const sel = {
       mute: `.lane[data-id="${laneId}"] .mute-btn`,
       solo: `.lane[data-id="${laneId}"] .solo-btn`,
       hide: `.lane[data-id="${laneId}"] .move-btn[title="Hide lane"]`,
-      drag: `.lane[data-id="${laneId}"] .drag-handle`,
+      chn: `.lane[data-id="${laneId}"] .chn-btn`,
+      swatch: `.lane[data-id="${laneId}"] .icon-row .swatch`,
       del: `.lane[data-id="${laneId}"] .x`,
-      stripe: `.lane[data-id="${laneId}"] .lane-color-stripe`,
     };
 
     const hittable = await page.evaluate((sel) => {
@@ -1287,30 +1301,30 @@ async function run() {
       }
       return out;
     }, sel);
-    check('every per-lane icon (M/S/hide/drag/×/color-stripe) has a real, unclipped hit target at its own screen coordinates',
+    check('every per-lane row-2 icon (M/S/hide/×/Channel/swatch) has a real, unclipped hit target at its own screen coordinates',
       Object.values(hittable).every(Boolean), hittable);
 
     const sizes = await page.evaluate((sel) => {
       const out = {};
-      for (const k of ['mute', 'solo', 'hide', 'drag', 'del']) {
+      for (const k of ['mute', 'solo', 'hide', 'del', 'chn', 'swatch']) {
         const r = document.querySelector(sel[k]).getBoundingClientRect();
         out[k] = { w: Math.round(r.width), h: Math.round(r.height) };
       }
       return out;
     }, sel);
-    check('per-lane M/S/hide/drag/× icons are all >=16px hit targets',
+    check('per-lane M/S/hide/×/Channel/swatch icons are all >=16px hit targets',
       Object.values(sizes).every(s => s.w >= 16 && s.h >= 16), sizes);
 
     // Row 2's deliberate left/right split: × sits strictly left of the
-    // Mute/Solo/grip cluster (Mute left of Solo left of grip), proving the
-    // new layout — not just that all the icons exist somewhere in the row.
+    // Channel/swatch/Mute/Solo cluster, in that order — proving the new
+    // layout, not just that all the icons exist somewhere in the row.
     const positions = await page.evaluate((sel) => {
       const out = {};
       for (const [k, s] of Object.entries(sel)) { out[k] = document.querySelector(s).getBoundingClientRect().left; }
       return out;
     }, sel);
-    check('row 2 layout: × is left of Mute, which is left of Solo, which is left of the drag grip',
-      positions.del < positions.mute && positions.mute < positions.solo && positions.solo < positions.drag, positions);
+    check('row 2 layout: × is left of Channel, which is left of the colour swatch, which is left of Mute, which is left of Solo',
+      positions.del < positions.chn && positions.chn < positions.swatch && positions.swatch < positions.mute && positions.mute < positions.solo, positions);
 
     // Real Playwright pointer clicks (no force:true, no dispatchEvent) must
     // actually land and trigger the real behavior, not just report a
@@ -1327,34 +1341,202 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // The lane color stripe replaces the old compact-row swatch button —
-    // same click-to-cycle-LANE_COLORS behavior, now via a real pointer click
-    // on the thin stripe at the leftcol's own left edge.
+    // The drag-to-reorder handle moved out of row 2 into row 3 (appended
+    // after Steps) since it's no longer in row 1 or row 2. Still a real,
+    // unclipped, >=16px hit target.
+    const laneId = await page.evaluate(() => window._TEST_addLane(31, 0));
+    await page.waitForTimeout(50);
+    const info = await page.evaluate((id) => {
+      const row = document.querySelector(`.lane[data-id="${id}"]`);
+      const drag = row.querySelector('.val-row .drag-handle');
+      if (!drag) return { found: false };
+      const r = drag.getBoundingClientRect();
+      const stepsRect = row.querySelector('.val-row .stepsn').getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const hit = document.elementFromPoint(cx, cy);
+      return {
+        found: true,
+        w: Math.round(r.width), h: Math.round(r.height),
+        hittable: !!hit && (hit === drag || drag.contains(hit) || hit.contains(drag)),
+        afterSteps: r.left >= stepsRect.left,
+      };
+    }, laneId);
+    check('row 3 (Val/Pos/Steps) ends with a real, unclipped, >=16px drag-to-reorder handle positioned after Steps',
+      info.found && info.w >= 16 && info.h >= 16 && info.hittable && info.afterSteps, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // Lane colour reverted from the v0.9.6 stripe back to a swatch button
+    // in row 2 — same click-to-cycle-LANE_COLORS behavior via a real
+    // pointer click, and every element showing this lane's color (row 2's
+    // swatch, the top-bar swatch, the tag-pill dot) stays in sync.
     const laneId = await page.evaluate(() => window._TEST_addLane(40, 0));
     await page.waitForTimeout(50);
     const before = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
-    await page.click(`.lane[data-id="${laneId}"] .lane-color-stripe`);
+    await page.click(`.lane[data-id="${laneId}"] .icon-row .swatch`);
     await page.waitForTimeout(30);
-    const after = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
-    check('a real pointer click on the lane color stripe cycles the lane\'s color (same behavior as the old swatch button)',
-      after !== before, { before, after });
-
-    // Active-lane accent and lane color must both stay visible at once —
-    // the color stripe sits just inside the .lane.active box-shadow accent
-    // indicator, not on top of/replacing it.
-    await page.evaluate((id) => { const l = window._TEST_state.ccLanes.find(x => x.id === id); document.querySelector(`.lane[data-id="${id}"]`).dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); }, laneId);
-    await page.waitForTimeout(30);
-    const signals = await page.evaluate((id) => {
-      const lc = document.querySelector(`.lane[data-id="${id}"].active .leftcol`);
-      const stripe = lc && lc.querySelector('.lane-color-stripe');
+    const after = await page.evaluate((id) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === id);
+      const row = document.querySelector(`.lane[data-id="${id}"]`);
       return {
-        isActive: !!lc,
-        boxShadow: lc ? getComputedStyle(lc).boxShadow : null,
-        stripeVisible: stripe ? (stripe.getBoundingClientRect().width > 0 && getComputedStyle(stripe).backgroundColor) : null,
+        color: lane.color,
+        rowSwatchBg: getComputedStyle(row.querySelector('.icon-row .swatch')).backgroundColor,
+        tbSwatchBg: getComputedStyle(row.querySelector('.tb-swatch')).backgroundColor,
+        tagDotBg: getComputedStyle(row.querySelector('.tag-pill-dot')).backgroundColor,
       };
     }, laneId);
-    check('the active-lane accent indicator and the lane-color stripe are both present simultaneously (neither overrides the other)',
-      signals.isActive && signals.boxShadow && signals.boxShadow !== 'none' && !!signals.stripeVisible, signals);
+    check('a real pointer click on the row-2 colour swatch cycles the lane\'s color',
+      after.color !== before, { before, after });
+    check('cycling the colour keeps the row-2 swatch, top-bar swatch, and tag-pill dot all in sync',
+      after.rowSwatchBg === after.tbSwatchBg && after.tbSwatchBg === after.tagDotBg, after);
+
+    // Clicking the top-bar swatch (available when the lane is minimized)
+    // cycles color too, for consistency with row 2's swatch.
+    const beforeTb = after.color;
+    await page.click(`.lane[data-id="${laneId}"] .move-btn[title="Hide lane"]`);
+    await page.waitForTimeout(30);
+    await page.click(`.lane[data-id="${laneId}"] .tb-swatch`);
+    await page.waitForTimeout(30);
+    const afterTb = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
+    check('a real pointer click on the minimized lane\'s top-bar swatch also cycles the lane\'s color',
+      afterTb !== beforeTb, { beforeTb, afterTb });
+  });
+
+  // ---------------- Channel picker popover ----------------
+
+  await withPage(browser, async (page) => {
+    // Channel is now a button (not a free-typing number input) that opens a
+    // shared popover listing all 16 MIDI channels by number and configured
+    // name (state.channelNames[]), matching the "N (name)" convention
+    // already used by the View Ch select / Recording Setup select.
+    await page.evaluate(() => {
+      window._TEST_state.channelNames[0] = 'Kick';
+      window._TEST_state.channelNames[15] = 'Sync Track';
+    });
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const btnLabelBefore = await page.evaluate(() => document.querySelector('.lane .chn-btn').textContent);
+    check('the Channel control in row 2 is a button labeled "Ch N", not a number input',
+      btnLabelBefore === 'Ch1', btnLabelBefore);
+
+    await page.click('.lane .chn-btn');
+    await page.waitForTimeout(30);
+    const popState = await page.evaluate(() => {
+      const pop = document.getElementById('chPopover');
+      const opts = [...pop.querySelectorAll('.ch-opt')];
+      return {
+        open: pop.classList.contains('open'),
+        count: opts.length,
+        firstLabel: opts[0].textContent,
+        ch16Label: opts[15].textContent,
+        ch16IsAmber: getComputedStyle(opts[15]).color,
+        otherColor: getComputedStyle(opts[1]).color,
+        ch16HasWarnClass: opts[15].classList.contains('ch16'),
+      };
+    });
+    check('clicking the Channel button opens a popover listing all 16 MIDI channels with their configured names',
+      popState.open && popState.count === 16 && popState.firstLabel === '1 (Kick)' && popState.ch16Label === '16 (Sync Track)', popState);
+    check('Channel 16 in the popover is visually flagged amber (reserved for the Follow-MMV sync track)',
+      popState.ch16HasWarnClass && popState.ch16IsAmber !== popState.otherColor && popState.ch16IsAmber === 'rgb(255, 180, 84)', popState);
+
+    // Selecting a channel updates lane.ch, the button's own label, and
+    // closes the popover.
+    await page.click('#chPopover .ch-opt:nth-child(5)'); // "5 (...)" = channel index 4
+    await page.waitForTimeout(30);
+    const afterSelect = await page.evaluate((id) => ({
+      ch: window._TEST_state.ccLanes.find(l => l.id === id).ch,
+      btnLabel: document.querySelector('.lane .chn-btn').textContent,
+      popoverOpen: document.getElementById('chPopover').classList.contains('open'),
+    }), laneId);
+    check('selecting a channel in the popover updates lane.ch, the button label, and closes the popover',
+      afterSelect.ch === 4 && afterSelect.btnLabel === 'Ch5' && !afterSelect.popoverOpen, afterSelect);
+  });
+
+  await withPage(browser, async (page) => {
+    // The channel popover closes on outside click and on Escape, matching
+    // how #recPopover/#tsPanel/#projPopover already behave.
+    await page.click('.lane .chn-btn');
+    await page.waitForTimeout(30);
+    const openBefore = await page.evaluate(() => document.getElementById('chPopover').classList.contains('open'));
+    await page.mouse.click(5, 5); // far corner, outside the popover and the button
+    await page.waitForTimeout(30);
+    const closedAfterOutsideClick = await page.evaluate(() => !document.getElementById('chPopover').classList.contains('open'));
+    check('the channel popover opens on click and closes on an outside click',
+      openBefore && closedAfterOutsideClick, { openBefore, closedAfterOutsideClick });
+
+    await page.click('.lane .chn-btn');
+    await page.waitForTimeout(30);
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(30);
+    const closedAfterEscape = await page.evaluate(() => !document.getElementById('chPopover').classList.contains('open'));
+    check('the channel popover closes on Escape',
+      closedAfterEscape, closedAfterEscape);
+  });
+
+  // ---------------- Minimized-lane drag-to-reorder (item 4) ----------------
+
+  await withPage(browser, async (page) => {
+    // A minimized lane can now genuinely be dragged to a new position via
+    // its top-bar's Move icon — previously the only drag handle lived
+    // inside the (display:none-while-minimized) lanebody, so a minimized
+    // lane could not be reordered at all. This drives a real HTML5 DnD
+    // sequence (mousedown on the handle arms row.draggable, then
+    // dragstart/dragover/drop on the target row) rather than just checking
+    // the element exists.
+    const idA = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const idB = await page.evaluate(() => window._TEST_addLane(50, 0));
+    await page.waitForTimeout(50);
+    // Minimize lane B and confirm its Move icon is now the only way to grab it.
+    await page.click(`.lane[data-id="${idB}"] .move-btn[title="Hide lane"]`);
+    await page.waitForTimeout(50);
+    const orderBefore = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
+    const result = await page.evaluate(({ idA, idB }) => {
+      const rowA = document.querySelector(`.lane[data-id="${idA}"]`);
+      const rowB = document.querySelector(`.lane[data-id="${idB}"]`);
+      const dragHandle = rowB.querySelector('.tb-drag');
+      if (!dragHandle) return { error: 'no tb-drag handle on minimized lane' };
+      dragHandle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      if (!rowB.draggable) return { error: 'row.draggable not armed by tb-drag mousedown', draggable: rowB.draggable };
+      const dt = new DataTransfer();
+      rowB.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      const r = rowA.getBoundingClientRect();
+      rowA.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, clientY: r.top + 1, dataTransfer: dt }));
+      rowA.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, clientY: r.top + 1, dataTransfer: dt }));
+      rowB.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      return { ok: true };
+    }, { idA, idB });
+    await page.waitForTimeout(50);
+    const orderAfter = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
+    check('the minimized lane top-bar\'s Move icon actually enables drag-to-reorder (a functional drag, not just element presence)',
+      !result.error && orderBefore.indexOf(idB) > orderBefore.indexOf(idA) && orderAfter.indexOf(idB) < orderAfter.indexOf(idA),
+      { result, orderBefore, orderAfter });
+  });
+
+  // ---------------- Password-manager opt-out attributes ----------------
+
+  await withPage(browser, async (page) => {
+    // 1Password/LastPass/Bitwarden autofill icons collided with the lane
+    // Name field's typed text; both free-text fields (Name, Tags) opt out
+    // with every ignore attribute each password manager respects. Number/
+    // select inputs (CC#, Steps, Val, Pos) deliberately do NOT get these —
+    // password managers don't target them.
+    const attrs = await page.evaluate(() => {
+      const lname = document.querySelector('.lane input.lname');
+      const ltags = document.querySelector('.lane input.ltags');
+      const ccn = document.querySelector('.lane input.ccn');
+      const get = (el) => ({
+        autocomplete: el.getAttribute('autocomplete'),
+        onep: el.getAttribute('data-1p-ignore'),
+        lp: el.getAttribute('data-lpignore'),
+        bw: el.getAttribute('data-bwignore'),
+      });
+      return { lname: get(lname), ltags: get(ltags), ccnHasAny: !!(ccn.getAttribute('data-1p-ignore') || ccn.getAttribute('data-lpignore') || ccn.getAttribute('data-bwignore')) };
+    });
+    check('the lane Name field carries autocomplete=off + 1Password/LastPass/Bitwarden ignore attributes',
+      attrs.lname.autocomplete === 'off' && attrs.lname.onep === 'true' && attrs.lname.lp === 'true' && attrs.lname.bw === 'true', attrs.lname);
+    check('the lane Tags field carries autocomplete=off + 1Password/LastPass/Bitwarden ignore attributes',
+      attrs.ltags.autocomplete === 'off' && attrs.ltags.onep === 'true' && attrs.ltags.lp === 'true' && attrs.ltags.bw === 'true', attrs.ltags);
+    check('the CC number input (a non-free-text field) does not carry password-manager ignore attributes',
+      !attrs.ccnHasAny, attrs.ccnHasAny);
   });
 
   await withPage(browser, async (page) => {
