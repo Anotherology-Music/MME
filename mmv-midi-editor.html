@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.8
+  MMV MIDI & CC Curve Editor v0.9.9
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -274,6 +274,35 @@
   non-crushed floor (60px, matching the existing grip-drag minimum)
   regardless of how many lanes exist, and the lane list scrolls for the
   rest exactly as it already could.
+  v0.9.9 CC lane leftcol redesigned again, based on real use of v0.9.7/
+  v0.9.8: row 1 (Minimize/Maximize toggle, "CC"-labeled CC#/PB, Name,
+  Channel, Colour) now sits in its own full-width strip ABOVE the lane's
+  curve canvas, instead of inside the leftcol column — it's the same real
+  controls whether the lane is expanded or minimized, not a separate
+  duplicate. Row 2 is × (delete) alone on the left, then Value/Position/
+  Steps/Mute/Solo grouped on the right (Channel and Colour moved out to row
+  1). Row 3 is the Tag pill (click-to-edit, unchanged behavior) with the
+  drag-to-reorder handle aligned to its right edge.
+  Minimize/Maximize is now ONE real two-state toggle button (▾ expanded /
+  ▸ minimized, using the same .on convention as Mute/Solo) instead of a
+  one-way ● Hide button paired with a separate ○ Show button that only
+  existed in a duplicate minimized-only top bar. That duplicate — the old
+  .lane-top-bar and its tb-vis/tb-swatch/tb-cc/tb-name/tb-drag elements —
+  is gone entirely: minimizing a lane now just hides row 2, row 3, and the
+  curve canvas, leaving row 1's own CC/Name/Channel/Colour controls doing
+  double duty as the minimized view. One consequence: a minimized lane's
+  drag-to-reorder handle (row 3) is hidden along with the rest of the
+  lanebody, so reordering a minimized lane now requires maximizing it
+  first — the old top-bar's duplicate handle that made that possible
+  without expanding is gone with the rest of the top bar.
+  LANE_MIN_H/LANE_FULL_H (the grip-drag shrink floors) and the minimized-
+  lane height floor are retuned for the new structure — row 1's own
+  min-height replaces the old top-bar's hardcoded 22px, and the same
+  fixed-floor + flex-shrink:0 pattern that fixed the v0.9.2/v0.9.8
+  lane-crushing defects is applied to it, so many lanes minimized at once
+  (or many expanded at once, re-verified) still can't be crushed toward
+  0px. Shrinking an expanded lane via the grip or Alt+wheel still floors at
+  rows 1+2, with row 3 (now Tag+Move) hiding first, same policy as before.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -349,7 +378,7 @@
   .lane.lane-ch-filtered .grip{display:none!important;}
   .lane.lane-ch-filtered .lanebody{display:none!important;}
   .lane.lane-ch-filtered{height:auto!important;min-height:0!important;}
-  .lane.lane-ch-filtered .lane-top-bar{display:flex;opacity:0.35;}
+  .lane.lane-ch-filtered .lane-row1{opacity:0.35;}
   /* shared */
   .group{display:flex;align-items:center;gap:6px;}
   .group .lbl{color:var(--txt2);font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
@@ -442,154 +471,86 @@
      This is unrelated to how far an individual .lane item can shrink; see
      .lane below for that. */
   .lanes{display:flex;flex-direction:column;flex:1 1 0;min-height:0;overflow-y:auto;}
-  /* min-height:60px + flex-shrink:0 (not the flexbox default min-height:0 +
+  /* min-height:64px + flex-shrink:0 (not the flexbox default min-height:0 +
      shrink:1) is deliberate: with a plain min-height:0, once enough lanes'
      combined 92px-each height exceeded .lanes' available space (e.g. a
      27-lane ISF import into a normal-height window), the flex algorithm
      crushed every lane down toward 0px instead of leaving .lanes' own
      overflow-y:auto to scroll — same defect already fixed for .lane-hidden
-     below, just never applied to ordinary expanded lanes. 60px matches
-     LANE_MIN_H (the grip-drag floor) so a lane can still be manually
-     shrunk that far, but nothing — pure lane count included — can crush it
-     smaller than that; the container scrolls instead, as it already could. */
-  .lane{height:92px;min-height:60px;flex-shrink:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
+     below, just never applied to ordinary expanded lanes. 64px matches
+     LANE_MIN_H (the grip-drag floor, row 1 + row 2's own natural minimum)
+     so a lane can still be manually shrunk that far, but nothing — pure
+     lane count included — can crush it smaller than that; the container
+     scrolls instead, as it already could. */
+  .lane{height:92px;min-height:64px;flex-shrink:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
   .lanebody{flex:1;display:flex;min-height:0;}
   .lane.active .leftcol{box-shadow:inset 3px 0 0 var(--accent2);}
 
-  /* Lane collapsed state */
+  /* Row 1: Minimize/Maximize toggle, CC#/PB, Name, Channel, Colour — a
+     full-width strip that sits ABOVE .lanebody (not inside .leftcol), so it
+     stays in the DOM and is fully visible/interactive whether the lane is
+     expanded or minimized. This is the single source of truth for CC#/
+     Name/Channel/Colour now — there is no separate minimized-only
+     duplicate (the old .lane-top-bar / tb-* elements from v0.9.7 are gone
+     as of v0.9.9). min-height + flex-shrink:0 here is the same
+     lane-crushing guard used everywhere else in this file (see .lane and
+     .lane.lane-hidden below) — this is what a minimized lane's whole
+     visible height rests on now, replacing the old top-bar's hardcoded
+     22px floor. */
+  .lane .lane-row1{flex:0 0 auto;display:flex;align-items:center;gap:5px;
+    min-height:28px;box-sizing:border-box;padding:4px 6px;
+    background:var(--panel);border-bottom:1px solid var(--line);}
+
+  /* Lane collapsed (minimized) state: .lanebody (rows 2+3 + the curve
+     canvas) and the grip hide outright; row 1 (above) is a sibling of
+     .lanebody so it is completely untouched by this rule and stays fully
+     visible/functional. flex-shrink:0 + a min-height matching row 1's own
+     natural floor is the actual fix here — a plain min-height:0 still let
+     the flex algorithm crush a minimized lane toward 0px once enough of
+     them were competing with the rest of the lane list for space (the more
+     you minimized, the more "shrinkable slack" accumulated across them) —
+     they'd visually vanish until scrolled to where flex-shrink happened to
+     still leave them a sliver. Refusing to shrink at all below row 1's own
+     height fixes that regardless of how many lanes (minimized or not) are
+     stacked above/below it. */
   .lane.lane-hidden .grip{display:none;}
   .lane.lane-hidden .lanebody{display:none;}
-  /* flex-shrink:0 is the actual fix here: a plain min-height:0 still let the
-     flex algorithm crush a minimized lane toward 0px once enough of them
-     were competing with the rest of the lane list for space (the more you
-     minimized, the more "shrinkable slack" accumulated across them) — they'd
-     visually vanish until scrolled to where flex-shrink happened to still
-     leave them a sliver. Locking min-height to the top-bar's own fixed
-     height and refusing to shrink at all fixes that regardless of how many
-     lanes (minimized or not) are stacked above/below it. */
-  .lane.lane-hidden{height:auto!important;min-height:22px!important;flex-shrink:0!important;}
-  /* Below the height that fits all 3 leftcol rows, hide val-row (row 3 —
-     Val/Pos/Steps + the drag-to-reorder handle, the lowest-priority row)
-     outright rather than let it clip mid-row — keeps row 1 (CC/Name/Tag/
-     Hide) and row 2 (×/Channel/Colour/Mute/Solo) always fully visible
-     within the lane's own bounds. */
-  .lane.lane-compact2 .val-row{display:none!important;}
-  /* Minimized top-bar order: Expand (tb-vis) — Colour (tb-swatch) — CC#
-     (tb-cc) — Name (tb-name, flex:1, fills remaining space) — Move
-     (tb-drag, drag-to-reorder — a minimized lane's .lanebody, and the
-     drag-handle that used to live inside it, is display:none, so without
-     this a minimized lane could never be dragged to reorder). Channel is
-     deliberately NOT shown here. */
-  .lane-top-bar{height:22px;display:none;align-items:center;gap:5px;padding:0 6px;background:var(--panel);border-bottom:1px solid var(--line);}
-  .lane.lane-hidden .lane-top-bar{display:flex;}
-  .lane-top-bar .tb-swatch{width:10px;height:10px;border-radius:2px;border:1px solid #0004;flex:0 0 auto;cursor:pointer;}
-  .lane-top-bar .tb-swatch:hover{filter:brightness(1.35);}
-  .lane-top-bar .tb-vis{font-size:12px;line-height:1;padding:0 2px;border:none;background:none;cursor:pointer;color:var(--accent2);}
-  .lane-top-bar .tb-cc{flex:0 0 auto;font-size:10px;color:var(--txt2);opacity:.75;white-space:nowrap;}
-  .lane-top-bar .tb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--txt2);}
-  .lane-top-bar .tb-drag{flex:0 0 auto;font-size:12px;line-height:1;padding:0 2px;color:var(--txt2);cursor:grab;user-select:none;}
-  .lane-top-bar .tb-drag:active{cursor:grabbing;}
+  .lane.lane-hidden{height:auto!important;min-height:30px!important;flex-shrink:0!important;}
+  /* Below the height that fits rows 1+2+3, hide row 3 (Tag pill + the
+     drag-to-reorder handle, the lowest-priority row) outright rather than
+     let it clip mid-row — keeps row 1 (always visible, outside .lanebody)
+     and row 2 (×/Val/Pos/Steps/Mute/Solo) always fully visible within the
+     lane's own bounds. */
+  .lane.lane-compact2 .row3{display:none!important;}
 
-  /* Lane leftcol — 3 rows: row 1 (CC#/PB, Name, Tag pill, Hide) on top and
-     last to hide, row 2 (× on the left; Channel/Colour swatch/Mute/Solo on
-     the right) below it, row 3 (Val/Pos/Steps + the drag-to-reorder handle)
-     hides first as a lane shrinks. */
-  /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
-     overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
-     which *still* creates a scroll container). Any non-"visible" overflow-y
-     would make this element its own sticky containing block, trapping
-     .leftcol-inner's centering to the (mostly offscreen) full row height
-     instead of letting it stick relative to .lanes, the true scrolling
-     ancestor. overflow:hidden lives on .leftcol-inner below instead — that's
-     the sticky element itself, not an ancestor, so it doesn't affect the
-     containing-block search. It used to also be load-bearing for clipping
-     the compact-row's icon buttons back to the 156px column width (they
-     overflowed and were unhittable); that's fixed now by giving the icons
-     their own wrapping row instead of relying on clipping, so this is just
-     a plain safety net today. */
-  .lane .leftcol{font-size:11px;justify-content:flex-start;overflow:visible;}
-  /* Keeps the name/CC/val/pos controls vertically centered in whatever part of
-     a tall (Alt+wheel-zoomed) lane is currently scrolled into view, instead of
-     scrolling away with the top of the row.
-     top:0;bottom:0 (not top:50%+transform) is deliberate: the transform
-     variant computes its offset purely from the scrollport center and can
-     push the element past its own row's edges for compact/default-height
-     lanes shorter than the scrollport, spilling into the row above. This
-     variant leans on .leftcol already being a column flexbox — auto margins
-     do the centering, and pinning both edges means it can never escape its
-     own row's bounds regardless of row or scrollport size. */
-  .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:2px;width:100%;overflow:hidden;}
-  .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
-  /* Row 1: CC#/PB, Name, Tag pill, Hide — all on one line. Channel moved to
-     row 2 (see .chn-btn below) so it's no longer a bare number sitting next
-     to CC# where the two could be confused at a glance. lname gets the
-     lion's share of extra space (flex weight 2); the tag pill/input share
-     what's left (weight 1) so both shrink together as the column narrows
-     instead of one starving the other. */
-  .lane .leftcol .name-row{padding:2px 0 1px;flex-wrap:nowrap;}
-  .lane .leftcol .name-row input.lname{flex:2 1 50px;min-width:0;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
-  .lane .leftcol .name-row input.ltags{flex:1 1 50px;min-width:0;padding:2px 4px;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
-  .lane .leftcol .name-row .ccn{flex:0 0 24px;width:24px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
-  .lane .leftcol .name-row .ccn::-webkit-outer-spin-button,
-  .lane .leftcol .name-row .ccn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
-  .lane .leftcol .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
-  /* Tag pill — compact colored stand-in for the tag text field, shown until
-     clicked (or Enter/Space when focused via keyboard), which swaps it for
-     the real input (committed the same as always on blur/Enter). */
-  .lane .leftcol .tag-pill{flex:1 1 50px;min-width:0;display:inline-flex;align-items:center;gap:4px;
-    font-size:10px;color:#cfe4ff;background:#2c313b;border:1px solid #3a404e;border-radius:9px;
-    padding:2px 7px;cursor:pointer;}
-  .lane .leftcol .tag-pill:hover,.lane .leftcol .tag-pill:focus{border-color:var(--accent);outline:none;}
-  .lane .leftcol .tag-pill.empty{color:var(--txt2);font-style:italic;}
-  .lane .leftcol .tag-pill.empty .tag-pill-dot{opacity:.35;}
-  .lane .leftcol .tag-pill-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
-  .lane .leftcol .tag-pill-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .lane.lane-filtered{display:none!important;}
-  .lane.lane-dimmed{opacity:.4;}
-  .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
-  .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
-  .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px 2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
-  .tag-chip:hover{border-color:#4fa3ff;}
-  .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
-  .tag-chip-label{background:none;border:none;color:inherit;font-size:11px;padding:0;cursor:pointer;}
-  /* >=16px hit target — same bump as the per-lane M/S/hide/delete icons below. */
-  .tag-mini-btn{touch-action:manipulation;user-select:none;-webkit-user-select:none;
-    font-size:9px;font-weight:700;line-height:1;min-width:16px;min-height:16px;padding:2px 5px;
-    border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
-    display:inline-flex;align-items:center;justify-content:center;}
-  .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
-  .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
-  /* Row 2: × (delete — the only destructive control) sits alone on the left
-     edge; Channel/Colour swatch/Mute/Solo group together on the right via
-     .icon-row-right (the drag-to-reorder handle used to live here too but
-     has moved to row 3 — Channel + the reintroduced colour swatch took its
-     place). The space-between split is the visual separation — × can't be
-     hit by accident while reaching for the other icons. Every icon is a
-     real >=16px hit target. */
-  .lane .leftcol .icon-row{gap:3px;padding-bottom:1px;justify-content:space-between;}
-  .lane .leftcol .icon-row-right{display:flex;align-items:center;gap:3px;}
-  .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle{
-    width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
-    display:inline-flex;align-items:center;justify-content:center;
-    border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
-    padding:0;line-height:1;flex-shrink:0;}
-  /* Lane colour — reverted back to a swatch button that lives in row 2
-     (between the Channel button and Mute), same click-to-cycle-LANE_COLORS
-     behavior it always had. The v0.9.6 "thin stripe on the leftcol's own
-     left edge" experiment is gone: it visually collided with the separate
-     .lane.active .leftcol inset box-shadow accent indicator, showing up as
-     two colored slivers side by side on the active lane. */
-  .lane .leftcol .swatch{width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
-    border-radius:4px;border:1px solid var(--line);cursor:pointer;padding:0;flex-shrink:0;}
-  .lane .leftcol .swatch:hover{filter:brightness(1.35);border-color:var(--accent);}
+  /* Lane row 1 content (see .lane-row1 above — it's a sibling of .leftcol,
+     not inside it, so its own elements are styled with a `.lane` qualifier
+     rather than `.lane .leftcol`). Order: Minimize/Maximize toggle — "CC"
+     label + CC#/PB — Name — Channel — Colour. */
+  .lane .lane-row1 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
+  .lane .lane-row1 .ccn{flex:0 0 28px;width:28px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
+  .lane .lane-row1 .ccn::-webkit-outer-spin-button,
+  .lane .lane-row1 .ccn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  .lane .lane-row1 .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
+  .lane .lane-row1 input.lname{flex:1 1 80px;min-width:0;max-width:260px;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   /* Channel — a button (not a free-typing number field) labeled "Ch N" that
      opens the shared #chPopover listing all 16 MIDI channels by number and
-     configured name; see #chPopover below. */
-  .lane .leftcol .chn-btn{height:16px;min-width:30px;box-sizing:border-box;padding:0 5px;font-size:10px;
+     configured name; see #chPopover below. Lives in row 1. */
+  .lane .lane-row1 .chn-btn{height:16px;min-width:30px;box-sizing:border-box;padding:0 5px;font-size:10px;
     border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
     flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
-  .lane .leftcol .chn-btn:hover{border-color:var(--accent);color:var(--accent);}
-  .lane .leftcol .chn-btn.ch16{color:#ffb454;border-color:#ffb45488;}
+  .lane .lane-row1 .chn-btn:hover{border-color:var(--accent);color:var(--accent);}
+  .lane .lane-row1 .chn-btn.ch16{color:#ffb454;border-color:#ffb45488;}
+  /* Lane colour — same click-to-cycle-LANE_COLORS swatch it always had,
+     now living in row 1 next to Channel. */
+  .lane .lane-row1 .swatch{width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
+    border-radius:4px;border:1px solid var(--line);cursor:pointer;padding:0;flex-shrink:0;}
+  .lane .lane-row1 .swatch:hover{filter:brightness(1.35);border-color:var(--accent);}
+  /* The minimize/maximize toggle — one real two-state control (▾ expanded /
+     ▸ minimized) instead of the old one-way ● Hide + separate top-bar-only
+     ○ Show. Uses the same .on convention as Mute/Solo/etc for its "on"
+     (minimized) state. */
+  .lane .lane-row1 .toggle-btn.on{color:var(--accent2);border-color:rgba(79,209,255,.4);}
   /* Shared channel-picker popover — one DOM instance for every lane (the
      lane list can be long), repositioned via JS from the clicked chn-btn's
      own getBoundingClientRect() each time it opens. Visual style matches
@@ -606,10 +567,76 @@
      here for the same reason (and with the same color) it's flagged in the
      Recording Setup channel list: #recordBtn.ch16warn / #recCh16Warn. */
   #chPopover .ch-opt.ch16{color:#ffb454;}
-  .lane .leftcol .x:hover,.lane .leftcol .move-btn:hover,.lane .leftcol .drag-handle:hover{
+
+  /* Lane leftcol — now 2 rows (row 1 lives outside it, see above): row 2
+     (× on the left; Val/Pos/Steps/Mute/Solo on the right) is the protected
+     floor that's always visible whenever a lane is expanded; row 3 (Tag
+     pill + the drag-to-reorder handle) hides first as a lane shrinks. */
+  /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
+     overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
+     which *still* creates a scroll container). Any non-"visible" overflow-y
+     would make this element its own sticky containing block, trapping
+     .leftcol-inner's centering to the (mostly offscreen) full row height
+     instead of letting it stick relative to .lanes, the true scrolling
+     ancestor. overflow:hidden lives on .leftcol-inner below instead — that's
+     the sticky element itself, not an ancestor, so it doesn't affect the
+     containing-block search. It used to also be load-bearing for clipping
+     the compact-row's icon buttons back to the 156px column width (they
+     overflowed and were unhittable); that's fixed now by giving the icons
+     their own wrapping row instead of relying on clipping, so this is just
+     a plain safety net today. */
+  .lane .leftcol{font-size:11px;justify-content:flex-start;overflow:visible;}
+  /* Keeps the val/pos/tag controls vertically centered in whatever part of
+     a tall (Alt+wheel-zoomed) lane is currently scrolled into view, instead of
+     scrolling away with the top of the row.
+     top:0;bottom:0 (not top:50%+transform) is deliberate: the transform
+     variant computes its offset purely from the scrollport center and can
+     push the element past its own row's edges for compact/default-height
+     lanes shorter than the scrollport, spilling into the row above. This
+     variant leans on .leftcol already being a column flexbox — auto margins
+     do the centering, and pinning both edges means it can never escape its
+     own row's bounds regardless of row or scrollport size. */
+  .leftcol-inner{position:sticky;top:0;bottom:0;margin-top:auto;margin-bottom:auto;display:flex;flex-direction:column;gap:2px;width:100%;overflow:hidden;}
+  .lane .leftcol .lr{display:flex;align-items:center;gap:3px;}
+  .lane.lane-filtered{display:none!important;}
+  .lane.lane-dimmed{opacity:.4;}
+  .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
+  .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
+  .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px 2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
+  .tag-chip:hover{border-color:#4fa3ff;}
+  .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
+  .tag-chip-label{background:none;border:none;color:inherit;font-size:11px;padding:0;cursor:pointer;}
+  /* >=16px hit target — same bump as the per-lane M/S/hide/delete icons below. */
+  .tag-mini-btn{touch-action:manipulation;user-select:none;-webkit-user-select:none;
+    font-size:9px;font-weight:700;line-height:1;min-width:16px;min-height:16px;padding:2px 5px;
+    border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;}
+  .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
+  .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
+  /* Row 2: × (delete — the only destructive control) sits alone on the left
+     edge; Value/Position/Steps + Mute/Solo group together on the right via
+     .row2-right (Channel and Colour moved out to row 1). The space-between
+     split is the visual separation — × can't be hit by accident while
+     reaching for the other controls. Every icon/input is a real >=16px hit
+     target. */
+  .lane .leftcol .row2{gap:3px;padding-bottom:1px;justify-content:space-between;flex-wrap:nowrap;}
+  .lane .leftcol .row2-right{display:flex;align-items:center;gap:3px;min-width:0;}
+  .lane .leftcol .row2 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
+  .lane .leftcol .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40px;}
+  .lane .leftcol .val-input{flex:0 1 40px;width:40px;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .pos-input{flex:0 1 38px;width:38px;min-width:0;max-width:44px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .stepsn{flex:0 0 22px;width:22px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
+  .lane .leftcol .stepsn::-webkit-outer-spin-button,
+  .lane .leftcol .stepsn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle,.lane .lane-row1 .move-btn{
+    width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
+    display:inline-flex;align-items:center;justify-content:center;
+    border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
+    padding:0;line-height:1;flex-shrink:0;}
+  .lane .leftcol .x:hover,.lane .leftcol .move-btn:hover,.lane .leftcol .drag-handle:hover,.lane .lane-row1 .move-btn:hover{
     border-color:var(--line);background:var(--panel2);}
-  .lane .leftcol .move-btn{font-size:10px;cursor:pointer;}
-  .lane .leftcol .move-btn:hover{color:var(--accent);}
+  .lane .leftcol .move-btn,.lane .lane-row1 .move-btn{font-size:10px;cursor:pointer;}
+  .lane .leftcol .move-btn:hover,.lane .lane-row1 .move-btn:hover{color:var(--accent);}
   .lane .leftcol .drag-handle{font-size:12px;cursor:grab;user-select:none;}
   .lane .leftcol .drag-handle:active{cursor:grabbing;}
   .lane .leftcol .x{color:var(--txt2);cursor:pointer;font-size:15px;}
@@ -617,14 +644,22 @@
   .lane.drag-over-top{border-top:2px solid var(--accent);}
   .lane.drag-over-bot{border-bottom:2px solid var(--accent);}
 
-  .lane .leftcol .val-row{gap:2px;padding-top:2px;padding-bottom:1px;}
-  .lane .leftcol .val-row span{font-size:10px;color:var(--txt2);flex-shrink:0;}
-  .lane .leftcol .val-row .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:51px;}
-  .lane .leftcol .val-input{flex:1;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
-  .lane .leftcol .pos-input{flex:1 1 0%;min-width:0;max-width:44px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
-  .lane .leftcol .val-row .stepsn{flex:0 0 24px;width:24px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
-  .lane .leftcol .val-row .stepsn::-webkit-outer-spin-button,
-  .lane .leftcol .val-row .stepsn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  /* Row 3: Tag pill (click-to-edit, flex-grow) on the left, the
+     drag-to-reorder handle aligned hard right — same space-between split
+     row 2 uses for ×/the icon cluster. */
+  .lane .leftcol .row3{gap:4px;padding-top:2px;padding-bottom:1px;justify-content:space-between;}
+  /* Tag pill — compact colored stand-in for the tag text field, shown until
+     clicked (or Enter/Space when focused via keyboard), which swaps it for
+     the real input (committed the same as always on blur/Enter). */
+  .lane .leftcol .tag-pill{flex:1 1 50px;min-width:0;display:inline-flex;align-items:center;gap:4px;
+    font-size:10px;color:#cfe4ff;background:#2c313b;border:1px solid #3a404e;border-radius:9px;
+    padding:2px 7px;cursor:pointer;}
+  .lane .leftcol .tag-pill:hover,.lane .leftcol .tag-pill:focus{border-color:var(--accent);outline:none;}
+  .lane .leftcol .tag-pill.empty{color:var(--txt2);font-style:italic;}
+  .lane .leftcol .tag-pill.empty .tag-pill-dot{opacity:.35;}
+  .lane .leftcol .tag-pill-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+  .lane .leftcol .tag-pill-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .lane .leftcol .row3 input.ltags{flex:1 1 50px;min-width:0;padding:2px 4px;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
   .add-row{flex:0 0 auto;border-top:1px solid var(--line);display:flex;min-height:0;}
   .add-row .leftcol{flex-direction:column!important;justify-content:center!important;gap:4px!important;overflow:visible!important;}
   .add-row .leftcol button{font-size:11px;padding:3px 5px;}
@@ -1403,13 +1438,16 @@
   [rulerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
 
   // ---------- Pane resize (grips) ----------
-  // A CC lane's leftcol content is row 1 (CC/Name/Ch/Tag/Hide) + row 2
-  // (×/Mute/Solo/grip) + row 3 (Val/Pos/Steps, when there's room). LANE_MIN_H
-  // is the floor when shrinking a lane — always enough for rows 1+2, never
-  // less, so those rows can never spill into the row above. LANE_FULL_H is
-  // the height at which row 3 actually fits; below that it's hidden outright
-  // rather than clipped.
-  const LANE_MIN_H=60, LANE_FULL_H=80;
+  // A CC lane is row 1 (Toggle/CC/Name/Channel/Colour — always visible,
+  // outside .lanebody) + .lanebody's leftcol, which holds row 2 (×/Val/Pos/
+  // Steps/Mute/Solo) and row 3 (Tag pill/Move, when there's room). LANE_MIN_H
+  // is the total-lane-height floor when shrinking a lane via the grip —
+  // always enough for row 1 + row 2, never less, so those can never spill
+  // out of the lane's own bounds. LANE_FULL_H is the total height at which
+  // row 3 actually fits too; below that it's hidden outright rather than
+  // clipped. Both must stay in sync with the CSS floors they mirror: .lane
+  // min-height (LANE_MIN_H) and .lane.lane-hidden min-height (row 1 alone).
+  const LANE_MIN_H=64, LANE_FULL_H=90;
   function updateLaneCompactness(row){
     if(!row||!row.classList||!row.classList.contains('lane')) return;
     row.classList.toggle('lane-compact2', row.offsetHeight<LANE_FULL_H);
@@ -2338,43 +2376,26 @@
     if(!laneMatchesFilter(lane)) row.classList.add('lane-filtered');
     if(!laneAudible(lane)) row.classList.add('lane-dimmed');
 
-    // Top bar: always visible, shown only when lane is collapsed (minimized).
-    // Order: Expand — Colour — CC#/PB — Name — Move (drag-to-reorder). A
-    // minimized lane's .lanebody (and the row-3 drag handle inside it) is
-    // display:none, so tb-drag is the only way to reorder a minimized lane;
-    // channel is deliberately not shown here (dropped for space — Channel
-    // now lives behind the row-2 Channel button when the lane is expanded).
-    const topBar=document.createElement('div'); topBar.className='lane-top-bar';
-    const tbVis=document.createElement('button'); tbVis.className='tb-vis'; tbVis.title='Show lane'; tbVis.textContent='○';
-    const tbSwatch=document.createElement('span'); tbSwatch.className='tb-swatch'; tbSwatch.style.background=lane.color;
-    tbSwatch.title='Lane color — click to change';
-    const tbCC=document.createElement('span'); tbCC.className='tb-cc';
-    function updateTbCC(){ tbCC.textContent=laneIsPb(lane)?'PB':'CC'+lane.cc; }
-    updateTbCC();
-    const tbName=document.createElement('span'); tbName.className='tb-name';
-    tbName.textContent=lane.name||(laneIsPb(lane)?'Pitch Bend':'CC'+lane.cc);
-    const tbDrag=document.createElement('span'); tbDrag.className='tb-drag'; tbDrag.textContent='⠿'; tbDrag.title='Drag to reorder';
-    topBar.appendChild(tbVis); topBar.appendChild(tbSwatch); topBar.appendChild(tbCC); topBar.appendChild(tbName); topBar.appendChild(tbDrag);
-
-    const grip=document.createElement('div'); grip.className='grip'; grip.title='Drag to resize this lane';
-    const body=document.createElement('div'); body.className='lanebody';
-    const left=document.createElement('div'); left.className='leftcol';
-
-    // Row 1 (top — last to disappear as lane shrinks): CC#/PB, Name, Tag
-    // pill, then the Minimize/Hide icon. Channel is NOT here (see row 2's
-    // Channel button below) — with both CC# and Channel as bare numbers
-    // close together in row 1, users couldn't tell which was which at a
-    // glance; splitting them across rows fixes that.
-    const nameRow=document.createElement('div'); nameRow.className='lr name-row';
+    // Row 1: Minimize/Maximize toggle — CC#/PB — Name — Channel — Colour.
+    // Sits directly under .lane, OUTSIDE .lanebody, so it's the single
+    // always-visible/always-functional header for both the expanded AND
+    // minimized states — there is no more separate minimized-only .lane-
+    // top-bar duplicate (removed entirely in v0.9.9). Minimizing hides
+    // .lanebody (rows 2+3 + the curve canvas) below; row 1's own elements
+    // (this exact CC input, Name input, Channel button, Colour swatch) stay
+    // live and interactive either way.
+    const row1=document.createElement('div'); row1.className='lr lane-row1';
+    const toggleBtn=document.createElement('button'); toggleBtn.className='move-btn toggle-btn'; toggleBtn.type='button';
     let ccn=null;
     if(laneIsPb(lane)){
       const pbTag=document.createElement('span'); pbTag.className='pb-tag'; pbTag.textContent='PB';
       pbTag.title='Pitch Bend (±8192, 14-bit)';
-      nameRow.appendChild(pbTag);
+      row1.appendChild(toggleBtn); row1.appendChild(pbTag);
     } else {
+      const ccLbl=document.createElement('span'); ccLbl.className='mini-lbl'; ccLbl.textContent='CC';
       ccn=document.createElement('input'); ccn.type='number'; ccn.className='ccn'; ccn.min=0; ccn.max=127; ccn.value=lane.cc;
       ccn.title='CC '+lane.cc+(ccName(lane.cc)?' – '+ccName(lane.cc):'');
-      nameRow.appendChild(ccn);
+      row1.appendChild(toggleBtn); row1.appendChild(ccLbl); row1.appendChild(ccn);
     }
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
     lname.placeholder=laneIsPb(lane)?'Pitch Bend':(ccName(lane.cc)||'Lane name…');
@@ -2384,7 +2405,65 @@
     // typed text — opt out with every ignore attribute each one respects.
     lname.autocomplete='off'; lname.setAttribute('data-1p-ignore','true');
     lname.setAttribute('data-lpignore','true'); lname.setAttribute('data-bwignore','true');
-    nameRow.appendChild(lname);
+    row1.appendChild(lname);
+    // Channel — a button (not a free-typing number field) that opens the
+    // shared #chPopover listing all 16 MIDI channels by number + configured
+    // name (see openChPopover below). Lives in row 1 now (moved out of row 2).
+    const chnBtn=document.createElement('button'); chnBtn.className='chn-btn'; chnBtn.type='button';
+    function updateChnBtn(){
+      chnBtn.textContent='Ch'+(lane.ch+1);
+      chnBtn.classList.toggle('ch16',lane.ch===15);
+      chnBtn.title=lane.ch===15
+        ? 'MIDI Channel 16 — reserved for the Follow MMV sync-track. Click to change.'
+        : 'MIDI Channel — click to change';
+    }
+    updateChnBtn();
+    chnBtn.addEventListener('click',e=>{ e.stopPropagation(); openChPopover(lane,chnBtn,()=>{ updateChnBtn(); }); });
+    row1.appendChild(chnBtn);
+    // Lane colour — same click-to-cycle-LANE_COLORS swatch behavior as
+    // always, also moved to row 1 (next to Channel).
+    const swatch=document.createElement('button'); swatch.className='swatch'; swatch.type='button';
+    swatch.style.background=lane.color; swatch.title='Lane color — click to change';
+    row1.appendChild(swatch);
+
+    const grip=document.createElement('div'); grip.className='grip'; grip.title='Drag to resize this lane';
+    const body=document.createElement('div'); body.className='lanebody';
+    const left=document.createElement('div'); left.className='leftcol';
+
+    // Row 2 (inside .leftcol — hidden along with the rest of .lanebody
+    // while minimized): Delete (×) — the only destructive control — sits
+    // alone on the left edge; Value/Position/Steps + Mute/Solo group
+    // together on the right, so × can never be hit by accident while
+    // reaching for the other controls. Every icon here is a real >=16px
+    // hit target with visible spacing between them.
+    const row2=document.createElement('div'); row2.className='lr row2';
+    const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
+    const valLbl=document.createElement('span'); valLbl.className='mini-lbl'; valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
+    const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input';
+    const rng=laneRange(lane); valInput.min=rng.min; valInput.max=rng.max; valInput.placeholder='—';
+    valInput.title='Value of selected point\nScroll/↑↓=±1  Shift=±5  Ctrl=±10\nAlt+scroll=snap to % steps';
+    // Read-only "N/M" step-index badge — only shown when Steps is on, so it
+    // costs nothing for lanes not using the feature. Kept prefix-free (no
+    // "step " text) so it has room to show 2-3 digit step counts.
+    const stepBadge=document.createElement('span'); stepBadge.className='step-badge'; stepBadge.style.display='none';
+    const posLbl=document.createElement('span'); posLbl.className='mini-lbl'; posLbl.textContent='P'; posLbl.title='Position';
+    const posInput=document.createElement('input'); posInput.type='text'; posInput.className='pos-input';
+    posInput.placeholder='—'; posInput.title='Position (Bar.Beat.16th.Tick)\nScroll or ↑↓ = ±1 tick\nShift = ±1/16th\nCtrl = ±1 beat\nAlt = ±1 bar\nType B.B.S.T and press Enter';
+    const stpLbl=document.createElement('span'); stpLbl.className='mini-lbl'; stpLbl.textContent='S'; stpLbl.title='Steps (snap-to-value)'; stpLbl.style.flexShrink='0';
+    const stepsInput=document.createElement('input'); stepsInput.type='number'; stepsInput.className='stepsn'; stepsInput.min=0;
+    stepsInput.value=lane.steps||0; stepsInput.placeholder='0';
+    const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
+    const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
+    const row2Right=document.createElement('span'); row2Right.className='row2-right';
+    row2Right.appendChild(valLbl); row2Right.appendChild(valInput); row2Right.appendChild(stepBadge);
+    row2Right.appendChild(posLbl); row2Right.appendChild(posInput);
+    row2Right.appendChild(stpLbl); row2Right.appendChild(stepsInput);
+    row2Right.appendChild(muteBtn); row2Right.appendChild(soloBtn);
+    row2.appendChild(xBtn); row2.appendChild(row2Right);
+
+    // Row 3 (inside .leftcol): Tag pill (click-to-edit, flex-grow) on the
+    // left, the drag-to-reorder handle aligned hard right.
+    const row3=document.createElement('div'); row3.className='lr row3';
     // Tags display as a compact colored pill (name + count truncated with a
     // title tooltip) instead of an always-open text field — the field is
     // only shown while actively editing. Same underlying data model/commit
@@ -2411,88 +2490,45 @@
     function exitTagEdit(){ ltags.style.display='none'; tagPill.style.display=''; renderTagPill(); }
     tagPill.addEventListener('click',enterTagEdit);
     tagPill.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); enterTagEdit(); } });
-    nameRow.appendChild(tagPill); nameRow.appendChild(ltags);
-    const hideBtn=document.createElement('button'); hideBtn.className='move-btn'; hideBtn.textContent='●'; hideBtn.title='Hide lane';
-    nameRow.appendChild(hideBtn);
-
-    // Row 2: Delete (×) — the only destructive control — sits alone on the
-    // left edge; Channel button, Colour swatch, Mute, Solo group together
-    // on the right, so × can never be hit by accident while reaching for
-    // the other icons. Every icon here is a real >=16px hit target with
-    // visible spacing between them.
-    const iconRow=document.createElement('div'); iconRow.className='lr icon-row';
-    const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
-    // Channel — a button (not a free-typing number field) that opens the
-    // shared #chPopover listing all 16 MIDI channels by number + configured
-    // name (see openChPopover below).
-    const chnBtn=document.createElement('button'); chnBtn.className='chn-btn'; chnBtn.type='button';
-    function updateChnBtn(){
-      chnBtn.textContent='Ch'+(lane.ch+1);
-      chnBtn.classList.toggle('ch16',lane.ch===15);
-      chnBtn.title=lane.ch===15
-        ? 'MIDI Channel 16 — reserved for the Follow MMV sync-track. Click to change.'
-        : 'MIDI Channel — click to change';
-    }
-    updateChnBtn();
-    chnBtn.addEventListener('click',e=>{ e.stopPropagation(); openChPopover(lane,chnBtn,()=>{ updateChnBtn(); }); });
-    const swatch=document.createElement('button'); swatch.className='swatch'; swatch.type='button';
-    swatch.style.background=lane.color; swatch.title='Lane color — click to change';
-    const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
-    const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
-    const iconRowRight=document.createElement('span'); iconRowRight.className='icon-row-right';
-    iconRowRight.appendChild(chnBtn); iconRowRight.appendChild(swatch); iconRowRight.appendChild(muteBtn); iconRowRight.appendChild(soloBtn);
-    iconRow.appendChild(xBtn); iconRow.appendChild(iconRowRight);
-
-    // Row 3: Val + Pos (+ Steps), then the drag-to-reorder handle at the
-    // end — it's not in row 1 or row 2 anymore, so it lands here. Steps
-    // lives here since it's the primary way to set it, so it needs its own
-    // room. Val/Pos/Steps content/behavior is otherwise unchanged.
-    const valRow=document.createElement('div'); valRow.className='lr val-row';
-    const valLbl=document.createElement('span'); valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
-    const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input'; valInput.style.cssText='width:46px;min-width:46px;flex:0 0 46px;';
-    const rng=laneRange(lane); valInput.min=rng.min; valInput.max=rng.max; valInput.placeholder='—';
-    valInput.title='Value of selected point\nScroll/↑↓=±1  Shift=±5  Ctrl=±10\nAlt+scroll=snap to % steps';
-    // Read-only "N/M" step-index badge — only shown when Steps is on, so it
-    // costs nothing for lanes not using the feature. Kept prefix-free (no
-    // "step " text) so it has room to show 2-3 digit step counts.
-    const stepBadge=document.createElement('span'); stepBadge.className='step-badge'; stepBadge.style.display='none';
-    const posLbl=document.createElement('span'); posLbl.textContent='P'; posLbl.title='Position';
-    const posInput=document.createElement('input'); posInput.type='text'; posInput.className='pos-input';
-    posInput.placeholder='—'; posInput.title='Position (Bar.Beat.16th.Tick)\nScroll or ↑↓ = ±1 tick\nShift = ±1/16th\nCtrl = ±1 beat\nAlt = ±1 bar\nType B.B.S.T and press Enter';
-    const stpLbl=document.createElement('span'); stpLbl.textContent='S'; stpLbl.title='Steps (snap-to-value)'; stpLbl.style.flexShrink='0';
-    const stepsInput=document.createElement('input'); stepsInput.type='number'; stepsInput.className='stepsn'; stepsInput.min=0;
-    stepsInput.value=lane.steps||0; stepsInput.placeholder='0';
     const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
-    valRow.appendChild(valLbl); valRow.appendChild(valInput); valRow.appendChild(stepBadge); valRow.appendChild(posLbl); valRow.appendChild(posInput);
-    valRow.appendChild(stpLbl); valRow.appendChild(stepsInput); valRow.appendChild(dragHandle);
+    row3.appendChild(tagPill); row3.appendChild(ltags); row3.appendChild(dragHandle);
 
     // Wrapped so it can be sticky-centered within the lane row: when a lane is
     // resized very tall (Alt+wheel), the row can exceed the viewport, and
-    // without this the name/CC/val/pos controls (naturally at the row's top)
+    // without this the val/pos/tag controls (naturally at the row's top)
     // scroll out of view while the lane's curve is still on screen.
     const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
-    leftInner.appendChild(nameRow); leftInner.appendChild(iconRow); leftInner.appendChild(valRow);
+    leftInner.appendChild(row2); leftInner.appendChild(row3);
     left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
 
     const sc=document.createElement('div'); sc.className='scroll hx';
     const cv=document.createElement('canvas'); sc.appendChild(cv);
     body.appendChild(left); body.appendChild(sc);
-    row.appendChild(topBar); row.appendChild(body); row.appendChild(grip);
+    row.appendChild(row1); row.appendChild(body); row.appendChild(grip);
     $('lanes').appendChild(row);
     lane._row=row; lane._scroll=sc; lane._canvas=cv;
 
-    // Toggle visibility
-    function hideLane(){ lane.visible=false; row.classList.add('lane-hidden'); resizeCanvases(); }
-    function showLane(){ lane.visible=true; row.classList.remove('lane-hidden'); resizeCanvases(); }
-    tbVis.addEventListener('click', showLane);
-    hideBtn.addEventListener('click', hideLane);
+    // Minimize/Maximize — a single real two-state toggle (▾ expanded / ▸
+    // minimized), replacing the old one-way ● Hide button paired with a
+    // separate ○ Show button that only ever existed in the now-removed
+    // top-bar. Same .on convention already used for Mute/Solo/etc.
+    function updateToggleBtn(){
+      const min=lane.visible===false;
+      toggleBtn.textContent=min?'▸':'▾';
+      toggleBtn.title=min?'Maximize lane':'Minimize lane';
+      toggleBtn.classList.toggle('on',min);
+    }
+    updateToggleBtn();
+    function toggleLaneMin(){
+      lane.visible=lane.visible===false?true:false;
+      row.classList.toggle('lane-hidden',lane.visible===false);
+      updateToggleBtn(); resizeCanvases();
+    }
+    toggleBtn.addEventListener('click',toggleLaneMin);
 
     // Name
-    lname.addEventListener('input',ev=>{
-      lane.name=ev.target.value;
-      tbName.textContent=lane.name||(laneIsPb(lane)?'Pitch Bend':'CC'+lane.cc);
-    });
+    lname.addEventListener('input',ev=>{ lane.name=ev.target.value; });
 
     // Tags — commits exactly as before (same parsing, pushUndo, refreshTagBar
     // on 'change'); blur additionally swaps the field back to the pill
@@ -2520,8 +2556,6 @@
         ev.target.title='CC '+lane.cc+(name?' – '+name:'');
         lname.title=name;
         if(!lane.name){ lname.placeholder=name||'Lane name…'; }
-        tbName.textContent=lane.name||'CC'+lane.cc;
-        updateTbCC();
       });
     }
     // Steps ("snap-to"): 0/1 = off (full granularity). Committed on
@@ -2540,29 +2574,27 @@
       pushUndo(); updateLaneValInput(lane); requestDraw();
     });
     stepsInput.addEventListener('keydown',e=>{ if(e.key==='Enter') stepsInput.blur(); });
-    // Lane color cycles through LANE_COLORS on click — reverted from the
-    // v0.9.6 color-stripe back to a swatch button in row 2 (same
-    // click-to-cycle behavior). Every element showing this lane's color
-    // (row 2's swatch, the top-bar swatch, the tag-pill dot) stays in sync;
-    // clicking either swatch has the same effect.
+    // Lane color cycles through LANE_COLORS on click — same swatch button
+    // in row 1 as v0.9.7, just relocated there from row 2. Every element
+    // showing this lane's color (row 1's swatch, the tag-pill dot) stays
+    // in sync.
     function cycleColor(){
       const i=(LANE_COLORS.indexOf(lane.color)+1)%LANE_COLORS.length; lane.color=LANE_COLORS[i];
-      swatch.style.background=lane.color; tbSwatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
+      swatch.style.background=lane.color; tagDot.style.background=lane.color; requestDraw();
     }
     swatch.addEventListener('click',cycleColor);
-    tbSwatch.addEventListener('click',cycleColor);
     xBtn.addEventListener('click',()=>{ if(!confirm('Delete CC Lane?')) return; pushUndo(); removeLane(lane.id); });
     lane._muteBtn=muteBtn; lane._soloBtn=soloBtn;
     muteBtn.addEventListener('click',()=>toggleLaneMuted(lane));
     soloBtn.addEventListener('click',()=>toggleLaneSoloed(lane));
 
-    // Drag-to-reorder — via the row-3 ⠿ handle when expanded, or the
-    // top-bar's ⠿ handle when minimized (a minimized lane's .lanebody, and
-    // the row-3 handle inside it, is display:none, so without this a
-    // minimized lane could never be dragged to a new position).
+    // Drag-to-reorder — via row 3's ⠿ handle. Row 3 (like row 2) is only
+    // visible while the lane is expanded — a minimized lane can no longer
+    // be dragged to reorder directly (the old top-bar's duplicate ⠿ handle
+    // that made that possible is gone along with the rest of the top bar);
+    // maximize it first, same as any other row-2/row-3 action.
     let _dragSrcId=null;
     dragHandle.addEventListener('mousedown',()=>{ row.draggable=true; });
-    tbDrag.addEventListener('mousedown',()=>{ row.draggable=true; });
     row.addEventListener('dragstart',e=>{ _dragSrcId=lane.id; e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain',lane.id); row.style.opacity='0.5'; });
     row.addEventListener('dragend',()=>{ row.draggable=false; row.style.opacity=''; document.querySelectorAll('.lane').forEach(r=>r.classList.remove('drag-over-top','drag-over-bot')); });
     row.addEventListener('dragover',e=>{ if(_dragSrcId===lane.id) return; e.preventDefault(); e.dataTransfer.dropEffect='move';

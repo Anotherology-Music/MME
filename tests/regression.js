@@ -1194,10 +1194,11 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // Shrinking a lane via the grip has a floor of "row 1 (CC/Name/Ch/Tag/
-    // Hide) + row 2 (×/Mute/Solo/grip)" — it can never go small enough for
-    // those two rows to be cut off, and row 3 (Val/Pos/Steps) hides outright
-    // once it no longer fits, instead of clipping mid-row.
+    // Shrinking a lane via the grip has a floor of "row 1 (Toggle/CC/Name/
+    // Channel/Colour, always visible outside .lanebody) + row 2 (×/Val/Pos/
+    // Steps/Mute/Solo)" — it can never go small enough for row 2 to be cut
+    // off, and row 3 (Tag pill/Move) hides outright once it no longer fits,
+    // instead of clipping mid-row.
     const row = await page.$('.lane');
     const grip = await page.$('.lane .grip');
     const gripBox = await grip.boundingBox();
@@ -1213,35 +1214,34 @@ async function run() {
     await page.waitForTimeout(100);
     const shrunk = await page.evaluate(() => {
       const r = document.querySelector('.lane');
-      const nameRow = r.querySelector('.name-row'), iconRow = r.querySelector('.icon-row'), valRow = r.querySelector('.val-row');
+      const row1 = r.querySelector('.lane-row1'), row2 = r.querySelector('.row2'), row3 = r.querySelector('.row3');
       return {
         rowHeight: r.offsetHeight,
         compact2: r.classList.contains('lane-compact2'),
-        nameVisible: nameRow.getBoundingClientRect().height > 0,
-        iconVisible: iconRow.getBoundingClientRect().height > 0,
-        valVisible: getComputedStyle(valRow).display !== 'none',
+        row1Visible: row1.getBoundingClientRect().height > 0,
+        row2Visible: row2.getBoundingClientRect().height > 0,
+        row3Visible: getComputedStyle(row3).display !== 'none',
       };
     });
-    check('shrinking a lane below the 3-row height hides row 3 (Val/Pos/Steps) but keeps rows 1+2 visible',
-      shrunk.compact2 && shrunk.nameVisible && shrunk.iconVisible && !shrunk.valVisible, shrunk);
-    check('the grip cannot shrink a lane below the row-1+row-2 minimum height',
-      shrunk.rowHeight >= 59, shrunk.rowHeight);
+    check('shrinking a lane below the 3-row height hides row 3 (Tag pill/Move) but keeps rows 1+2 visible',
+      shrunk.compact2 && shrunk.row1Visible && shrunk.row2Visible && !shrunk.row3Visible, shrunk);
+    check('the grip cannot shrink a lane below the row-1+row-2 minimum height (LANE_MIN_H)',
+      shrunk.rowHeight >= 64, shrunk.rowHeight);
   });
 
   await withPage(browser, async (page) => {
-    // Minimizing a lane (the ● hide button) collapses it to a single top-bar
-    // row: Expand — Colour — CC# — Name — Move. Channel is intentionally
-    // dropped from this view (it now lives behind row 2's Channel button
-    // when expanded), so the minimized top-bar shows the custom name and
-    // CC# but no channel — and gains a real Move (drag-reorder) icon that
-    // didn't exist before (the old drag handle only lived in the
-    // now-hidden lanebody, so a minimized lane could never be reordered).
+    // Minimizing a lane (row 1's single ▾/▸ toggle) hides row 2, row 3, and
+    // the curve canvas, but row 1 itself — the SAME CC/Name/Channel/Colour
+    // elements used when expanded, not a duplicate — stays exactly as it
+    // was: showing the custom name, CC#, and now (unlike the old v0.9.7
+    // top-bar, which deliberately dropped it) the Channel button too, since
+    // Channel lives in row 1 now rather than behind a hidden row 2.
     const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
     await page.fill('.lane input.lname', 'sequenceProgress');
     await page.dispatchEvent('.lane input.lname', 'input');
-    // Set the channel via the popover flow (channel is no longer a
+    // Set the channel via the popover flow (channel is a button, not a
     // fill-able number input) so we can prove it's still tracked correctly
-    // even though it's not shown while minimized.
+    // and still visibly shown while minimized.
     await page.click('.lane .chn-btn');
     await page.waitForTimeout(30);
     await page.click('#chPopover .ch-opt:nth-child(3)'); // "3" (index 2 = channel 3)
@@ -1249,45 +1249,125 @@ async function run() {
     // Real pointer click, not a dispatched one: proving every icon is a
     // real, unclipped hit target — see the "hittable at real pointer
     // coordinates" test below, which proves this for every icon in the row.
-    await page.click('.lane .move-btn[title="Hide lane"]');
+    await page.click('.lane .toggle-btn[title="Minimize lane"]');
     await page.waitForTimeout(50);
     const info = await page.evaluate((id) => {
       const row = document.querySelector('.lane');
       return {
         hidden: row.classList.contains('lane-hidden'),
-        name: row.querySelector('.tb-name').textContent,
-        cc: row.querySelector('.tb-cc').textContent,
-        hasMoveIcon: !!row.querySelector('.tb-drag'),
-        topBarText: row.querySelector('.lane-top-bar').textContent,
+        name: row.querySelector('input.lname').value,
+        cc: row.querySelector('.lane-row1 .ccn').value,
+        chnLabel: row.querySelector('.chn-btn').textContent,
+        toggleGlyph: row.querySelector('.toggle-btn').textContent,
+        toggleTitle: row.querySelector('.toggle-btn').title,
+        row1Visible: row.querySelector('.lane-row1').getBoundingClientRect().height > 0,
+        lanebodyHidden: getComputedStyle(row.querySelector('.lanebody')).display === 'none',
         laneCh: window._TEST_state.ccLanes.find(l => l.id === id).ch,
       };
     }, laneId);
-    check('minimized lane top-bar shows custom name plus CC#, and a Move icon — but no Channel',
-      info.hidden && info.name === 'sequenceProgress' && /^CC\d+$/.test(info.cc) && info.hasMoveIcon
-      && !/Ch\d/.test(info.topBarText) && info.laneCh === 2, info);
+    check('minimizing a lane hides the canvas/rows 2-3 but keeps row 1 (Name/CC/Channel) showing the same live data',
+      info.hidden && info.lanebodyHidden && info.row1Visible && info.name === 'sequenceProgress'
+      && info.cc !== '' && info.chnLabel === 'Ch3' && info.laneCh === 2, info);
+    check('the toggle button flips to the "maximize" glyph/title once minimized',
+      info.toggleGlyph === '▸' && info.toggleTitle === 'Maximize lane', info);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Minimize/Maximize control is ONE real two-state toggle, not a
+    // one-way Hide paired with a separate Show — prove both directions work
+    // by checking row 2/row 3/canvas visibility (not just a CSS class) each
+    // time, and that the same click target and glyph/title convention holds
+    // in both states.
+    const laneId = await page.evaluate(() => window._TEST_addLane(33, 0));
+    await page.waitForTimeout(50);
+    async function state() {
+      return page.evaluate((id) => {
+        const row = document.querySelector(`.lane[data-id="${id}"]`);
+        const row2 = row.querySelector('.row2'), row3 = row.querySelector('.row3'), canvas = row.querySelector('canvas');
+        const toggle = row.querySelector('.toggle-btn');
+        return {
+          hiddenClass: row.classList.contains('lane-hidden'),
+          row2Visible: row2.getBoundingClientRect().height > 0 && getComputedStyle(row.querySelector('.lanebody')).display !== 'none',
+          row3Visible: row3.getBoundingClientRect().height > 0 && getComputedStyle(row.querySelector('.lanebody')).display !== 'none',
+          canvasVisible: getComputedStyle(canvas).display !== 'none' && canvas.getBoundingClientRect().width > 0,
+          glyph: toggle.textContent, title: toggle.title, on: toggle.classList.contains('on'),
+        };
+      }, laneId);
+    }
+    const initial = await state();
+    check('a freshly added lane starts expanded: row 2, row 3, and the canvas all visible, toggle shows ▾/"Minimize lane"',
+      !initial.hiddenClass && initial.row2Visible && initial.row3Visible && initial.canvasVisible
+      && initial.glyph === '▾' && initial.title === 'Minimize lane' && !initial.on, initial);
+
+    await page.click(`.lane[data-id="${laneId}"] .toggle-btn`);
+    await page.waitForTimeout(50);
+    const afterMin = await state();
+    check('clicking the toggle minimizes: row 2, row 3, and the canvas all hide, toggle flips to ▸/"Maximize lane"/.on',
+      afterMin.hiddenClass && !afterMin.row2Visible && !afterMin.row3Visible && !afterMin.canvasVisible
+      && afterMin.glyph === '▸' && afterMin.title === 'Maximize lane' && afterMin.on, afterMin);
+
+    await page.click(`.lane[data-id="${laneId}"] .toggle-btn`);
+    await page.waitForTimeout(50);
+    const afterMax = await state();
+    check('clicking the SAME toggle again maximizes it back: row 2, row 3, and the canvas all reappear, toggle flips back to ▾/"Minimize lane"',
+      !afterMax.hiddenClass && afterMax.row2Visible && afterMax.row3Visible && afterMax.canvasVisible
+      && afterMax.glyph === '▾' && afterMax.title === 'Minimize lane' && !afterMax.on, afterMax);
+  });
+
+  await withPage(browser, async (page) => {
+    // Row 1 is the SAME element tree whether expanded or minimized (no
+    // stripped-down duplicate) — prove every one of its controls is still
+    // genuinely functional while minimized: CC# edit, Name edit, the
+    // Channel popover, and colour cycling (colour cycling is covered by its
+    // own dedicated test elsewhere; this one covers CC/Name/Channel).
+    const laneId = await page.evaluate(() => window._TEST_addLane(60, 0));
+    await page.waitForTimeout(50);
+    await page.click(`.lane[data-id="${laneId}"] .toggle-btn`);
+    await page.waitForTimeout(50);
+    const hiddenNow = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'), laneId);
+    check('lane is minimized before exercising row 1 controls', hiddenNow, hiddenNow);
+
+    // CC# edit while minimized
+    await page.fill(`.lane[data-id="${laneId}"] .lane-row1 .ccn`, '77');
+    await page.dispatchEvent(`.lane[data-id="${laneId}"] .lane-row1 .ccn`, 'input');
+    await page.waitForTimeout(30);
+    const ccAfter = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).cc, laneId);
+    check('editing the CC# input works while the lane is minimized', ccAfter === 77, ccAfter);
+
+    // Name edit while minimized
+    await page.fill(`.lane[data-id="${laneId}"] input.lname`, 'brightnessCurve');
+    await page.dispatchEvent(`.lane[data-id="${laneId}"] input.lname`, 'input');
+    await page.waitForTimeout(30);
+    const nameAfter = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).name, laneId);
+    check('editing the Name input works while the lane is minimized', nameAfter === 'brightnessCurve', nameAfter);
+
+    // Channel popover opens + a selection commits, while minimized
+    await page.click(`.lane[data-id="${laneId}"] .chn-btn`);
+    await page.waitForTimeout(30);
+    const popOpen = await page.evaluate(() => document.getElementById('chPopover').classList.contains('open'));
+    check('the Channel popover opens from row 1 while the lane is minimized', popOpen, popOpen);
+    await page.click('#chPopover .ch-opt:nth-child(7)'); // channel index 6 (Ch7)
+    await page.waitForTimeout(30);
+    const chAfter = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).ch, laneId);
+    const btnLabelAfter = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .chn-btn`).textContent, laneId);
+    check('selecting a channel from the popover while minimized updates lane.ch and the button label',
+      chAfter === 6 && btnLabelAfter === 'Ch7', { chAfter, btnLabelAfter });
   });
 
   // ---------------- Lane icon ergonomics (item 4) ----------------
 
   await withPage(browser, async (page) => {
-    // Every per-lane icon/button in row 2 (Channel, Colour swatch, M, S,
-    // hide ●, delete ×) must be a real, unclipped, >=16px hit target that a
-    // genuine pointer click can land on. Row 2's layout is a deliberate
-    // split: × alone on the far left, Channel/swatch/Mute/Solo grouped on
-    // the far right — proven here by real coordinates, not just class
-    // presence. The drag-to-reorder handle is no longer in row 2 (it moved
-    // to row 3) so it's tested separately below.
+    // Row 1's icon/button controls (Minimize/Maximize toggle, Channel,
+    // Colour swatch) must be real, unclipped, >=16px hit targets that a
+    // genuine pointer click can land on, in the order: toggle — CC# — Name
+    // — Channel — Colour.
     const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
     await page.waitForTimeout(50);
     const sel = {
-      mute: `.lane[data-id="${laneId}"] .mute-btn`,
-      solo: `.lane[data-id="${laneId}"] .solo-btn`,
-      hide: `.lane[data-id="${laneId}"] .move-btn[title="Hide lane"]`,
-      chn: `.lane[data-id="${laneId}"] .chn-btn`,
-      swatch: `.lane[data-id="${laneId}"] .icon-row .swatch`,
-      del: `.lane[data-id="${laneId}"] .x`,
+      toggle: `.lane[data-id="${laneId}"] .toggle-btn`,
+      chn: `.lane[data-id="${laneId}"] .lane-row1 .chn-btn`,
+      swatch: `.lane[data-id="${laneId}"] .lane-row1 .swatch`,
     };
-
     const hittable = await page.evaluate((sel) => {
       const out = {};
       for (const [k, s] of Object.entries(sel)) {
@@ -1301,30 +1381,82 @@ async function run() {
       }
       return out;
     }, sel);
-    check('every per-lane row-2 icon (M/S/hide/×/Channel/swatch) has a real, unclipped hit target at its own screen coordinates',
+    check('every per-lane row-1 icon (Minimize toggle/Channel/swatch) has a real, unclipped hit target at its own screen coordinates',
       Object.values(hittable).every(Boolean), hittable);
 
     const sizes = await page.evaluate((sel) => {
       const out = {};
-      for (const k of ['mute', 'solo', 'hide', 'del', 'chn', 'swatch']) {
+      for (const k of Object.keys(sel)) {
         const r = document.querySelector(sel[k]).getBoundingClientRect();
         out[k] = { w: Math.round(r.width), h: Math.round(r.height) };
       }
       return out;
     }, sel);
-    check('per-lane M/S/hide/×/Channel/swatch icons are all >=16px hit targets',
+    check('per-lane row-1 toggle/Channel/swatch icons are all >=16px hit targets',
       Object.values(sizes).every(s => s.w >= 16 && s.h >= 16), sizes);
 
-    // Row 2's deliberate left/right split: × sits strictly left of the
-    // Channel/swatch/Mute/Solo cluster, in that order — proving the new
-    // layout, not just that all the icons exist somewhere in the row.
+    const positions = await page.evaluate((laneId) => {
+      const row = document.querySelector(`.lane[data-id="${laneId}"] .lane-row1`);
+      const q = sel => row.querySelector(sel).getBoundingClientRect().left;
+      return { toggle: q('.toggle-btn'), ccn: q('.ccn'), lname: q('.lname'), chn: q('.chn-btn'), swatch: q('.swatch') };
+    }, laneId);
+    check('row 1 layout: Toggle is left of CC#, which is left of Name, which is left of Channel, which is left of Colour',
+      positions.toggle < positions.ccn && positions.ccn < positions.lname && positions.lname < positions.chn && positions.chn < positions.swatch, positions);
+
+    // Real Playwright pointer click (no force:true, no dispatchEvent) must
+    // actually land and trigger the real behavior, not just report a
+    // non-empty bounding box.
+    await page.click(sel.toggle);
+    const hiddenAfterRealClick = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'), laneId);
+    check('a real pointer click on the toggle button actually minimizes the lane (not force-clicked, not dispatched)',
+      hiddenAfterRealClick === true, hiddenAfterRealClick);
+  });
+
+  await withPage(browser, async (page) => {
+    // Row 2's icon controls (×, Mute, Solo) must be real, unclipped,
+    // >=16px hit targets. Row 2's deliberate left/right split: × sits
+    // alone on the far left, Value/Position/Steps/Mute/Solo grouped on the
+    // far right — proven here by real coordinates, not just class presence.
+    const laneId = await page.evaluate(() => window._TEST_addLane(31, 0));
+    await page.waitForTimeout(50);
+    const sel = {
+      del: `.lane[data-id="${laneId}"] .x`,
+      mute: `.lane[data-id="${laneId}"] .mute-btn`,
+      solo: `.lane[data-id="${laneId}"] .solo-btn`,
+    };
+    const hittable = await page.evaluate((sel) => {
+      const out = {};
+      for (const [k, s] of Object.entries(sel)) {
+        const el = document.querySelector(s);
+        if (!el) { out[k] = false; continue; }
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) { out[k] = false; continue; }
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const hit = document.elementFromPoint(cx, cy);
+        out[k] = !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+      }
+      return out;
+    }, sel);
+    check('every per-lane row-2 icon (×/Mute/Solo) has a real, unclipped hit target at its own screen coordinates',
+      Object.values(hittable).every(Boolean), hittable);
+
+    const sizes = await page.evaluate((sel) => {
+      const out = {};
+      for (const k of Object.keys(sel)) {
+        const r = document.querySelector(sel[k]).getBoundingClientRect();
+        out[k] = { w: Math.round(r.width), h: Math.round(r.height) };
+      }
+      return out;
+    }, sel);
+    check('per-lane ×/Mute/Solo icons are all >=16px hit targets', Object.values(sizes).every(s => s.w >= 16 && s.h >= 16), sizes);
+
     const positions = await page.evaluate((sel) => {
       const out = {};
       for (const [k, s] of Object.entries(sel)) { out[k] = document.querySelector(s).getBoundingClientRect().left; }
       return out;
     }, sel);
-    check('row 2 layout: × is left of Channel, which is left of the colour swatch, which is left of Mute, which is left of Solo',
-      positions.del < positions.chn && positions.chn < positions.swatch && positions.swatch < positions.mute && positions.mute < positions.solo, positions);
+    check('row 2 layout: × is left of Mute, which is left of Solo',
+      positions.del < positions.mute && positions.mute < positions.solo, positions);
 
     // Real Playwright pointer clicks (no force:true, no dispatchEvent) must
     // actually land and trigger the real behavior, not just report a
@@ -1333,73 +1465,68 @@ async function run() {
     const mutedAfterRealClick = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).muted, laneId);
     check('a real pointer click on the Mute icon actually toggles mute (not force-clicked, not dispatched)',
       mutedAfterRealClick === true, mutedAfterRealClick);
-
-    await page.click(sel.hide);
-    const hiddenAfterRealClick = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'), laneId);
-    check('a real pointer click on the Hide icon actually hides the lane (not force-clicked, not dispatched)',
-      hiddenAfterRealClick === true, hiddenAfterRealClick);
   });
 
   await withPage(browser, async (page) => {
-    // The drag-to-reorder handle moved out of row 2 into row 3 (appended
-    // after Steps) since it's no longer in row 1 or row 2. Still a real,
-    // unclipped, >=16px hit target.
+    // Row 3: the drag-to-reorder handle sits at the row's right edge, after
+    // the (flex-grow) Tag pill. Still a real, unclipped, >=16px hit target.
     const laneId = await page.evaluate(() => window._TEST_addLane(31, 0));
     await page.waitForTimeout(50);
     const info = await page.evaluate((id) => {
       const row = document.querySelector(`.lane[data-id="${id}"]`);
-      const drag = row.querySelector('.val-row .drag-handle');
+      const drag = row.querySelector('.row3 .drag-handle');
       if (!drag) return { found: false };
       const r = drag.getBoundingClientRect();
-      const stepsRect = row.querySelector('.val-row .stepsn').getBoundingClientRect();
+      const pillRect = row.querySelector('.row3 .tag-pill').getBoundingClientRect();
+      const row3Rect = row.querySelector('.row3').getBoundingClientRect();
       const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
       const hit = document.elementFromPoint(cx, cy);
       return {
         found: true,
         w: Math.round(r.width), h: Math.round(r.height),
         hittable: !!hit && (hit === drag || drag.contains(hit) || hit.contains(drag)),
-        afterSteps: r.left >= stepsRect.left,
+        afterTagPill: r.left >= pillRect.right - 1,
+        atRightEdge: Math.abs(r.right - row3Rect.right) < 20,
       };
     }, laneId);
-    check('row 3 (Val/Pos/Steps) ends with a real, unclipped, >=16px drag-to-reorder handle positioned after Steps',
-      info.found && info.w >= 16 && info.h >= 16 && info.hittable && info.afterSteps, info);
+    check('row 3 (Tag pill + Move) ends with a real, unclipped, >=16px drag-to-reorder handle at the row\'s right edge',
+      info.found && info.w >= 16 && info.h >= 16 && info.hittable && info.afterTagPill && info.atRightEdge, info);
   });
 
   await withPage(browser, async (page) => {
-    // Lane colour reverted from the v0.9.6 stripe back to a swatch button
-    // in row 2 — same click-to-cycle-LANE_COLORS behavior via a real
-    // pointer click, and every element showing this lane's color (row 2's
-    // swatch, the top-bar swatch, the tag-pill dot) stays in sync.
+    // Lane colour is a swatch button in row 1 (moved there from row 2 in
+    // v0.9.9) — same click-to-cycle-LANE_COLORS behavior via a real pointer
+    // click, and every element showing this lane's color (row 1's swatch,
+    // the tag-pill dot) stays in sync.
     const laneId = await page.evaluate(() => window._TEST_addLane(40, 0));
     await page.waitForTimeout(50);
     const before = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
-    await page.click(`.lane[data-id="${laneId}"] .icon-row .swatch`);
+    await page.click(`.lane[data-id="${laneId}"] .lane-row1 .swatch`);
     await page.waitForTimeout(30);
     const after = await page.evaluate((id) => {
       const lane = window._TEST_state.ccLanes.find(l => l.id === id);
       const row = document.querySelector(`.lane[data-id="${id}"]`);
       return {
         color: lane.color,
-        rowSwatchBg: getComputedStyle(row.querySelector('.icon-row .swatch')).backgroundColor,
-        tbSwatchBg: getComputedStyle(row.querySelector('.tb-swatch')).backgroundColor,
+        row1SwatchBg: getComputedStyle(row.querySelector('.lane-row1 .swatch')).backgroundColor,
         tagDotBg: getComputedStyle(row.querySelector('.tag-pill-dot')).backgroundColor,
       };
     }, laneId);
-    check('a real pointer click on the row-2 colour swatch cycles the lane\'s color',
+    check('a real pointer click on the row-1 colour swatch cycles the lane\'s color',
       after.color !== before, { before, after });
-    check('cycling the colour keeps the row-2 swatch, top-bar swatch, and tag-pill dot all in sync',
-      after.rowSwatchBg === after.tbSwatchBg && after.tbSwatchBg === after.tagDotBg, after);
+    check('cycling the colour keeps the row-1 swatch and the tag-pill dot in sync',
+      after.row1SwatchBg === after.tagDotBg, after);
 
-    // Clicking the top-bar swatch (available when the lane is minimized)
-    // cycles color too, for consistency with row 2's swatch.
-    const beforeTb = after.color;
-    await page.click(`.lane[data-id="${laneId}"] .move-btn[title="Hide lane"]`);
+    // Row 1 (including its swatch) is the SAME element while minimized —
+    // no separate duplicate — so clicking it there must cycle color too.
+    const beforeMin = after.color;
+    await page.click(`.lane[data-id="${laneId}"] .toggle-btn`);
     await page.waitForTimeout(30);
-    await page.click(`.lane[data-id="${laneId}"] .tb-swatch`);
+    await page.click(`.lane[data-id="${laneId}"] .lane-row1 .swatch`);
     await page.waitForTimeout(30);
-    const afterTb = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
-    check('a real pointer click on the minimized lane\'s top-bar swatch also cycles the lane\'s color',
-      afterTb !== beforeTb, { beforeTb, afterTb });
+    const afterMin = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
+    check('a real pointer click on the swatch still cycles the lane\'s color while the lane is minimized (same element, no duplicate)',
+      afterMin !== beforeMin, { beforeMin, afterMin });
   });
 
   // ---------------- Channel picker popover ----------------
@@ -1415,7 +1542,7 @@ async function run() {
     });
     const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
     const btnLabelBefore = await page.evaluate(() => document.querySelector('.lane .chn-btn').textContent);
-    check('the Channel control in row 2 is a button labeled "Ch N", not a number input',
+    check('the Channel control in row 1 is a button labeled "Ch N", not a number input',
       btnLabelBefore === 'Ch1', btnLabelBefore);
 
     await page.click('.lane .chn-btn');
@@ -1472,30 +1599,42 @@ async function run() {
       closedAfterEscape, closedAfterEscape);
   });
 
-  // ---------------- Minimized-lane drag-to-reorder (item 4) ----------------
+  // ---------------- Minimized-lane drag-to-reorder (v0.9.9 behavior change) ----------------
 
   await withPage(browser, async (page) => {
-    // A minimized lane can now genuinely be dragged to a new position via
-    // its top-bar's Move icon — previously the only drag handle lived
-    // inside the (display:none-while-minimized) lanebody, so a minimized
-    // lane could not be reordered at all. This drives a real HTML5 DnD
-    // sequence (mousedown on the handle arms row.draggable, then
-    // dragstart/dragover/drop on the target row) rather than just checking
-    // the element exists.
+    // v0.9.9 tradeoff: since the old duplicate .lane-top-bar (and its own
+    // ⠿ tb-drag handle) is gone, row 3 — the only place the drag handle now
+    // lives — is hidden along with the rest of .lanebody while a lane is
+    // minimized, so a minimized lane can no longer be reordered without
+    // first maximizing it. Confirm that's true (no usable drag handle while
+    // minimized), and that maximizing restores full drag-to-reorder via the
+    // same row-3 handle used by any expanded lane — this drives a real
+    // HTML5 DnD sequence (mousedown arms row.draggable, then dragstart/
+    // dragover/drop) rather than just checking the element exists.
     const idA = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
     const idB = await page.evaluate(() => window._TEST_addLane(50, 0));
     await page.waitForTimeout(50);
-    // Minimize lane B and confirm its Move icon is now the only way to grab it.
-    await page.click(`.lane[data-id="${idB}"] .move-btn[title="Hide lane"]`);
+    await page.click(`.lane[data-id="${idB}"] .toggle-btn`);
+    await page.waitForTimeout(50);
+    const minimizedDragUsable = await page.evaluate((idB) => {
+      const rowB = document.querySelector(`.lane[data-id="${idB}"]`);
+      const dragHandle = rowB.querySelector('.row3 .drag-handle');
+      return !!dragHandle && dragHandle.getBoundingClientRect().height > 0;
+    }, idB);
+    check('a minimized lane has no usable drag-to-reorder handle (row 3 is hidden along with the rest of .lanebody)',
+      minimizedDragUsable === false, minimizedDragUsable);
+
+    // Maximize it back and confirm the SAME row-3 handle now works.
+    await page.click(`.lane[data-id="${idB}"] .toggle-btn`);
     await page.waitForTimeout(50);
     const orderBefore = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
     const result = await page.evaluate(({ idA, idB }) => {
       const rowA = document.querySelector(`.lane[data-id="${idA}"]`);
       const rowB = document.querySelector(`.lane[data-id="${idB}"]`);
-      const dragHandle = rowB.querySelector('.tb-drag');
-      if (!dragHandle) return { error: 'no tb-drag handle on minimized lane' };
+      const dragHandle = rowB.querySelector('.row3 .drag-handle');
+      if (!dragHandle) return { error: 'no row-3 drag handle on the maximized lane' };
       dragHandle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-      if (!rowB.draggable) return { error: 'row.draggable not armed by tb-drag mousedown', draggable: rowB.draggable };
+      if (!rowB.draggable) return { error: 'row.draggable not armed by drag-handle mousedown', draggable: rowB.draggable };
       const dt = new DataTransfer();
       rowB.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: dt }));
       const r = rowA.getBoundingClientRect();
@@ -1506,7 +1645,7 @@ async function run() {
     }, { idA, idB });
     await page.waitForTimeout(50);
     const orderAfter = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
-    check('the minimized lane top-bar\'s Move icon actually enables drag-to-reorder (a functional drag, not just element presence)',
+    check('after maximizing, the same row-3 Move handle enables a functional drag-to-reorder',
       !result.error && orderBefore.indexOf(idB) > orderBefore.indexOf(idA) && orderAfter.indexOf(idB) < orderAfter.indexOf(idA),
       { result, orderBefore, orderAfter });
   });
@@ -1666,7 +1805,15 @@ async function run() {
     await page.mouse.up();
     await page.waitForTimeout(80);
     const bypassedV = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId).points.find(p => Math.abs(p.t - 960) < 5).v, laneId);
-    check('holding Shift while dragging a point bypasses Steps snapping', Math.abs(bypassedV - 60) <= 2, bypassedV);
+    // Tolerance widened from +/-2 to +/-4 in v0.9.9: row 1 now sits above the
+    // canvas as its own fixed-height strip instead of sharing the lanebody's
+    // column with rows 2/3 (see buildLaneDom), so a default-height lane's
+    // canvas is ~30px shorter than before — coarser value-per-pixel
+    // resolution means a few steps of mouse interpolation land a couple of
+    // value-units further off target than they used to. The behavior under
+    // test (Shift bypasses the Steps snap) is unchanged; only the pixel
+    // math changed.
+    check('holding Shift while dragging a point bypasses Steps snapping', Math.abs(bypassedV - 60) <= 4, bypassedV);
   });
 
   await withPage(browser, async (page) => {
@@ -2944,21 +3091,38 @@ async function run() {
   await withPage(browser, async (page) => {
     // A crushed flex-shrink bug used to let minimized lanes collapse toward
     // 0px once enough of them were competing for space with the rest of the
-    // lane list — they'd visually vanish. Every minimized lane must keep its
-    // fixed top-bar height (22px) no matter how many siblings are minimized.
+    // lane list — they'd visually vanish. v0.9.9 retune: the old fixed
+    // 22px top-bar floor is gone along with the top-bar itself; a minimized
+    // lane's whole visible content is now row 1 alone (Toggle/CC/Name/
+    // Channel/Colour), so its natural height (~29-30px) is what must survive
+    // being crushed, and — since row 1 is now the SAME functional controls
+    // shown when expanded, not a stripped-down duplicate — its actual text
+    // must still be genuinely visible/readable, not just "tall enough on
+    // paper" (same class of check as the 27-expanded-lanes test below).
     const ids = [];
-    for (let i = 0; i < 8; i++) ids.push(await page.evaluate((cc) => window._TEST_addLane(cc, 0), 40 + i));
-    await page.waitForTimeout(100);
+    for (let i = 0; i < 20; i++) ids.push(await page.evaluate((cc) => window._TEST_addLane(cc, 0), 40 + i));
+    await page.waitForTimeout(150);
 
     for (const id of ids) {
-      await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .move-btn[title="Hide lane"]`).click(), id);
-      await page.waitForTimeout(20);
+      await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"] .toggle-btn`).click(), id);
+      await page.waitForTimeout(15);
     }
-    await page.waitForTimeout(80);
+    await page.waitForTimeout(100);
 
-    const heights = await page.evaluate((ids) => ids.map(id => document.querySelector(`.lane[data-id="${id}"]`).offsetHeight), ids);
-    check('every minimized lane keeps a real, non-crushed height (>=20px) even with many minimized at once',
-      heights.every(h => h >= 20), heights);
+    const info = await page.evaluate((ids) => {
+      const heights = ids.map(id => document.querySelector(`.lane[data-id="${id}"]`).offsetHeight);
+      const lastCcn = document.querySelector(`.lane[data-id="${ids[ids.length - 1]}"] .lane-row1 .ccn`);
+      const r = lastCcn.getBoundingClientRect();
+      return {
+        heights,
+        allHidden: ids.every(id => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden')),
+        lastCcVisible: r.height > 8 && getComputedStyle(lastCcn).display !== 'none' && getComputedStyle(lastCcn).visibility !== 'hidden',
+      };
+    }, ids);
+    check('every minimized lane keeps a real, non-crushed row-1 height (>=26px) even with 20 minimized at once',
+      info.allHidden && info.heights.every(h => h >= 26), info.heights);
+    check('the last of many minimized lanes still has a genuinely visible (non-zero-height) row-1 CC# field',
+      info.lastCcVisible, info.lastCcVisible);
   });
 
   await withPage(browser, async (page) => {
@@ -2968,8 +3132,8 @@ async function run() {
     // flexbox default flex-shrink:1, so instead of .lanes' own overflow-y:
     // auto kicking in to scroll, every lane got crushed toward 0px and
     // rendered with no visible text at all. Every expanded lane must keep at
-    // least its functional floor (LANE_MIN_H, 60px — enough for rows 1+2)
-    // regardless of how many siblings exist, with the container scrolling
+    // least its functional floor (LANE_MIN_H, 64px — enough for row 1 + row
+    // 2) regardless of how many siblings exist, with the container scrolling
     // to accommodate the rest instead.
     const ids = [];
     for (let i = 0; i < 27; i++) ids.push(await page.evaluate((cc) => window._TEST_addLane(cc, 0), 40 + i));
@@ -2980,8 +3144,8 @@ async function run() {
       const lanesEl = document.getElementById('lanes');
       return { heights, scrollHeight: lanesEl.scrollHeight, clientHeight: lanesEl.clientHeight };
     }, ids);
-    check('27 expanded lanes at once (a large ISF import) keep every lane at/above its 60px functional floor, not crushed toward 0',
-      info.heights.every(h => h >= 60), info.heights);
+    check('27 expanded lanes at once (a large ISF import) keep every lane at/above its 64px functional floor, not crushed toward 0',
+      info.heights.every(h => h >= 64), info.heights);
     check('the lane list scrolls (content taller than the viewport) instead of shrinking lanes to fit',
       info.scrollHeight > info.clientHeight, { scrollHeight: info.scrollHeight, clientHeight: info.clientHeight });
 
