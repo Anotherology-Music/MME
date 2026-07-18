@@ -2961,6 +2961,41 @@ async function run() {
       heights.every(h => h >= 20), heights);
   });
 
+  await withPage(browser, async (page) => {
+    // Same defect, but for ordinary EXPANDED lanes: a large ISF import (e.g.
+    // 27 CC lanes at once, as reported) has a combined natural height far
+    // exceeding a normal window — .lane previously had min-height:0 and the
+    // flexbox default flex-shrink:1, so instead of .lanes' own overflow-y:
+    // auto kicking in to scroll, every lane got crushed toward 0px and
+    // rendered with no visible text at all. Every expanded lane must keep at
+    // least its functional floor (LANE_MIN_H, 60px — enough for rows 1+2)
+    // regardless of how many siblings exist, with the container scrolling
+    // to accommodate the rest instead.
+    const ids = [];
+    for (let i = 0; i < 27; i++) ids.push(await page.evaluate((cc) => window._TEST_addLane(cc, 0), 40 + i));
+    await page.waitForTimeout(150);
+
+    const info = await page.evaluate((ids) => {
+      const heights = ids.map(id => document.querySelector(`.lane[data-id="${id}"]`).offsetHeight);
+      const lanesEl = document.getElementById('lanes');
+      return { heights, scrollHeight: lanesEl.scrollHeight, clientHeight: lanesEl.clientHeight };
+    }, ids);
+    check('27 expanded lanes at once (a large ISF import) keep every lane at/above its 60px functional floor, not crushed toward 0',
+      info.heights.every(h => h >= 60), info.heights);
+    check('the lane list scrolls (content taller than the viewport) instead of shrinking lanes to fit',
+      info.scrollHeight > info.clientHeight, { scrollHeight: info.scrollHeight, clientHeight: info.clientHeight });
+
+    // And each lane's row-1 text (name input, CC number) is genuinely visible,
+    // not just "tall enough on paper" — the user's actual complaint was that
+    // no text rendered at all.
+    const nameVisible = await page.evaluate((id) => {
+      const inp = document.querySelector(`.lane[data-id="${id}"] input.lname`);
+      const r = inp.getBoundingClientRect();
+      return r.height > 8 && getComputedStyle(inp).display !== 'none' && getComputedStyle(inp).visibility !== 'hidden';
+    }, ids[ids.length - 1]);
+    check('the last of many expanded lanes still has a genuinely visible (non-zero-height) name field', nameVisible, nameVisible);
+  });
+
   // ---------------- Autosave & crash recovery ----------------
 
   await withPage(browser, async (page) => {

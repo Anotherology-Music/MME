@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.7
+  MMV MIDI & CC Curve Editor v0.9.8
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -264,6 +264,16 @@
   1Password/LastPass/Bitwarden autofill icons (autocomplete="off" plus each
   manager's own ignore attribute), which were popping up over typed text in
   the Name field.
+  v0.9.8 Fix: a large ISF import (e.g. 27 CC lanes at once) crushed every
+  lane down toward 0px height with no visible text at all, instead of
+  letting the lane list scroll. Same underlying flex-shrink defect already
+  fixed for minimized lanes a few versions back (min-height:0 + the
+  flexbox default flex-shrink:1 let the lane list crush its items instead
+  of scrolling once their combined height exceeded the window), just never
+  applied to ordinary expanded lanes — now every lane keeps a real,
+  non-crushed floor (60px, matching the existing grip-drag minimum)
+  regardless of how many lanes exist, and the lane list scrolls for the
+  rest exactly as it already could.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -425,16 +435,24 @@
 
   .pr-splitter{height:5px;flex:0 0 5px;background:var(--panel2);border-top:1px solid var(--line);border-bottom:1px solid var(--line);cursor:ns-resize;}
   .pr-splitter:hover,.pr-splitter.dragging{background:var(--accent2);}
+  /* min-height:0 here overrides the flexbox default auto min-height on
+     .lanes itself (which would otherwise be based on the summed min-content
+     size of every lane inside it) — without it, .lanes could refuse to
+     shrink below that sum and overflow its own parent instead of scrolling.
+     This is unrelated to how far an individual .lane item can shrink; see
+     .lane below for that. */
   .lanes{display:flex;flex-direction:column;flex:1 1 0;min-height:0;overflow-y:auto;}
-  /* min-height:0 overrides the flexbox default auto min-height (which is
-     based on content's min-content size) — without it, on short viewports
-     where .lanes (the scrolling flex column above) has to squeeze a lane
-     below its own content's natural minimum, the lane would refuse to
-     shrink and silently overflow .lanes' clipped box instead, leaving its
-     grip (and everything below the clip line) positioned outside the
-     visible/hittable area even though getBoundingClientRect still reports
-     a plausible-looking box for it. */
-  .lane{height:92px;min-height:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
+  /* min-height:60px + flex-shrink:0 (not the flexbox default min-height:0 +
+     shrink:1) is deliberate: with a plain min-height:0, once enough lanes'
+     combined 92px-each height exceeded .lanes' available space (e.g. a
+     27-lane ISF import into a normal-height window), the flex algorithm
+     crushed every lane down toward 0px instead of leaving .lanes' own
+     overflow-y:auto to scroll — same defect already fixed for .lane-hidden
+     below, just never applied to ordinary expanded lanes. 60px matches
+     LANE_MIN_H (the grip-drag floor) so a lane can still be manually
+     shrunk that far, but nothing — pure lane count included — can crush it
+     smaller than that; the container scrolls instead, as it already could. */
+  .lane{height:92px;min-height:60px;flex-shrink:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
   .lanebody{flex:1;display:flex;min-height:0;}
   .lane.active .leftcol{box-shadow:inset 3px 0 0 var(--accent2);}
 
