@@ -117,6 +117,13 @@ async function withPage(browser, fn) {
   page.on('pageerror', e => console.log('  [page error]', e.message));
   await page.goto(URL);
   await page.waitForTimeout(250);
+  // A fresh project no longer seeds a default CC1 lane (v0.9.10) — most
+  // tests aren't exercising that startup behavior at all and just relied on
+  // a lane existing as scaffolding (ccLanes[0], etc). Seed one baseline lane
+  // here so every test's actual premise still holds; the couple of tests
+  // that specifically verify the NEW empty-start behavior open their own
+  // page directly instead of going through this helper.
+  await page.evaluate(() => window._TEST_addLane(1, 0));
   try { await fn(page); } finally { await page.close(); }
 }
 
@@ -141,6 +148,19 @@ async function run() {
   const browser = await chromium.launch();
 
   // ---------------- Baseline / core ----------------
+
+  {
+    // A genuinely fresh load (not routed through withPage(), which seeds a
+    // baseline lane as scaffolding for the rest of this suite) must start
+    // with zero CC lanes — the old always-add-a-default-CC1-lane startup
+    // behavior was removed in v0.9.10.
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    await page.goto(URL);
+    await page.waitForTimeout(250);
+    const laneCount = await page.evaluate(() => window._TEST_state.ccLanes.length);
+    check('a fresh project starts with zero CC lanes (no default CC1 auto-added)', laneCount === 0, laneCount);
+    await page.close();
+  }
 
   await withPage(browser, async (page) => {
     const bars = await page.evaluate(() => window._TEST_state.bars);
@@ -220,6 +240,8 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
+    // withPage() seeds one baseline pristine CC1/Ch0 lane; adding a second
+    // (non-pristine, cc=2) is what makes projectHasContent() true here.
     await page.click('#addLane');
     await page.setInputFiles('#fileInput', midiTmpPath);
     await page.waitForTimeout(200);

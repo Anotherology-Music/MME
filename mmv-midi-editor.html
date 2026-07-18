@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.9
+  MMV MIDI & CC Curve Editor v0.9.10
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -303,6 +303,15 @@
   (or many expanded at once, re-verified) still can't be crushed toward
   0px. Shrinking an expanded lane via the grip or Alt+wheel still floors at
   rows 1+2, with row 3 (now Tag+Move) hiding first, same policy as before.
+  v0.9.10 Fix: row 1's Name field could grow to fill the lane's full width
+  (row 1 sits above the curve canvas as a full-width strip) and visually
+  spill past the leftcol/canvas divider into the curve area with a long
+  enough name. Row 1 is now width-matched to the leftcol itself, and the
+  Name field's own max-width is smaller, so it can no longer cross that
+  line regardless of leftcol width or name length.
+  A fresh project no longer auto-adds a default CC1 "Modulation Wheel"
+  lane — new projects start with zero CC lanes; "+ Add CC lane"/"+ Add PB
+  lane" create the first one exactly as they always did.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -497,7 +506,11 @@
      .lane.lane-hidden below) — this is what a minimized lane's whole
      visible height rests on now, replacing the old top-bar's hardcoded
      22px floor. */
-  .lane .lane-row1{flex:0 0 auto;display:flex;align-items:center;gap:5px;
+  /* Width-matched to .leftcol (var(--keys-w)) rather than left to stretch
+     across the whole .lane — without this, row 1's Name field (flex-grow:1)
+     had the entire lane's width to expand into and visually spilled well
+     past the leftcol/canvas divider line into the curve-drawing area. */
+  .lane .lane-row1{flex:0 0 auto;width:var(--keys-w);display:flex;align-items:center;gap:5px;
     min-height:28px;box-sizing:border-box;padding:4px 6px;
     background:var(--panel);border-bottom:1px solid var(--line);}
 
@@ -532,7 +545,7 @@
   .lane .lane-row1 .ccn::-webkit-outer-spin-button,
   .lane .lane-row1 .ccn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   .lane .lane-row1 .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
-  .lane .lane-row1 input.lname{flex:1 1 80px;min-width:0;max-width:260px;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
+  .lane .lane-row1 input.lname{flex:1 1 60px;min-width:0;max-width:140px;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   /* Channel — a button (not a free-typing number field) labeled "Ch N" that
      opens the shared #chPopover listing all 16 MIDI channels by number and
      configured name; see #chPopover below. Lives in row 1. */
@@ -5582,7 +5595,10 @@
       row.appendChild(lbl); row.appendChild(inp); grid.appendChild(row);
     } }
     populateViewCh();
-    addLane(1,0); prScroll.scrollTop=pitchToY(84); state.scrollTop=prScroll.scrollTop;
+    // No default CC1 lane on a fresh start — the empty-lane-list state is
+    // already fully supported (Generate/tag-bar/active-lane logic all treat
+    // it as valid); "+ Add CC lane" / "+ Add PB lane" create the first one.
+    prScroll.scrollTop=pitchToY(84); state.scrollTop=prScroll.scrollTop;
     keysCanvas.style.transform='translateY('+(-state.scrollTop)+'px)'; prCanvas.style.transform='translate(0px,'+state.scrollTop+'px)';
     updatePlayheadEl(); updateUndoBtns(); updateLoopStatus(); updatePlayPos(); updateTransportBtns(); updateDuration();
     requestDraw();
