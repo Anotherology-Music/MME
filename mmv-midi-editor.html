@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.15
+  MMV MIDI & CC Curve Editor v0.9.16
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -422,6 +422,21 @@
   Export downloads an updated .fs (original untouched) and, when any row is
   wiring-checked, a plain-text wiring sheet. Imported ISFs are also now
   copied into the current Projects Folder on import, when one is set.
+  v0.9.16 Fix: ISF import silently dropped every point2D input (e.g.
+  AspectXZ, GemScreenOffset) — buildMappingRows had no branch for that type,
+  so it fell through every check and simply vanished from the dialog with no
+  indication. point2D now splits into two rows ("<Name> X" / "<Name> Y",
+  matching MMV's own display) with per-axis MIN/MAX read from an array, a
+  single shared MIN/MAX, or falling back to 0..1 if the shader declares
+  neither. Also fixed: a TYPE "float" input carrying its own VALUES/LABELS
+  array (a real, if non-standard, pattern some ISF shaders use for an
+  enum-style control instead of TYPE "long") used to lose its Steps and
+  LABELS entirely — Steps and the Migrate-to-MMV Step modifier now both
+  recognize it. Migrate to MMV's export can now correctly recombine a
+  point2D's two rows back into one 2-element DEFAULT array. Any ISF input
+  type still not recognized (e.g. point3D) now shows a visible "Not shown"
+  notice in the import dialog naming it, instead of disappearing silently —
+  the general fix for the class of bug point2D fell into.
 -->
 
 <style>
@@ -5146,17 +5161,43 @@
           const def=inp.DEFAULT||inp.default||[0,0,0,1];
           const chNames=['R','G','B','A'];
           for(let ci=0;ci<4;ci++){
-            rows.push({name:nm+'.'+chNames[ci],type:'color',min:0,max:1,
+            rows.push({name:nm+'.'+chNames[ci],srcName:nm,type:'color',min:0,max:1,
               defaultVal:typeof def[ci]==='number'?def[ci]:0,isColor:true,colorCh:ci});
+          }
+        } else if(t==='point2D'||t==='point2d'){
+          // ISF's point2D isn't a plain scalar and has no dedicated branch
+          // elsewhere in this function, so without this it silently falls
+          // through every check below and the parameter just vanishes from
+          // the import — split it into two mappable rows instead, same
+          // pattern as color's per-channel split. MIN/MAX may be given as a
+          // 2-element array (per-axis), a single number (applies to both
+          // axes), or omitted (falls back to 0..1, same default this
+          // function already uses for a bare float with no declared range).
+          const def=inp.DEFAULT||inp.default||[0,0];
+          const minRaw=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:null);
+          const maxRaw=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:null);
+          const axNames=['X','Y'];
+          for(let ai=0;ai<2;ai++){
+            const mn=Array.isArray(minRaw)?(minRaw[ai]!=null?minRaw[ai]:0):(minRaw!=null?minRaw:0);
+            const mx=Array.isArray(maxRaw)?(maxRaw[ai]!=null?maxRaw[ai]:1):(maxRaw!=null?maxRaw:1);
+            rows.push({name:nm+' '+axNames[ai],srcName:nm,type:'float',min:mn,max:mx,
+              defaultVal:typeof def[ai]==='number'?def[ai]:0,isPoint2D:true,pointAxis:ai});
           }
         } else if(t==='float'){
           const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
           const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:1);
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
-          rows.push({name:nm,type:'float',min:mn,max:mx,defaultVal:dv});
+          const vals=inp.VALUES||inp.values||null;
+          const labs=inp.LABELS||inp.labels||null;
+          // A handful of real-world ISF shaders (this app's own gem shaders
+          // among them) declare a discrete/enum control as TYPE "float" with
+          // a VALUES/LABELS array rather than TYPE "long" — without this,
+          // Steps/LABELS silently get dropped for exactly those parameters.
+          const isfSteps=vals?vals.length:0;
+          rows.push({name:nm,srcName:nm,type:'float',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
         } else if(t==='bool'||t==='boolean'){
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:false);
-          rows.push({name:nm,type:'bool',min:0,max:1,defaultVal:dv?1:0,steps:2});
+          rows.push({name:nm,srcName:nm,type:'bool',min:0,max:1,defaultVal:dv?1:0,steps:2});
         } else if(t==='long'||t==='int'){
           const vals=inp.VALUES||inp.values||null;
           const labs=inp.LABELS||inp.labels||null;
@@ -5167,7 +5208,7 @@
           // an explicit VALUES list gives its own option count, otherwise a
           // plain integer range is inherently one step per integer.
           const isfSteps=vals?vals.length:Math.max(2,Math.round(mx-mn+1));
-          rows.push({name:nm,type:'long',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
+          rows.push({name:nm,srcName:nm,type:'long',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
         }
       }
       return rows;
@@ -5215,6 +5256,18 @@
       const rows=buildMappingRows(inputs);
       if(!rows.length){ flash('No mappable parameters found in ISF shader.'); return; }
 
+      // Anything whose TYPE isn't one buildMappingRows knows how to turn
+      // into a row (a genuinely unsupported/unrecognized type, or a typo)
+      // would otherwise vanish from this dialog with zero indication —
+      // exactly the failure mode that let point2D inputs go missing
+      // silently before it got a branch of its own. Surface it instead.
+      const mappedSrc=new Set(rows.map(function(r){ return r.srcName; }));
+      const INTENTIONALLY_UNMAPPABLE=['image','audio','audioFFT','event'];
+      const skipped=inputs.filter(function(inp){
+        const t=inp.TYPE||inp.type||'';
+        return INTENTIONALLY_UNMAPPABLE.indexOf(t)===-1 && !mappedSrc.has(inp.NAME||inp.name||'?');
+      });
+
       const existing=document.getElementById('isfDialog');
       if(existing) existing.remove();
 
@@ -5249,6 +5302,15 @@
       sceneInput.style.cssText='width:120px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:3px 6px;font-size:12px;';
       tagRow.appendChild(tagInfo); tagRow.appendChild(sceneLbl); tagRow.appendChild(sceneInput);
       dlg.appendChild(tagRow);
+
+      if(skipped.length){
+        const warnRow=document.createElement('div');
+        warnRow.style.cssText='padding:6px 18px;border-bottom:1px solid #2c313b;flex-shrink:0;font-size:11px;color:#ffb454;';
+        warnRow.textContent='Not shown (unsupported input type): '+skipped.map(function(inp){
+          return (inp.NAME||inp.name||'?')+' ('+(inp.TYPE||inp.type||'?')+')';
+        }).join(', ');
+        dlg.appendChild(warnRow);
+      }
 
       // ── Table ────────────────────────────────────────────────────
       const tableWrap=document.createElement('div');
@@ -5624,9 +5686,14 @@
     // guessed.
     function computeModifiers(row){
       const scale=row.max-row.min, offset=row.min;
-      if(row.type!=='long'&&row.type!=='bool') return {scale,offset,step:null,warning:null};
+      // Discrete = long/bool, OR a float carrying its own VALUES array (some
+      // real ISF shaders declare an enum-style control as TYPE "float" with
+      // VALUES/LABELS instead of TYPE "long" — see buildMappingRows).
+      const hasValues=Array.isArray(row.values)&&row.values.length>1;
+      const discrete=row.type==='long'||row.type==='bool'||(row.type==='float'&&hasValues);
+      if(!discrete) return {scale,offset,step:null,warning:null};
       if(row.type==='bool') return {scale,offset,step:1,warning:null};
-      if(Array.isArray(row.values)&&row.values.length>1){
+      if(hasValues){
         const diffs=[]; for(let i=1;i<row.values.length;i++) diffs.push(row.values[i]-row.values[i-1]);
         const d0=diffs[0], even=diffs.every(function(d){ return Math.abs(d-d0)<1e-6; });
         if(!even) return {scale,offset,step:null,warning:'Irregular VALUES spacing — set Step manually in MMV.'};
@@ -5656,8 +5723,11 @@
     }
 
     // Deep-clones the entry's header, writes each checked row's playhead
-    // value into its INPUT's DEFAULT (recombining color R/G/B/A rows back
-    // into a single 4-element array), and returns the new header object.
+    // value into its INPUT's DEFAULT (recombining color R/G/B/A rows, or
+    // point2D X/Y rows, back into a single array), and returns the new
+    // header object. Looks the INPUT up by row.srcName (the original ISF
+    // NAME every row carries, regardless of how many rows it was split
+    // into) rather than re-deriving it from the display name.
     function buildUpdatedHeader(entry,rows,nativeByName,updateSet){
       const header=JSON.parse(JSON.stringify(parseISFHeader(entry.source)));
       const inputs=header.INPUTS||header.inputs||[];
@@ -5665,17 +5735,16 @@
         if(!updateSet.has(row.name)) return;
         const native=nativeByName[row.name];
         if(native==null) return;
+        const inp=inputs.find(function(i){ return (i.NAME||i.name)===(row.srcName||row.name); });
+        if(!inp) return;
+        const key=inp.DEFAULT!=null?'DEFAULT':'default';
         if(row.isColor){
-          const baseName=row.name.slice(0,row.name.lastIndexOf('.'));
-          const inp=inputs.find(function(i){ return (i.NAME||i.name)===baseName; });
-          if(!inp) return;
-          const key=inp.DEFAULT!=null?'DEFAULT':'default';
           if(!Array.isArray(inp[key])) inp[key]=[0,0,0,1];
           inp[key][row.colorCh]=native;
+        } else if(row.isPoint2D){
+          if(!Array.isArray(inp[key])) inp[key]=[0,0];
+          inp[key][row.pointAxis]=native;
         } else {
-          const inp=inputs.find(function(i){ return (i.NAME||i.name)===row.name; });
-          if(!inp) return;
-          const key=inp.DEFAULT!=null?'DEFAULT':'default';
           inp[key]=row.type==='bool'?!!native:native;
         }
       });

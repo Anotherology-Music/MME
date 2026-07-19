@@ -2288,6 +2288,128 @@ async function run() {
     check('Clicking a picker entry opens that entry\'s migrate sheet', sheetTitle === true, sheetTitle);
   });
 
+  // ---------------- ISF import: point2D inputs + float-with-VALUES (bug fix) ----------------
+
+  await withPage(browser, async (page) => {
+    // point2D inputs (e.g. AspectXZ, GemScreenOffset) had no branch in
+    // buildMappingRows at all and silently vanished from the import dialog
+    // with zero indication — this is the exact bug report. Cover all three
+    // MIN/MAX declaration styles a real shader might use.
+    const header = {
+      INPUTS: [
+        { NAME: 'AspectXZ', TYPE: 'point2D', DEFAULT: [1, 1] }, // no MIN/MAX -> falls back to 0..1, same as a bare float
+        { NAME: 'RangePoint', TYPE: 'point2D', DEFAULT: [0.5, 0.5], MIN: [0, -1], MAX: [2, 1] }, // per-axis array MIN/MAX
+        { NAME: 'ScalarRangePoint', TYPE: 'point2D', DEFAULT: [5, 5], MIN: 0, MAX: 10 }, // single MIN/MAX applies to both axes
+      ],
+    };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'points.fs'), header);
+    await page.waitForTimeout(150);
+    const rowNames = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody td:first-child')).map(td => td.textContent));
+    check('point2D input produces two rows named "<Name> X" / "<Name> Y" (matches MMV\'s own display, not a dot separator)',
+      rowNames.includes('AspectXZ X') && rowNames.includes('AspectXZ Y'), rowNames);
+
+    const rows = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody tr')).map(tr => {
+      const tds = tr.querySelectorAll('td');
+      return { name: tds[0].textContent, min: tds[2].textContent, max: tds[3].textContent, def: tds[4].textContent };
+    }));
+    const aspectX = rows.find(r => r.name === 'AspectXZ X');
+    const rangeX = rows.find(r => r.name === 'RangePoint X');
+    const rangeY = rows.find(r => r.name === 'RangePoint Y');
+    const scalarX = rows.find(r => r.name === 'ScalarRangePoint X');
+    check('point2D with no MIN/MAX: X row shows Min 0 / Max 1 / Default 1', aspectX && aspectX.min === '0' && aspectX.max === '1' && aspectX.def === '1', aspectX);
+    check('point2D with per-axis array MIN/MAX: X row uses MIN[0]/MAX[0]', rangeX && rangeX.min === '0' && rangeX.max === '2', rangeX);
+    check('point2D with per-axis array MIN/MAX: Y row uses MIN[1]/MAX[1] (including a negative MIN)', rangeY && rangeY.min === '-1' && rangeY.max === '1', rangeY);
+    check('point2D with a single scalar MIN/MAX applies it to both axes', scalarX && scalarX.min === '0' && scalarX.max === '10', scalarX);
+  });
+
+  await withPage(browser, async (page) => {
+    // A genuinely unsupported/unrecognized INPUT type must be visibly
+    // flagged, not silently dropped — the general fix for the class of bug
+    // point2D fell into.
+    const header = {
+      INPUTS: [
+        { NAME: 'Known', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 },
+        { NAME: 'Unknown3D', TYPE: 'point3D', DEFAULT: [0, 0, 0] },
+        { NAME: 'AnAudioInput', TYPE: 'audio' }, // intentionally unmappable — should NOT trigger the warning
+      ],
+    };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'mixed.fs'), header);
+    await page.waitForTimeout(150);
+    const warnText = await page.evaluate(() => { const el = document.querySelector('#isfDialog'); const rows = Array.from(el.children); const w = rows.find(r => r.textContent.includes('Not shown')); return w ? w.textContent : null; });
+    check('An unrecognized input type (point3D) surfaces a visible "Not shown" notice naming it', warnText && warnText.includes('Unknown3D') && warnText.includes('point3D'), warnText);
+    check('An intentionally-unmappable type (audio) does NOT trigger the notice', warnText && !warnText.includes('AnAudioInput'), warnText);
+    const rowNames = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody td:first-child')).map(td => td.textContent));
+    check('The unsupported input never appears as an importable row either', !rowNames.includes('Unknown3D'), rowNames);
+  });
+
+  await withPage(browser, async (page) => {
+    // Some real shaders (this app's own gem shaders among them) declare a
+    // discrete/enum control as TYPE "float" with VALUES/LABELS instead of
+    // TYPE "long" — Steps and the wiring-sheet Step modifier must not be
+    // silently lost for those.
+    const cutTypeInput = { NAME: 'CutType', TYPE: 'float', DEFAULT: 2, MIN: 0, MAX: 7, VALUES: [0, 1, 2, 3, 4, 5, 6, 7], LABELS: ['Octa', 'Princess', 'Cushion', 'Emerald', 'Round', 'Oval', 'Trillion', 'Curved'] };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'cuttype.fs'), { INPUTS: [cutTypeInput] });
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+    const cutLane = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.name === 'CutType'));
+    check('A TYPE "float" input with a VALUES array still gets its CC lane\'s Steps auto-set (8 options)', cutLane && cutLane.steps === 8, cutLane);
+
+    const cutRow = { name: 'CutType', type: 'float', min: 0, max: 7, values: [0, 1, 2, 3, 4, 5, 6, 7] };
+    const mods = await page.evaluate((r) => window._TEST_computeModifiers(r), cutRow);
+    check('computeModifiers treats a float-with-VALUES row as discrete too: Scale=7, Offset=0, Step=1 (matches the CutType example from the strategy notes)',
+      mods.scale === 7 && mods.offset === 0 && mods.step === 1, mods);
+  });
+
+  await withPage(browser, async (page) => {
+    // Full round-trip against the ACTUAL header from the user's attached
+    // shader (ComplexDiamond_xyz_Optimised.fs) that surfaced this bug —
+    // AspectXZ and GemScreenOffset (both point2D) must now import and
+    // migrate correctly, and CutType (float+VALUES) must keep its Steps.
+    const realHeader = {
+      INPUTS: [
+        { NAME: 'GemColor', TYPE: 'color', DEFAULT: [1, 0, 0, 1] },
+        { NAME: 'CutType', TYPE: 'float', DEFAULT: 2, MIN: 0, MAX: 7, VALUES: [0, 1, 2, 3, 4, 5, 6, 7], LABELS: ['Octa', 'Princess', 'Cushion', 'Emerald/Radiant', 'Round', 'Oval', 'Trillion', 'Curved Trillion'] },
+        { NAME: 'FacetCount', TYPE: 'float', DEFAULT: 24, MIN: 3, MAX: 96 },
+        { NAME: 'GirdleRadius', TYPE: 'float', DEFAULT: 1, MIN: 0.1, MAX: 10 },
+        { NAME: 'AspectXZ', TYPE: 'point2D', DEFAULT: [1, 1] },
+        { NAME: 'GemScreenOffset', TYPE: 'point2D', DEFAULT: [0, 0] },
+      ],
+    };
+    const realSource = '/*\n' + JSON.stringify(realHeader, null, 2) + '\n*/\nvoid main(){}\n';
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'ComplexDiamond_xyz_Optimised.fs', s), { h: realHeader, s: realSource });
+    await page.waitForTimeout(150);
+    const rowNames = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody td:first-child')).map(td => td.textContent));
+    check('Real shader: all 4 previously-missing rows now appear (AspectXZ X/Y, GemScreenOffset X/Y)',
+      ['AspectXZ X', 'AspectXZ Y', 'GemScreenOffset X', 'GemScreenOffset Y'].every(n => rowNames.includes(n)), rowNames);
+
+    await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+
+    const aspectXId = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.isf && l.isf.name === 'AspectXZ X').id);
+    await page.evaluate((id) => window._TEST_upsertPoint(id, 15000, 100), aspectXId); // automate it, so it's on the wiring sheet
+
+    const entry = await page.evaluate(() => { const h = window._TEST_state.isfHistory; return h[h.length - 1]; });
+    await page.evaluate((e) => window._TEST_openMigrateSheet(e), entry);
+    await page.waitForTimeout(150);
+    const migRows = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => tr.querySelectorAll('td')[0].textContent));
+    check('Migrate sheet also lists the previously-missing point2D-derived rows', ['AspectXZ X', 'AspectXZ Y', 'GemScreenOffset X', 'GemScreenOffset Y'].every(n => migRows.includes(n)), migRows);
+
+    const downloads = [];
+    page.on('download', (d) => downloads.push(d));
+    await page.click('#isfMigrateDialog button:has-text("Export")');
+    await page.waitForTimeout(400);
+    const isfDl = downloads.find(d => d.suggestedFilename().endsWith('.migrated.fs'));
+    const content = fs.readFileSync(await isfDl.path(), 'utf8');
+    const m = content.match(/\/\*\s*([\s\S]*?)\s*\*\//);
+    const newHeader = JSON.parse(m[1]);
+    const aspectInput = newHeader.INPUTS.find(i => i.NAME === 'AspectXZ');
+    check('Exported ISF recombines AspectXZ X/Y back into a single 2-element DEFAULT array, not two orphaned fields',
+      Array.isArray(aspectInput.DEFAULT) && aspectInput.DEFAULT.length === 2, aspectInput);
+  });
+
   // ---------------- GENERATE strip: 6 shapes + direction toggle (item 6) ----------------
 
   await withPage(browser, async (page) => {
