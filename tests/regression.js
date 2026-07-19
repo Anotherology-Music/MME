@@ -3656,6 +3656,30 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
+    // A 3-digit velocity (e.g. 100) must render fully inside #velValInput,
+    // not clip — the field's DOM value being correct isn't enough to prove
+    // this: an earlier version had the right value ("100") but the wrong
+    // (larger) font/padding actually applied, from a global
+    // input[type=number] rule beating the field's own class on specificity,
+    // so it visually clipped to an unreadable "10" + a sliver despite the
+    // underlying data being fine. clientWidth < scrollWidth is exactly that
+    // failure mode.
+    await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 64, start: 0, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      window._TEST_updateNoteInfo();
+    });
+    const m = await page.evaluate(() => {
+      const el = document.getElementById('velValInput');
+      return { value: el.value, clientWidth: el.clientWidth, scrollWidth: el.scrollWidth, fontSize: getComputedStyle(el).fontSize };
+    });
+    check('a 3-digit velocity value renders without clipping (clientWidth >= scrollWidth)',
+      m.value === '100' && m.clientWidth >= m.scrollWidth, m);
+  });
+
+  await withPage(browser, async (page) => {
     // Nothing selected -> "—" placeholders in note-details/V/Pos and a
     // "Ch—" channel button, same convention the CC lane's V/P/S fields
     // already use with no active point.

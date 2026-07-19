@@ -467,9 +467,17 @@
      sliver. flex:0 0 (not 0 1) — a shrinkable basis let this field get
      squeezed below the width a 3-digit velocity (1-127) needs whenever the
      row's other flexible fields (note/pos) were fighting it for space,
-     clipping "100" down to "1". A fixed 32px is enough for 3 digits and
-     small enough to not crowd the rest of the row. */
-  #velValInput{flex:0 0 32px;width:32px;-moz-appearance:textfield;}
+     clipping "100" down to "1". 36px is enough for 3 digits at the font
+     actually applied below.
+     padding/font-size are repeated here (not left to .ni-input alone): the
+     global `input[type=number]{padding:4px 6px;font-size:12px}` rule (an
+     attribute selector) is MORE specific than a plain class like .ni-input,
+     so it silently won the cascade and left this field rendering at the
+     wrong (larger) font/padding despite the narrow 32px box — the actual
+     visible bug this caused: "100" clipped to an unreadable "10" + a sliver.
+     An ID selector beats an attribute selector, so restating them here
+     forces the compact sizing .ni-input always intended. */
+  #velValInput{flex:0 0 36px;width:36px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
   #velValInput::-webkit-outer-spin-button,#velValInput::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* No mini-label (per explicit instruction) — the mono font + BBT dots
      already read unambiguously as a position. */
