@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.11
+  MMV MIDI & CC Curve Editor v0.9.12
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -339,6 +339,15 @@
   lane is marked as current. Selecting an entry applies the same side
   effects the old free-typing input did (lane.cc, button label/title, the
   unnamed lane's name placeholder) and closes the popover.
+  v0.9.12 Fix: a note/CC point sitting on tick 0 rendered flush against the
+  leftcol divider and was hard to see or click precisely. Every
+  horizontally-scrolling pane (ruler, piano roll, velocity strip, CC lanes,
+  audio waveform) now nudges its tick-based content (grid lines, notes,
+  points, playhead, locators) a fixed few pixels right of the divider at
+  draw time, while each pane's own background stays flush against it — a
+  small margin, not a jarring gap. tickToX/xToTick and the on-screen
+  scroll/zoom math are unchanged; clicking, dragging, and zoom-at-mouse
+  still resolve to the same tick as before.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -1417,6 +1426,16 @@
   function prContentH(){ return NPITCH*state.noteHeight; }
   function tickToX(t){ return t*state.pxPerTick; }
   function xToTick(x){ return x/state.pxPerTick; }
+  // GUTTER: a fixed visual inset (px) between the leftcol border and where
+  // tick-0 content actually draws, so a note/CC point at tick 0 doesn't sit
+  // flush against the border and get obscured. Deliberately NOT baked into
+  // tickToX/xToTick — those stay the single source of truth for tick<->pixel
+  // math (grid, notes, drag deltas, zoom, scroll clamping). Instead every
+  // horizontally-scrolling canvas nudges its content by GUTTER at draw time
+  // (see beginPane's callers), and every screen->tick coordinate conversion
+  // (rulerX/prCoords/velCoords/laneCoords/zoomHAt) subtracts it back out, so
+  // clicks/drags still land on the tick that's visually under the cursor.
+  const GUTTER=6;
   function pitchToY(p){ return (PITCH_MAX-p)*state.noteHeight; }
   function yToPitch(y){ return clamp(PITCH_MAX - Math.floor(y/state.noteHeight), PITCH_MIN, PITCH_MAX); }
   function fracTicks(s){ if(typeof s!=='string') return ticksPerBeat();
@@ -1491,7 +1510,10 @@
 
   // ---------- Sizing (virtualised: canvases are viewport-sized) ----------
   function resizeCanvases(){
-    const cw=contentW();
+    // +GUTTER: the drawn content is nudged right by GUTTER px (see beginPane's
+    // callers), so the scrollable range needs the same extra room or the last
+    // GUTTER px of the song would be pushed off-canvas and unreachable.
+    const cw=contentW()+GUTTER;
     setSpacer(masterScroll, cw, 1);
     setSpacer(rulerScroll, cw, 1); rulerCanvas.width=rulerScroll.clientWidth||300; rulerCanvas.height=26;
     setSpacer(audioScroll, cw, 1); audioCanvas.width=audioScroll.clientWidth||300; audioCanvas.height=audioRow.clientHeight||64;
@@ -1508,7 +1530,7 @@
   }
   // canvas is absolute at content origin; translate it by +scroll to keep in viewport (horizontal), and (piano) +scrollTop handled natively
   function tx2(sc){ return 'translate('+sc.scrollLeft+'px,0px)'; }
-  function updatePlayheadEl(){ if(phEl) phEl.style.transform='translateX('+(tickToX(state.playhead)-state.scrollLeft)+'px)'; }
+  function updatePlayheadEl(){ if(phEl) phEl.style.transform='translateX('+(tickToX(state.playhead)-state.scrollLeft+GUTTER)+'px)'; }
   // Scroll Lock: once the playhead reaches the middle of the viewport it
   // stays pinned there and the timeline scrolls underneath it instead.
   // Only nudges the scroll when the playhead is past center or has gone
@@ -1517,10 +1539,10 @@
   // DAW center-lock scroll.
   function applyScrollLock(){ if(!state.scrollLock) return;
     const viewW=prScroll.clientWidth||300, centerX=viewW/2;
-    const playheadX=tickToX(state.playhead), maxScroll=Math.max(0,contentW()-viewW);
-    const onScreenX=playheadX-state.scrollLeft;
+    const playheadX=tickToX(state.playhead), maxScroll=Math.max(0,contentW()+GUTTER-viewW);
+    const onScreenX=playheadX-state.scrollLeft+GUTTER;
     if(onScreenX<=centerX && onScreenX>=0) return;
-    const desired=clamp(playheadX-centerX,0,maxScroll);
+    const desired=clamp(playheadX-centerX+GUTTER,0,maxScroll);
     if(desired===state.scrollLeft) return;
     prScroll.scrollLeft=desired; state.scrollLeft=desired; syncH(prScroll); applyTransforms(); requestDraw();
   }
@@ -1687,7 +1709,9 @@
     ctx.moveTo(Math.round(x1)+0.5,0); ctx.lineTo(Math.round(x1)+0.5,h); ctx.stroke(); }
 
   function drawRuler(){ const cv=rulerCanvas,ctx=rctx,vw=cv.width,h=cv.height; beginPane(ctx,cv); const sx=state.scrollLeft;
-    ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h); drawLocators(ctx,h);
+    ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h);
+    ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
+    drawLocators(ctx,h);
     const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
     const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
     const changeAt=new Map(tsMapSorted().filter(s=>s.tick>0).map(s=>[s.tick,s]));
@@ -1743,6 +1767,7 @@
     const cv=audioCanvas, ctx=actx, w=cv.width, h=cv.height; beginPane(ctx,cv);
     const sx=state.scrollLeft;
     ctx.fillStyle=getCss('--panel3'); ctx.fillRect(sx,0,w,h);
+    ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
     gridLinesX(ctx,0,h,w); drawLocators(ctx,h);
     if(!(audioDrag&&audioDrag.moved)) audioCanvas.style.cursor=audioBuf?'grab':'default';
     if(!audioBuf){
@@ -1801,6 +1826,7 @@
   function drawPiano(){ const cv=prCanvas,ctx=pctx,vw=cv.width,h=cv.height,nh=state.noteHeight; beginPane(ctx,cv); const sx=state.scrollLeft;
     for(let p=PITCH_MIN;p<=PITCH_MAX;p++){ const y=pitchToY(p); ctx.fillStyle=isBlack(p)?'#181b21':'#1e2128'; ctx.fillRect(sx,y,vw,nh); }
     for(let p=PITCH_MIN;p<=PITCH_MAX;p++){ const y=Math.round(pitchToY(p))+0.5; ctx.strokeStyle=(p%12===0)?getCss('--gridBeat'):getCss('--grid'); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(sx,y); ctx.lineTo(sx+vw,y); ctx.stroke(); }
+    ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content (grid/notes) shifts right by the gutter
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
     const t0=xToTick(sx),t1=xToTick(sx+vw);
     const hasSel=state.selection.size>0;
@@ -1844,6 +1870,7 @@
   function drawVel(){ const cv=velCanvas,ctx=vctx,vw=cv.width,h=cv.height; beginPane(ctx,cv); const sx=state.scrollLeft;
     ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h);
     ctx.strokeStyle=getCss('--grid'); ctx.beginPath(); [0.25,0.5,0.75].forEach(f=>{ const y=Math.round(h*f)+0.5; ctx.moveTo(sx,y); ctx.lineTo(sx+vw,y);}); ctx.stroke();
+    ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
     const t0=xToTick(sx),t1=xToTick(sx+vw);
     const hasSel2=state.selection.size>0;
@@ -1889,6 +1916,7 @@
       ctx.strokeStyle=getCss('--txt2'); ctx.lineWidth=1; ctx.setLineDash([3,3]);
       ctx.beginPath(); ctx.moveTo(sx,cy); ctx.lineTo(sx+vw,cy); ctx.stroke(); ctx.setLineDash([]); ctx.lineWidth=1;
     }
+    ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content (curve/points) shifts right by the gutter
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
     const r=laneRange(lane);
     ctx.strokeStyle=lane.color; ctx.lineWidth=2; ctx.beginPath();
@@ -1906,7 +1934,7 @@
   }
 
   // ---------- Ruler: scrub + locators ----------
-  function rulerX(e){ const r=rulerScroll.getBoundingClientRect(); return e.clientX-r.left+state.scrollLeft; }
+  function rulerX(e){ const r=rulerScroll.getBoundingClientRect(); return e.clientX-r.left+state.scrollLeft-GUTTER; }
   function snapLoc(t){ if(state.snap==='off') return Math.round(t); return Math.round(snapT(t)); }
   let rulerDrag=null;
   rulerCanvas.addEventListener('mousedown',e=>{ const x=rulerX(e); rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false}; });
@@ -1921,7 +1949,7 @@
   rulerCanvas.addEventListener('dblclick',()=>{ state.locStart=state.locEnd=null; updateLoopStatus(); requestDraw(); });
 
   // ---------- Piano roll interaction ----------
-  function prCoords(e){ const r=prScroll.getBoundingClientRect(); return { x:e.clientX-r.left+state.scrollLeft, y:e.clientY-r.top+prScroll.scrollTop }; }
+  function prCoords(e){ const r=prScroll.getBoundingClientRect(); return { x:e.clientX-r.left+state.scrollLeft-GUTTER, y:e.clientY-r.top+prScroll.scrollTop }; }
   function noteAt(x,y){ const p=yToPitch(y), t=xToTick(x);
     for(let i=state.notes.length-1;i>=0;i--){ const n=state.notes[i];
       if(state.viewCh!==null&&n.ch!==state.viewCh) continue;
@@ -2060,7 +2088,7 @@
   }
 
   // ---------- Velocity lane ----------
-  function velCoords(e){ const r=velScroll.getBoundingClientRect(); return {x:e.clientX-r.left+state.scrollLeft,y:e.clientY-r.top}; }
+  function velCoords(e){ const r=velScroll.getBoundingClientRect(); return {x:e.clientX-r.left+state.scrollLeft-GUTTER,y:e.clientY-r.top}; }
   let velDrag=false;
   function updateNoteInfo(){
     const sel=[...state.selection].map(byId).filter(Boolean);
@@ -2185,7 +2213,7 @@
     const win=Math.max(1,Math.round(state.ppq/state.ccRes/2)); lane.points=lane.points.filter(p=>Math.abs(p.t-t)>win);
     lane.points.push({t,v}); lane.points.sort((a,b)=>a.t-b.t); }
   function eraseRange(lane,a,b){ const lo=Math.min(a,b)-xToTick(6),hi=Math.max(a,b)+xToTick(6); lane.points=lane.points.filter(p=>p.t<lo||p.t>hi); }
-  function laneCoords(lane,e){ const r=lane._scroll.getBoundingClientRect(); return {x:e.clientX-r.left+state.scrollLeft,y:e.clientY-r.top}; }
+  function laneCoords(lane,e){ const r=lane._scroll.getBoundingClientRect(); return {x:e.clientX-r.left+state.scrollLeft-GUTTER,y:e.clientY-r.top}; }
   function nearestCCPoint(lane,x,y){ const h=lane._canvas.height; let best=null,bd=1e9;
     for(const p of lane.points){ const px=tickToX(p.t), py=val2yForLane(h,p.v,lane); const d=Math.hypot(px-x,py-y); if(d<bd){ bd=d; best=p; } } return {p:best,d:bd}; }
   function removePoint(lane,p){ const i=lane.points.indexOf(p); if(i>=0) lane.points.splice(i,1); }
@@ -4342,8 +4370,8 @@
   $('rulerMode').addEventListener('change',()=>{ state.rulerMode=$('rulerMode').value; requestDraw(); });
   function zoomHAt(f, clientX){ const old=state.pxPerTick; const np=clamp(old*f,0.004,8); if(np===old) return;
     const r=prScroll.getBoundingClientRect(); const mvx=(clientX==null)?prScroll.clientWidth/2:clamp(clientX-r.left,0,prScroll.clientWidth);
-    const tickAtMouse=(state.scrollLeft+mvx)/old; state.pxPerTick=np; resizeCanvases();
-    prScroll.scrollLeft=Math.max(0, tickAtMouse*np - mvx); state.scrollLeft=prScroll.scrollLeft; syncH(prScroll); applyTransforms(); updatePlayheadEl(); requestDraw(); }
+    const tickAtMouse=(state.scrollLeft+mvx-GUTTER)/old; state.pxPerTick=np; resizeCanvases();
+    prScroll.scrollLeft=Math.max(0, tickAtMouse*np - mvx + GUTTER); state.scrollLeft=prScroll.scrollLeft; syncH(prScroll); applyTransforms(); updatePlayheadEl(); requestDraw(); }
   function zoomVAt(f, clientY){ const old=state.noteHeight; let nh=clamp(Math.round(old*f),4,40);
     if(nh===old){ nh=clamp(old+(f>1?1:-1),4,40); if(nh===old) return; }
     const r=prScroll.getBoundingClientRect(); const fy=(clientY==null)?prScroll.clientHeight/2:clamp(clientY-r.top,0,prScroll.clientHeight);

@@ -58,7 +58,9 @@ function buildTestHtml() {
       '  window._TEST_secondsToTicks = (s) => secondsToTicks(s);',
       '  window._TEST_audioGainValue = () => (typeof audioGain !== "undefined" && audioGain) ? audioGain.gain.value : null;',
       '  window._TEST_fmtClockHundredths = (sec) => fmtClockHundredths(sec);',
-      '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
+      '  window._TEST_GUTTER = () => GUTTER;',
+      '  window._TEST_requestDraw = () => { drawAll(); };',
+      '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft + GUTTER, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
       '  window._TEST_pushUndo = pushUndo;',
       '  window._TEST_undo = undo;',
       '  window._TEST_play = (t0) => play(t0);',
@@ -574,9 +576,9 @@ async function run() {
     // clicking the ruler moves the playhead; its BBT and MM:SS readouts must agree
     const r = await page.evaluate(() => {
       const rr = document.getElementById('rulerScroll').getBoundingClientRect();
-      return { left: rr.left, top: rr.top, height: rr.height, px: window._TEST_state.pxPerTick, scrollLeft: window._TEST_state.scrollLeft };
+      return { left: rr.left, top: rr.top, height: rr.height, px: window._TEST_state.pxPerTick, scrollLeft: window._TEST_state.scrollLeft, gutter: window._TEST_GUTTER() };
     });
-    await page.mouse.click(r.left + 3840 * r.px - r.scrollLeft, r.top + r.height / 2);
+    await page.mouse.click(r.left + 3840 * r.px - r.scrollLeft + r.gutter, r.top + r.height / 2);
     await page.waitForTimeout(50);
     const afterClick = await page.evaluate(() => ({
       stPlay: document.getElementById('stPlay').textContent,
@@ -589,9 +591,9 @@ async function run() {
     // hovering the ruler (no click/drag) must live-update the Cursor readout
     const r = await page.evaluate(() => {
       const rr = document.getElementById('rulerScroll').getBoundingClientRect();
-      return { left: rr.left, top: rr.top, height: rr.height, px: window._TEST_state.pxPerTick, scrollLeft: window._TEST_state.scrollLeft };
+      return { left: rr.left, top: rr.top, height: rr.height, px: window._TEST_state.pxPerTick, scrollLeft: window._TEST_state.scrollLeft, gutter: window._TEST_GUTTER() };
     });
-    await page.mouse.move(r.left + 2000 * r.px - r.scrollLeft + 20, r.top + r.height / 2);
+    await page.mouse.move(r.left + 2000 * r.px - r.scrollLeft + r.gutter + 20, r.top + r.height / 2);
     await page.waitForTimeout(50);
     const hover = await page.evaluate(() => ({
       stPos: document.getElementById('stPos').textContent,
@@ -809,7 +811,7 @@ async function run() {
       const px = window._TEST_state.pxPerTick, nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
       const tick = edge === 'left' ? note.start : note.start + note.length;
       const nudge = edge === 'left' ? 2 : -2;
-      const x = tick * px - window._TEST_state.scrollLeft + nudge;
+      const x = tick * px - window._TEST_state.scrollLeft + window._TEST_GUTTER() + nudge;
       const y = (PITCH_MAX - note.pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
       return { clientX: rect.left + x, clientY: rect.top + y };
     }, { note, edge });
@@ -854,7 +856,7 @@ async function run() {
       const rect = document.getElementById('prScroll').getBoundingClientRect();
       const px = window._TEST_state.pxPerTick, nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
       const tick = note.start + note.length / 2; // click mid-note, away from edge-resize zones
-      const x = tick * px - window._TEST_state.scrollLeft;
+      const x = tick * px - window._TEST_state.scrollLeft + window._TEST_GUTTER();
       const y = (PITCH_MAX - note.pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
       return { clientX: rect.left + x, clientY: rect.top + y };
     }, note);
@@ -895,7 +897,7 @@ async function run() {
       const rect = document.getElementById('prScroll').getBoundingClientRect();
       const px = window._TEST_state.pxPerTick, nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
       const tick = note.start + note.length / 2;
-      const x = tick * px - window._TEST_state.scrollLeft;
+      const x = tick * px - window._TEST_state.scrollLeft + window._TEST_GUTTER();
       const y = (PITCH_MAX - note.pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
       return { clientX: rect.left + x, clientY: rect.top + y };
     }, note);
@@ -2303,7 +2305,7 @@ async function run() {
     const result = await page.evaluate(({ farTick, viewW }) => {
       window._TEST_state.playhead = farTick; window._TEST_applyScrollLock();
       const px = farTick * window._TEST_state.pxPerTick;
-      return { scrollLeft: window._TEST_state.scrollLeft, expected: px - viewW / 2 };
+      return { scrollLeft: window._TEST_state.scrollLeft, expected: px - viewW / 2 + window._TEST_GUTTER() };
     }, { farTick, viewW });
     check('Scroll Lock centers the playhead once it is past the middle of the view',
       Math.abs(result.scrollLeft - result.expected) < 2, result);
@@ -3621,6 +3623,181 @@ async function run() {
     });
     check('a PB lane shows the "PB" tag and has no CC# picker button in row 1',
       info.found && info.hasPbTag && !info.hasCcBtn, info);
+  });
+
+  // ---------------- Timeline left-margin gutter (v0.9.12) ----------------
+  // A note/CC point at tick 0 used to render flush against the leftcol
+  // divider (border-right on .leftcol), making it hard to see or click.
+  // Every horizontally-scrolling pane now nudges its tick-based content a
+  // fixed GUTTER px to the right at draw time (via ctx.translate after each
+  // pane's own edge-to-edge background is painted), while tickToX/xToTick
+  // and every scroll/zoom formula stay exactly as they were — only the
+  // screen<->tick coordinate helpers (rulerX/prCoords/velCoords/laneCoords/
+  // zoomHAt) know about the gutter, subtracting it back out so a click still
+  // lands on the tick that's visually under the cursor.
+
+  await withPage(browser, async (page) => {
+    // 1) Visual clearance: sample actual canvas pixels (not just the
+    // formula) to prove a tick-0 note is inset from the border by ~GUTTER
+    // px, and that the border itself (x=0) is still plain background.
+    const gutter = await page.evaluate(() => window._TEST_GUTTER());
+    check('GUTTER is a small positive inset (a few px, not zero and not huge)', gutter > 0 && gutter <= 12, gutter);
+
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 70, start: 0, length: 480, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      return n;
+    });
+    await page.evaluate(() => window._TEST_requestDraw());
+    const scan = await page.evaluate((pitch) => {
+      const cv = document.getElementById('prCanvas'), ctx = cv.getContext('2d');
+      const nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
+      const y = Math.round((PITCH_MAX - pitch) * nh + nh / 2);
+      const row = ctx.getImageData(0, y, Math.min(40, cv.width), 1).data;
+      const bg = [row[0], row[1], row[2]];
+      let firstDiff = -1;
+      for (let x = 0; x < row.length / 4; x++) {
+        const o = x * 4;
+        if (Math.abs(row[o] - bg[0]) + Math.abs(row[o + 1] - bg[1]) + Math.abs(row[o + 2] - bg[2]) > 40) { firstDiff = x; break; }
+      }
+      return { firstDiff, bg };
+    }, note.pitch);
+    check('a tick-0 note\'s fill color starts roughly GUTTER px in from the canvas edge, not at x=0',
+      scan.firstDiff >= gutter - 1 && scan.firstDiff <= gutter + 2, { ...scan, gutter });
+    check('the column right at the leftcol border (x=0) is still plain pane background, not note fill — a real margin, not a coincidence',
+      scan.firstDiff > 0, scan);
+  });
+
+  await withPage(browser, async (page) => {
+    // 2) Hit-testing follows the same shift: a click at the OLD tick-0 spot
+    // (flush against the border) no longer hits the note, but a click at its
+    // actual gutter-shifted on-screen position does.
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 68, start: 0, length: 480, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      return n;
+    });
+    const pos = await page.evaluate((pitch) => {
+      const rect = document.getElementById('prScroll').getBoundingClientRect();
+      const nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
+      const y = rect.top + (PITCH_MAX - pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
+      return { xBorder: rect.left + 1, xNote: rect.left + window._TEST_GUTTER() + 20, y };
+    }, note.pitch);
+    await page.mouse.click(pos.xBorder, pos.y);
+    const selAtBorder = await page.evaluate(() => [...window._TEST_state.selection]);
+    check('clicking right at the leftcol border (the pre-gutter tick-0 spot) no longer hits the tick-0 note',
+      selAtBorder.length === 0, selAtBorder);
+
+    await page.mouse.click(pos.xNote, pos.y);
+    const selAtNote = await page.evaluate(() => [...window._TEST_state.selection]);
+    check('clicking at the note\'s actual (gutter-shifted) on-screen position selects it',
+      selAtNote.includes(note.id), { selAtNote, noteId: note.id });
+  });
+
+  await withPage(browser, async (page) => {
+    // 3) Round-trip: clicking the ruler at the on-screen position of tick T
+    // (computed the same way the app renders it, i.e. through the gutter)
+    // must resolve back to exactly tick T — both at tick 0 (the reported
+    // bug) and at a nonzero tick (so the fix isn't accidentally tick-0-only).
+    for (const T of [0, 960]) {
+      const clientX = await page.evaluate((T) => {
+        const r = document.getElementById('rulerScroll').getBoundingClientRect();
+        return r.left + T * window._TEST_state.pxPerTick - window._TEST_state.scrollLeft + window._TEST_GUTTER();
+      }, T);
+      const clientY = await page.evaluate(() => {
+        const r = document.getElementById('rulerScroll').getBoundingClientRect();
+        return r.top + r.height / 2;
+      });
+      await page.evaluate(() => { window._TEST_state.playhead = -1; });
+      await page.mouse.click(clientX, clientY);
+      const playhead = await page.evaluate(() => window._TEST_state.playhead);
+      check(`clicking the ruler at tick ${T}'s on-screen position sets the playhead to exactly tick ${T} (round-trips through the gutter)`,
+        playhead === T, { T, playhead });
+    }
+  });
+
+  await withPage(browser, async (page) => {
+    // 4) Drag deltas are unaffected: the gutter is a constant baked into both
+    // the drag-start and drag-move coordinate reads, so it must cancel out.
+    // Verified explicitly (not just reasoned about) for a note starting at
+    // tick 0 and one starting at a nonzero tick, with snap off so the raw
+    // pixel->tick arithmetic isn't obscured by grid snapping.
+    await page.evaluate(() => { window._TEST_state.snap = 'off'; });
+    const pxPerTick = await page.evaluate(() => window._TEST_state.pxPerTick);
+    for (const startTick of [0, 960]) {
+      const note = await page.evaluate((startTick) => {
+        const n = { id: window._TEST_state.nextId++, pitch: 72, start: startTick, length: 480, vel: 100, ch: 0 };
+        window._TEST_state.notes.push(n);
+        window._TEST_state.selection.clear();
+        window._TEST_state.selection.add(n.id);
+        return n;
+      }, startTick);
+      const pt = await page.evaluate((note) => {
+        const rect = document.getElementById('prScroll').getBoundingClientRect();
+        const nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
+        const tick = note.start + note.length / 2;
+        const x = tick * window._TEST_state.pxPerTick - window._TEST_state.scrollLeft + window._TEST_GUTTER();
+        const y = (PITCH_MAX - note.pitch) * nh + nh / 2 - document.getElementById('prScroll').scrollTop;
+        return { clientX: rect.left + x, clientY: rect.top + y };
+      }, note);
+      const rawDeltaPx = 137; // arbitrary, deliberately not aligned to any tick/snap boundary
+      await page.mouse.move(pt.clientX, pt.clientY);
+      await page.mouse.down();
+      await page.mouse.move(pt.clientX + rawDeltaPx, pt.clientY, { steps: 5 });
+      await page.mouse.up();
+      await page.waitForTimeout(100);
+      const after = await page.evaluate((id) => window._TEST_state.notes.find(n => n.id === id).start, note.id);
+      const expectedDelta = Math.round(rawDeltaPx / pxPerTick);
+      check(`dragging a note starting at tick ${startTick} by ${rawDeltaPx}px moves it by the same tick delta the gutter has no effect on drag deltas`,
+        after - startTick === expectedDelta, { startTick, after, expectedDelta, actualDelta: after - startTick });
+      await page.evaluate((id) => { window._TEST_state.notes = window._TEST_state.notes.filter(n => n.id !== id); }, note.id);
+    }
+  });
+
+  await withPage(browser, async (page) => {
+    // 5) Cross-pane pixel alignment: the ruler's bar line and a note at that
+    // same tick must land at the same physical x — this is exactly what
+    // would break if the gutter translate weren't applied identically to
+    // every horizontally-scrolling pane.
+    const rulerRect = await page.evaluate(() => document.getElementById('rulerCanvas').getBoundingClientRect());
+    const prRect = await page.evaluate(() => document.getElementById('prCanvas').getBoundingClientRect());
+    check('ruler and piano-roll canvases share the same horizontal screen position (precondition for the alignment check below)',
+      Math.abs(rulerRect.left - prRect.left) < 1, { rulerLeft: rulerRect.left, prLeft: prRect.left });
+
+    // Bar 2 starts at tick 1920 (ppq 480 * 4 ticks/beat * 4/4 time) — a
+    // guaranteed full-height bar line in the ruler.
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 66, start: 1920, length: 480, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      return n;
+    });
+    await page.evaluate(() => window._TEST_requestDraw());
+    const xs = await page.evaluate((pitch) => {
+      const prCv = document.getElementById('prCanvas'), rulerCv = document.getElementById('rulerCanvas');
+      const pctx = prCv.getContext('2d'), rctx = rulerCv.getContext('2d');
+      const nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
+      const y = Math.round((PITCH_MAX - pitch) * nh + nh / 2);
+      const row = pctx.getImageData(0, y, prCv.width, 1).data;
+      const bg = [row[0], row[1], row[2]];
+      let noteX = -1;
+      for (let x = 0; x < row.length / 4; x++) {
+        const o = x * 4;
+        if (Math.abs(row[o] - bg[0]) + Math.abs(row[o + 1] - bg[1]) + Math.abs(row[o + 2] - bg[2]) > 40) { noteX = x; break; }
+      }
+      const rrow = rctx.getImageData(0, 2, rulerCv.width, 1).data;
+      const rbg = [rrow[0], rrow[1], rrow[2]];
+      let barX = -1;
+      for (let x = 0; x < rrow.length / 4; x++) {
+        const o = x * 4;
+        if (Math.abs(rrow[o] - rbg[0]) + Math.abs(rrow[o + 1] - rbg[1]) + Math.abs(rrow[o + 2] - rbg[2]) > 30) { barX = x; break; }
+      }
+      return { noteX, barX };
+    }, note.pitch);
+    check('the tick-1920 note (piano roll) and the ruler\'s bar line at the same tick land within 2px of each other',
+      xs.noteX >= 0 && xs.barX >= 0 && Math.abs(xs.noteX - xs.barX) <= 2, xs);
   });
 
   await browser.close();
