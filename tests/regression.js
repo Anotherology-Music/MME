@@ -89,6 +89,7 @@ function buildTestHtml() {
       '  window._TEST_autosaveTick = () => autosaveTick();',
       '  window._TEST_autosaveMarkClean = () => autosaveMarkClean();',
       '  window._TEST_checkAutosaveRestore = () => checkAutosaveRestore();',
+      '  window._TEST_noteName = (p) => noteName(p);',
       '  init();',
     ].join('\n')
   );
@@ -1278,7 +1279,7 @@ async function run() {
       return {
         hidden: row.classList.contains('lane-hidden'),
         name: row.querySelector('input.lname').value,
-        cc: row.querySelector('.lane-row1 .ccn').value,
+        cc: row.querySelector('.lane-row1 .ccn').textContent,
         chnLabel: row.querySelector('.chn-btn').textContent,
         toggleGlyph: row.querySelector('.toggle-btn').textContent,
         toggleTitle: row.querySelector('.toggle-btn').title,
@@ -1349,12 +1350,16 @@ async function run() {
     const hiddenNow = await page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'), laneId);
     check('lane is minimized before exercising row 1 controls', hiddenNow, hiddenNow);
 
-    // CC# edit while minimized
-    await page.fill(`.lane[data-id="${laneId}"] .lane-row1 .ccn`, '77');
-    await page.dispatchEvent(`.lane[data-id="${laneId}"] .lane-row1 .ccn`, 'input');
+    // CC# picker popover opens + a selection commits, while minimized (same
+    // click-to-open-popover UX as Channel, exercised below).
+    await page.click(`.lane[data-id="${laneId}"] .lane-row1 .ccn`);
+    await page.waitForTimeout(30);
+    const ccPopOpen = await page.evaluate(() => document.getElementById('ccPopover').classList.contains('open'));
+    check('the CC# popover opens from row 1 while the lane is minimized', ccPopOpen, ccPopOpen);
+    await page.click('#ccPopover .cc-opt:nth-child(78)'); // 78th entry = CC 77
     await page.waitForTimeout(30);
     const ccAfter = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).cc, laneId);
-    check('editing the CC# input works while the lane is minimized', ccAfter === 77, ccAfter);
+    check('selecting a CC from the popover works while the lane is minimized', ccAfter === 77, ccAfter);
 
     // Name edit while minimized
     await page.fill(`.lane[data-id="${laneId}"] input.lname`, 'brightnessCurve');
@@ -1678,26 +1683,28 @@ async function run() {
     // 1Password/LastPass/Bitwarden autofill icons collided with the lane
     // Name field's typed text; both free-text fields (Name, Tags) opt out
     // with every ignore attribute each password manager respects. Number/
-    // select inputs (CC#, Steps, Val, Pos) deliberately do NOT get these —
-    // password managers don't target them.
+    // select inputs (Steps, Val, Pos) deliberately do NOT get these —
+    // password managers don't target them. CC# is no longer even an input —
+    // it's a button that opens the #ccPopover picker — so it's structurally
+    // immune to autofill rather than needing an opt-out attribute.
     const attrs = await page.evaluate(() => {
       const lname = document.querySelector('.lane input.lname');
       const ltags = document.querySelector('.lane input.ltags');
-      const ccn = document.querySelector('.lane input.ccn');
+      const ccn = document.querySelector('.lane .lane-row1 .ccn');
       const get = (el) => ({
         autocomplete: el.getAttribute('autocomplete'),
         onep: el.getAttribute('data-1p-ignore'),
         lp: el.getAttribute('data-lpignore'),
         bw: el.getAttribute('data-bwignore'),
       });
-      return { lname: get(lname), ltags: get(ltags), ccnHasAny: !!(ccn.getAttribute('data-1p-ignore') || ccn.getAttribute('data-lpignore') || ccn.getAttribute('data-bwignore')) };
+      return { lname: get(lname), ltags: get(ltags), ccnTag: ccn.tagName };
     });
     check('the lane Name field carries autocomplete=off + 1Password/LastPass/Bitwarden ignore attributes',
       attrs.lname.autocomplete === 'off' && attrs.lname.onep === 'true' && attrs.lname.lp === 'true' && attrs.lname.bw === 'true', attrs.lname);
     check('the lane Tags field carries autocomplete=off + 1Password/LastPass/Bitwarden ignore attributes',
       attrs.ltags.autocomplete === 'off' && attrs.ltags.onep === 'true' && attrs.ltags.lp === 'true' && attrs.ltags.bw === 'true', attrs.ltags);
-    check('the CC number input (a non-free-text field) does not carry password-manager ignore attributes',
-      !attrs.ccnHasAny, attrs.ccnHasAny);
+    check('CC# is a real <button> (picker popover), not a free-text/number field a password manager could target',
+      attrs.ccnTag === 'BUTTON', attrs.ccnTag);
   });
 
   await withPage(browser, async (page) => {
@@ -3349,6 +3356,271 @@ async function run() {
     }, ids);
     check('a quick touch tap still smart-toggles the group (all muted -> all unmuted)',
       Array.isArray(tapped) && tapped.every(m => m === false), tapped);
+  });
+
+  // ---------------- Note Info: equal columns + manual minimize toggle ----------------
+
+  await withPage(browser, async (page) => {
+    // Force the box open (a note selected) so the grid actually has layout
+    // to measure — with nothing selected it's auto-collapsed and every
+    // column would trivially measure 0.
+    await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      window._TEST_updateNoteInfo();
+    });
+    const widths = await page.evaluate(() =>
+      [...document.querySelectorAll('#noteInfoLeft .ni-col')].map(c => Math.round(c.getBoundingClientRect().width)));
+    check('Note Info renders exactly 4 columns (Note/Vel/Pos/Ch)', widths.length === 4, widths);
+    check('Note Info\'s 4 columns are all equal width (grid-template-columns: 1fr 1fr 1fr 1fr, not 0.5fr for Note)',
+      widths.every(w => Math.abs(w - widths[0]) <= 1), widths);
+  });
+
+  await withPage(browser, async (page) => {
+    // Manual minimize/maximize toggle (#niToggleBtn) — a NEW mechanism,
+    // separate from the existing auto-collapse-on-no-selection behavior,
+    // that must coexist with it: off, it defers entirely to auto-collapse;
+    // on, it force-collapses regardless of selection.
+    const noSel = await page.evaluate(() => ({
+      collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
+      manual: window._TEST_state.noteInfoManuallyCollapsed,
+    }));
+    check('with nothing selected and the manual toggle untouched (off), Note Info still auto-collapses as before',
+      noSel.collapsed === true && noSel.manual === false, noSel);
+
+    await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 67, start: 0, length: 240, vel: 90, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      window._TEST_updateNoteInfo();
+    });
+    const withSel = await page.evaluate(() => document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'));
+    check('selecting a note auto-expands Note Info (manual toggle still off, unchanged legacy behavior)',
+      withSel === false, withSel);
+
+    // Manually collapse WHILE a note is selected — the whole point of this
+    // toggle: reclaim vertical space even with something selected.
+    await page.click('#niToggleBtn');
+    const manualWithSel = await page.evaluate(() => ({
+      collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
+      manual: window._TEST_state.noteInfoManuallyCollapsed,
+      selSize: window._TEST_state.selection.size,
+      glyph: document.getElementById('niToggleBtn').textContent,
+      emptyLabel: document.getElementById('noteInfoEmpty').textContent,
+    }));
+    check('the manual toggle force-collapses Note Info even while a note IS selected',
+      manualWithSel.collapsed === true && manualWithSel.manual === true && manualWithSel.selSize === 1 && manualWithSel.glyph === '▸',
+      manualWithSel);
+    check('the collapsed placeholder does not falsely claim "no selection" when manually collapsed with a real selection',
+      manualWithSel.emptyLabel === 'Note Info — minimized', manualWithSel.emptyLabel);
+
+    // Toggling back off defers to auto-collapse again (still selected -> expanded).
+    await page.click('#niToggleBtn');
+    const backToAuto = await page.evaluate(() => ({
+      collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
+      manual: window._TEST_state.noteInfoManuallyCollapsed,
+    }));
+    check('un-toggling the manual override hands control back to auto-collapse (expanded, since a note is still selected)',
+      backToAuto.collapsed === false && backToAuto.manual === false, backToAuto);
+
+    // Clearing the selection while the manual toggle is off returns to
+    // auto-collapsed — proving the manual flag didn't get stuck "on" and
+    // isn't fighting the auto behavior in the other direction either.
+    await page.evaluate(() => { window._TEST_state.selection.clear(); window._TEST_updateNoteInfo(); });
+    const clearedSel = await page.evaluate(() => document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'));
+    check('clearing the selection with the manual toggle off re-collapses via auto-collapse alone', clearedSel === true, clearedSel);
+  });
+
+  // ---------------- Piano roll: lower resize floor ----------------
+
+  await withPage(browser, async (page) => {
+    const minHeightCss = await page.evaluate(() => getComputedStyle(document.querySelector('.piano-row')).minHeight);
+    check('the piano-row CSS floor is lowered to 28px (from the old 70px)', minHeightCss === '28px', minHeightCss);
+
+    const errors = [];
+    page.on('pageerror', e => errors.push(e.message));
+    const sp = await page.$('#prSplitter');
+    const box = await sp.boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    // Drag the splitter far up (shrinking the piano row above it) well past
+    // any realistic floor, to prove the JS clamp actually reaches the new
+    // 28px minimum rather than stopping at the old 70px one.
+    await page.mouse.move(box.x + box.width / 2, box.y - 2000, { steps: 10 });
+    await page.mouse.up();
+    await page.waitForTimeout(150);
+    const h = await page.evaluate(() => document.querySelector('.piano-row').offsetHeight);
+    check('dragging #prSplitter all the way up shrinks the piano roll down to the new 28px floor',
+      h === 28, h);
+    check('shrinking the piano roll to its new minimum does not throw (resizeCanvases/drawPiano/drawKeys survive)',
+      errors.length === 0, errors);
+
+    // Dragging back down should grow it again, well past the floor — proves
+    // the floor is a one-sided clamp, not a stuck value. The splitter itself
+    // has moved (the piano row above it is now only 28px tall), so its
+    // bounding box must be re-measured rather than reusing the stale one
+    // from before the first drag.
+    const box2 = await sp.boundingBox();
+    await page.mouse.move(box2.x + box2.width / 2, box2.y + box2.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box2.x + box2.width / 2, box2.y + 200, { steps: 10 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const h2 = await page.evaluate(() => document.querySelector('.piano-row').offsetHeight);
+    check('the piano roll can still be dragged back up above the floor afterward', h2 > 28, h2);
+  });
+
+  // ---------------- Piano roll notes: dual custom-name/pitch-name labels ----------------
+
+  await withPage(browser, async (page) => {
+    // A wide note (nw well past the two-label gate of 40px) with a custom
+    // pitch name must draw BOTH labels in the same pass: the custom name
+    // left-aligned, and the standard note name right-aligned — mirroring
+    // the keys column's own long-standing dual-label behavior, instead of
+    // noteLabel()'s old either/or.
+    const expectedStd = await page.evaluate(() => window._TEST_noteName(60));
+    await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 3840, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.pitchNames['0_60'] = 'Kick';
+    });
+    const draws = await page.evaluate(() => {
+      const ctx = document.getElementById('prCanvas').getContext('2d');
+      const out = [];
+      const orig = ctx.fillText.bind(ctx);
+      ctx.fillText = (text, x, y) => { out.push({ text, x: Math.round(x), align: ctx.textAlign }); return orig(text, x, y); };
+      window.dispatchEvent(new Event('resize'));
+      return new Promise(resolve => setTimeout(() => resolve(out), 200));
+    });
+    const custom = draws.find(d => d.text === 'Kick');
+    const std = draws.find(d => d.text === expectedStd);
+    check('a wide named note draws its custom pitch name, left-aligned', !!custom && custom.align === 'left', { custom, draws });
+    check('the SAME wide named note ALSO draws the standard note name, right-aligned, in the same pass',
+      !!std && std.align === 'right', { std, expectedStd, draws });
+    check('the custom name sits to the left of the standard name', !!custom && !!std && custom.x < std.x, { custom, std });
+  });
+
+  await withPage(browser, async (page) => {
+    // A named note too NARROW for both labels (nw <= 40) falls back to the
+    // single left-aligned label it always showed (today's noteLabel() call,
+    // unchanged) — degrades sensibly instead of cramming two labels in.
+    await page.evaluate(() => {
+      // pxPerTick defaults to 0.18 -> 112 ticks is ~20px wide (>14 so still
+      // drawn, but <=40 so the two-label gate should NOT fire).
+      const n = { id: window._TEST_state.nextId++, pitch: 62, start: 0, length: 112, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.pitchNames['0_62'] = 'Snare';
+    });
+    const draws = await page.evaluate(() => {
+      const ctx = document.getElementById('prCanvas').getContext('2d');
+      const out = [];
+      const orig = ctx.fillText.bind(ctx);
+      ctx.fillText = (text, x, y) => { out.push({ text, align: ctx.textAlign }); return orig(text, x, y); };
+      window.dispatchEvent(new Event('resize'));
+      return new Promise(resolve => setTimeout(() => resolve(out), 200));
+    });
+    const snareDraws = draws.filter(d => d.text === 'Snare');
+    check('a narrow named note (too small for both labels) still draws its custom name once, left-aligned',
+      snareDraws.length === 1 && snareDraws[0].align === 'left', { snareDraws, draws });
+  });
+
+  // ---------------- CC# picker popover (mirrors the Channel picker) ----------------
+
+  await withPage(browser, async (page) => {
+    // Baseline lane from withPage(): CC1 on Ch0 (current for this test).
+    const lane0 = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    // Same channel as lane0 -> CC10 must show as "used" in lane0's popover.
+    await page.evaluate(() => window._TEST_addLane(10, 0));
+    // A different channel -> CC20 must NOT show as "used" in lane0's popover.
+    await page.evaluate(() => window._TEST_addLane(20, 1));
+    await page.waitForTimeout(50);
+
+    await page.click(`.lane[data-id="${lane0}"] .lane-row1 .ccn`);
+    await page.waitForTimeout(30);
+
+    const info = await page.evaluate(() => {
+      const pop = document.getElementById('ccPopover');
+      const opts = [...pop.querySelectorAll('.cc-opt')];
+      return {
+        open: pop.classList.contains('open'),
+        count: opts.length,
+        namedText: opts[7] ? opts[7].textContent : null,   // CC 7 -> named, not current, not used
+        unnamedText: opts[3] ? opts[3].textContent : null, // CC 3 -> free/undefined
+        currentClass: opts[1] ? opts[1].className : '',    // CC 1 is lane0's current CC
+        usedClass: opts[10] ? opts[10].className : '',     // CC 10, used by another lane on Ch0
+        diffChClass: opts[20] ? opts[20].className : '',   // CC 20, used but on Ch1 (different channel)
+      };
+    });
+    check('the CC popover opens on clicking the CC# button and lists all 128 entries', info.open && info.count === 128, info);
+    check('a CC with a known GM name shows "N: Name" (e.g. "7: Volume")',
+      info.namedText === '7: Volume', info.namedText);
+    check('a CC with no GM name (a free/undefined CC) shows just the bare number',
+      info.unnamedText === '3', info.unnamedText);
+    check('the CC currently assigned to this lane is marked "current"', info.currentClass.includes('current'), info.currentClass);
+    check('a CC already used by ANOTHER lane on the SAME channel is highlighted "used" (amber)',
+      info.usedClass.includes('used'), info.usedClass);
+    check('a CC used on a DIFFERENT channel is NOT flagged as "used" for this lane',
+      !info.diffChClass.includes('used'), info.diffChClass);
+
+    // Selecting an entry applies the same side effects the old free-typing
+    // input's handler used to (lane.cc, button label/title, Name placeholder
+    // when unnamed) and closes the popover.
+    await page.click('#ccPopover .cc-opt:nth-child(51)'); // 51st entry (1-indexed) = CC 50
+    await page.waitForTimeout(30);
+    const after = await page.evaluate((id) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === id);
+      const btn = document.querySelector(`.lane[data-id="${id}"] .lane-row1 .ccn`);
+      const lname = document.querySelector(`.lane[data-id="${id}"] input.lname`);
+      return {
+        cc: lane.cc, btnText: btn.textContent, btnTitle: btn.title,
+        lnamePlaceholder: lname.placeholder,
+        popOpen: document.getElementById('ccPopover').classList.contains('open'),
+      };
+    }, lane0);
+    check('selecting a CC from the popover updates lane.cc, the button label/title, and the unnamed lane\'s placeholder',
+      after.cc === 50 && after.btnText === '50' && after.btnTitle.includes('50') && after.lnamePlaceholder.length > 0,
+      after);
+    check('selecting a CC from the popover closes it', after.popOpen === false, after.popOpen);
+  });
+
+  await withPage(browser, async (page) => {
+    // Outside-click and Escape both close the CC popover, same as #chPopover.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.click(`.lane[data-id="${laneId}"] .lane-row1 .ccn`);
+    await page.waitForTimeout(30);
+    const openBefore = await page.evaluate(() => document.getElementById('ccPopover').classList.contains('open'));
+    await page.mouse.click(5, 5);
+    await page.waitForTimeout(30);
+    const closedAfterOutsideClick = await page.evaluate(() => !document.getElementById('ccPopover').classList.contains('open'));
+    check('clicking outside the CC popover closes it', openBefore && closedAfterOutsideClick, { openBefore, closedAfterOutsideClick });
+
+    await page.click(`.lane[data-id="${laneId}"] .lane-row1 .ccn`);
+    await page.waitForTimeout(30);
+    const openAgain = await page.evaluate(() => document.getElementById('ccPopover').classList.contains('open'));
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(30);
+    const closedAfterEscape = await page.evaluate(() => !document.getElementById('ccPopover').classList.contains('open'));
+    check('pressing Escape closes the CC popover', openAgain && closedAfterEscape, { openAgain, closedAfterEscape });
+  });
+
+  await withPage(browser, async (page) => {
+    // Pitch-bend lanes show "PB" instead of a CC#, and must not have a CC
+    // picker button at all — the popover only ever applies to CC lanes.
+    await page.click('#addPbLane');
+    await page.waitForTimeout(50);
+    const info = await page.evaluate(() => {
+      const row = [...document.querySelectorAll('.lane')].find(r => r.querySelector('.pb-tag'));
+      return {
+        found: !!row,
+        hasPbTag: row ? !!row.querySelector('.pb-tag') : false,
+        hasCcBtn: row ? !!row.querySelector('.lane-row1 .ccn') : true,
+      };
+    });
+    check('a PB lane shows the "PB" tag and has no CC# picker button in row 1',
+      info.found && info.hasPbTag && !info.hasCcBtn, info);
   });
 
   await browser.close();

@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.10
+  MMV MIDI & CC Curve Editor v0.9.11
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -312,6 +312,33 @@
   A fresh project no longer auto-adds a default CC1 "Modulation Wheel"
   lane — new projects start with zero CC lanes; "+ Add CC lane"/"+ Add PB
   lane" create the first one exactly as they always did.
+  v0.9.11 Note Info's four columns (Note/Vel/Pos/Ch) are now equal width
+  (grid-template-columns 1fr 1fr 1fr 1fr, not 0.5fr for Note) so all four
+  boxes read as one consistent family; the read-only Note display and the
+  editable Vel/Pos/Ch inputs now share the same height/padding too. Note
+  Info also gets its own manual minimize/maximize toggle (▾/▸, same
+  convention as the CC lane toggle) next to the "Note Info" label — a
+  separate, in-memory-only preference from the existing auto-collapse-on-
+  no-selection behavior: off, nothing changes; on, it force-collapses the
+  box to reclaim vertical space even while a note IS selected.
+  The piano roll's resize floor is lowered from 70px to 28px (both the CSS
+  min-height and the #prSplitter drag clamp) so it can shrink much further
+  to free up room for CC lanes when notes aren't the focus, while still
+  leaving a scrollable sliver of keys visible.
+  Piano-roll note rectangles with a custom pitch name now draw BOTH the
+  custom name (left-aligned, bold) and the standard note name (right-
+  aligned) in the same pass, mirroring the keys column's own long-standing
+  dual-label behavior — naming a note no longer means losing its note-
+  number/name display. Notes too narrow for both (<=40px wide) fall back
+  to the single label they always showed.
+  CC# is now a button (not a free-typing number field) that opens a shared
+  #ccPopover listing all 128 CC values by number + GM name (bare number
+  when unnamed), same click-to-pick UX the Channel button already has.
+  Any CC already used by another lane on the SAME MIDI channel is
+  highlighted amber (#ffb454); the CC currently assigned to the open
+  lane is marked as current. Selecting an entry applies the same side
+  effects the old free-typing input did (lane.cc, button label/title, the
+  unnamed lane's name placeholder) and closes the popover.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -370,19 +397,41 @@
   /* ── Note Info columns (replaces velocity leftcol) ── */
   .note-info-left{padding:4px 5px!important;justify-content:center!important;}
   .ni-title{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);padding-bottom:3px;white-space:nowrap;}
-  .note-info-grid{display:grid;grid-template-columns:0.5fr 1fr 1fr 1fr;gap:3px;width:100%;}
+  .note-info-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:3px;width:100%;}
   .ni-col{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;}
   .ni-lbl{font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em;}
-  .ni-input{width:100%;padding:2px 3px;font-size:10px;text-align:center;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
+  .ni-input,.ni-disp{box-sizing:border-box;width:100%;height:19px;padding:2px 3px;font-size:10px;line-height:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:4px;overflow:hidden;white-space:nowrap;}
+  .ni-input{color:var(--accent2);}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
-  .ni-disp{font-size:10px;color:var(--txt);background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:2px 1px;width:100%;text-align:center;overflow:hidden;white-space:nowrap;}
+  .ni-disp{color:var(--txt);display:flex;align-items:center;justify-content:center;}
   /* Collapsed to a single slim row when nothing is selected (item 5) — the
      title + grid stay in the DOM (field ids/editing behavior unchanged when
      expanded) and just hide, so nothing about the actual editing wiring
-     needs to know about collapse state. */
+     needs to know about collapse state. Same mechanism now also drives a
+     SEPARATE manual minimize toggle (state.noteInfoManuallyCollapsed) — see
+     the ni-header/.toggle-btn wiring near #noteInfoLeft — which forces this
+     same collapsed look regardless of selection when the user just wants
+     the vertical space back. */
   .ni-empty{display:none;font-size:10px;color:var(--txt2);white-space:nowrap;}
   .note-info-left.ni-collapsed .ni-title,.note-info-left.ni-collapsed .note-info-grid{display:none;}
   .note-info-left.ni-collapsed .ni-empty{display:block;}
+  .ni-header{display:flex;align-items:center;gap:4px;width:100%;justify-content:center;}
+  .ni-header .toggle-btn{flex-shrink:0;}
+  .note-info-left.ni-collapsed .ni-header{justify-content:space-between;}
+  /* Manual minimize/maximize toggle for the whole Note Info box — same
+     .move-btn/.toggle-btn visual language as the CC lane row-1 toggle
+     (▾ expanded / ▸ minimized, same .on convention), just scoped to
+     .note-info-left instead of .lane. This is independent of the existing
+     auto-collapse-on-no-selection behavior above (.ni-collapsed) — both
+     apply the same collapsed look, but this one is driven by a manual
+     state.noteInfoManuallyCollapsed flag instead of selection state. */
+  .note-info-left .move-btn{
+    width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
+    display:inline-flex;align-items:center;justify-content:center;
+    border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
+    padding:0;line-height:1;flex-shrink:0;font-size:10px;cursor:pointer;}
+  .note-info-left .move-btn:hover{border-color:var(--line);background:var(--panel2);color:var(--accent);}
+  .note-info-left .move-btn.on{color:var(--accent2);border-color:rgba(79,209,255,.4);}
   /* ── Lane ch-filter: auto-collapse when View Ch doesn't match ── */
   .lane.lane-ch-filtered .grip{display:none!important;}
   .lane.lane-ch-filtered .lanebody{display:none!important;}
@@ -461,7 +510,7 @@
   .audio-leftcol{display:flex!important;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:3px 5px;}
   .audio-name{font-size:10px;color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;width:100%;text-align:center;}
 
-  .piano-row{flex:0 0 auto;min-height:70px;height:200px;}
+  .piano-row{flex:0 0 auto;min-height:28px;height:200px;}
   .vel-row{height:84px;}
   /* Slim gutter label identifying the velocity-bars strip itself, since the
      leftcol next to it is Note Info (notes+CC points), not a "velocity"
@@ -541,9 +590,13 @@
      rather than `.lane .leftcol`). Order: Minimize/Maximize toggle — "CC"
      label + CC#/PB — Name — Channel — Colour. */
   .lane .lane-row1 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
-  .lane .lane-row1 .ccn{flex:0 0 28px;width:28px;padding:1px 1px;font-size:10px;-moz-appearance:textfield;}
-  .lane .lane-row1 .ccn::-webkit-outer-spin-button,
-  .lane .lane-row1 .ccn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  /* CC# — a button (not a free-typing number field), same UX shift Channel
+     already went through: opens the shared #ccPopover listing all 128 CC
+     values by number + name; see #ccPopover below. */
+  .lane .lane-row1 .ccn{height:16px;min-width:24px;box-sizing:border-box;padding:0 4px;font-size:10px;
+    border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
+    flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
+  .lane .lane-row1 .ccn:hover{border-color:var(--accent);color:var(--accent);}
   .lane .lane-row1 .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
   .lane .lane-row1 input.lname{flex:1 1 60px;min-width:0;max-width:140px;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   /* Channel — a button (not a free-typing number field) labeled "Ch N" that
@@ -580,6 +633,31 @@
      here for the same reason (and with the same color) it's flagged in the
      Recording Setup channel list: #recordBtn.ch16warn / #recCh16Warn. */
   #chPopover .ch-opt.ch16{color:#ffb454;}
+  /* Shared CC#-picker popover — same one-DOM-instance-repositioned-via-JS
+     pattern as #chPopover above, opened from a lane's .ccn button (row 1).
+     All 128 CC values laid out as a compact 4-column grid (0-31/32-63/
+     64-95/96-127) since a single 190px-wide column like #chPopover's would
+     make the list absurdly tall for 128 rows. */
+  #ccPopover{position:fixed;width:480px;max-height:360px;overflow-y:auto;background:var(--panel);
+    border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;
+    box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:700;display:none;
+    grid-template-columns:repeat(4,1fr);gap:1px;padding:5px;}
+  #ccPopover.open{display:grid;}
+  #ccPopover .cc-opt{display:block;width:100%;text-align:left;font-size:10.5px;padding:3px 5px;
+    border-radius:4px;border:1px solid transparent;background:none;color:var(--txt);cursor:pointer;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  #ccPopover .cc-opt:hover{background:var(--panel2);border-color:var(--line);}
+  /* Currently-assigned CC on THIS lane — same accent highlight #chPopover
+     uses for the current channel, plus a checkmark so it reads distinctly
+     from the amber "used elsewhere on this channel" highlight below (the
+     two are mutually exclusive by construction — a lane's own CC is never
+     counted as "used by another lane"). */
+  #ccPopover .cc-opt.current{background:rgba(79,163,255,.18);color:var(--accent);}
+  /* Already claimed by another lane on the SAME MIDI channel as the lane
+     whose popover is open — the whole point of this feature: let the user
+     see at a glance which CC#s are free vs. already in use on this channel.
+     Same amber (#ffb454) already used for the Channel-16 warning above. */
+  #ccPopover .cc-opt.used{color:#ffb454;}
 
   /* Lane leftcol — now 2 rows (row 1 lives outside it, see above): row 2
      (× on the left; Val/Pos/Steps/Mute/Solo on the right) is the protected
@@ -986,8 +1064,11 @@
 
     <div class="row vel-row" id="velRow">
       <div class="leftcol note-info-left" id="noteInfoLeft">
-        <span class="ni-empty" id="noteInfoEmpty">Note Info — no selection</span>
-        <span class="ni-title">Note Info</span>
+        <div class="ni-header">
+          <span class="ni-empty" id="noteInfoEmpty">Note Info — no selection</span>
+          <span class="ni-title">Note Info</span>
+          <button type="button" class="move-btn toggle-btn" id="niToggleBtn" title="Minimize Note Info">▾</button>
+        </div>
         <div class="note-info-grid">
           <div class="ni-col">
             <span class="ni-lbl">Note</span>
@@ -1250,6 +1331,10 @@
     sweepAmpLoStart:0, sweepAmpLoEnd:0, sweepAmpHiStart:30, sweepAmpHiEnd:127,
     durMode:'hms', rulerMode:'bars',
     notes:[], ccLanes:[], nextId:1, pitchNames:{}, keysW:300, projectName:'',
+    // UI-only preference (not persisted/undoable, like keysW above): manual
+    // minimize toggle for the Note Info box, independent of the existing
+    // auto-collapse-on-no-selection behavior — see updateNoteInfo().
+    noteInfoManuallyCollapsed:false,
     channelNames:Array(16).fill(''),
     activeLaneId:null, selection:new Set(), focus:'piano',
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
@@ -1724,7 +1809,26 @@
       ctx.fillStyle=velColor(n.vel); ctx.fillRect(x,y+1,nw,nh-2);
       ctx.strokeStyle=sel?getCss('--sel'):chanColor(n.ch); ctx.lineWidth=sel?2:1; ctx.strokeRect(x+0.5,y+1.5,nw-1,nh-3);
       if(nw>14&&nh>=10){ ctx.save(); ctx.beginPath(); ctx.rect(x+1,y+1,nw-2,nh-2); ctx.clip();
-        ctx.fillStyle=sel?'#06223f':'#06223f'; ctx.font=Math.min(9,nh-2)+'px system-ui'; ctx.textBaseline='middle'; ctx.textAlign='left'; ctx.fillText(noteLabel(n.pitch,n.ch),x+2,y+nh/2); ctx.restore(); }
+        ctx.fillStyle=sel?'#06223f':'#06223f'; ctx.font=Math.min(9,nh-2)+'px system-ui'; ctx.textBaseline='middle';
+        // A note with a custom pitch name used to lose the note-number/name
+        // display entirely (noteLabel() returns EITHER the custom name OR
+        // the standard name, never both). Mirror the keys column's own
+        // dual-label behavior (drawKeys() above): custom name left-aligned +
+        // bold, standard note name right-aligned, both visible at once —
+        // but only once there's enough width for both without colliding
+        // (nw>40 — wider than the plain nw>14 text gate above, since two
+        // short labels plus the gap between them need noticeably more room
+        // than one); a narrower named note falls back to the single
+        // left-aligned label it always showed (today's noteLabel() call,
+        // unchanged), same as an unnamed note.
+        const customName=pitchName(n.pitch,n.ch);
+        if(customName&&nw>40){
+          ctx.textAlign='left'; ctx.fillText(customName,x+2,y+nh/2);
+          ctx.textAlign='right'; ctx.fillText(noteName(n.pitch),x+nw-2,y+nh/2);
+        } else {
+          ctx.textAlign='left'; ctx.fillText(noteLabel(n.pitch,n.ch),x+2,y+nh/2);
+        }
+        ctx.restore(); }
     }
     // Pass 1: unselected notes (dimmed when something is selected, hidden if channel filtered out)
     if(hasSel) ctx.globalAlpha=0.35;
@@ -1975,8 +2079,20 @@
     // Collapse to a single slim row when nothing is selected — a note or a
     // CC point (ccSel, defined below, tracks the latter across all lanes).
     // Field ids/editing behavior are unchanged; only visibility toggles.
+    // state.noteInfoManuallyCollapsed (set by the ▾/▸ toggle button) is a
+    // SEPARATE, manual override: when on, it forces the collapsed look
+    // regardless of selection (the user wants the vertical space back even
+    // while something IS selected); when off, this auto behavior alone
+    // decides collapse state, unchanged from before.
     const nil=$('noteInfoLeft');
-    if(nil) nil.classList.toggle('ni-collapsed', sel.length===0 && (typeof ccSel==='undefined'||ccSel.size===0));
+    const autoCollapse=sel.length===0 && (typeof ccSel==='undefined'||ccSel.size===0);
+    if(nil) nil.classList.toggle('ni-collapsed', state.noteInfoManuallyCollapsed || autoCollapse);
+    // The collapsed placeholder text says "no selection", which would be
+    // misleading if the box is showing collapsed only because of the manual
+    // override while something IS actually selected — swap in a label that
+    // reflects that instead.
+    const ne=$('noteInfoEmpty');
+    if(ne) ne.textContent=(state.noteInfoManuallyCollapsed && !autoCollapse)?'Note Info — minimized':'Note Info — no selection';
   }
   // keep old name as alias so velocity drag calls still work
   const updateVelValInput=updateNoteInfo;
@@ -2383,6 +2499,42 @@
     pop.style.left=Math.round(left)+'px'; pop.style.top=Math.round(top)+'px';
   }
 
+  // ---------- CC# picker popover (mirrors the Channel picker above) ----------
+  // One shared instance for every lane's CC# button (row 1), the same
+  // repositioned-via-getBoundingClientRect() approach as #chPopover. Lists
+  // all 128 CC values; highlights (amber, #ffb454) any CC already claimed by
+  // ANOTHER lane on the SAME MIDI channel as the lane whose popover is open,
+  // and marks (accent + checkmark) the CC currently assigned to THIS lane.
+  function ensureCcPopover(){
+    let pop=$('ccPopover');
+    if(!pop){ pop=document.createElement('div'); pop.id='ccPopover'; document.body.appendChild(pop); }
+    return pop;
+  }
+  function closeCcPopover(){ const pop=$('ccPopover'); if(pop) pop.classList.remove('open'); }
+  function openCcPopover(lane,btnEl,onSelect){
+    const pop=ensureCcPopover();
+    pop.innerHTML='';
+    for(let cc=0;cc<128;cc++){
+      const name=ccName(cc);
+      const label=name?(cc+': '+name):String(cc);
+      const usedByOther=state.ccLanes.some(l=>l.ch===lane.ch&&l.cc===cc&&l.id!==lane.id);
+      const isCurrent=cc===lane.cc;
+      const opt=document.createElement('button'); opt.type='button';
+      opt.className='cc-opt'+(isCurrent?' current':'')+(usedByOther?' used':'');
+      opt.textContent=(isCurrent?'✓ ':'')+label;
+      opt.title=label+(isCurrent?' — current':'')+(usedByOther?' — already used on Ch'+(lane.ch+1)+' by another lane':'');
+      opt.addEventListener('click',()=>{ lane.cc=cc; if(onSelect) onSelect(); closeCcPopover(); });
+      pop.appendChild(opt);
+    }
+    pop.classList.add('open');
+    const r=btnEl.getBoundingClientRect();
+    const popW=pop.offsetWidth, popH=pop.offsetHeight;
+    let left=r.left, top=r.bottom+3;
+    if(left+popW>window.innerWidth-8) left=Math.max(8,window.innerWidth-popW-8);
+    if(top+popH>window.innerHeight-8) top=Math.max(8,r.top-popH-3);
+    pop.style.left=Math.round(left)+'px'; pop.style.top=Math.round(top)+'px';
+  }
+
   function buildLaneDom(lane){
     const row=document.createElement('div'); row.className='lane'; row.dataset.id=lane.id;
     if(lane.visible===false) row.classList.add('lane-hidden');
@@ -2406,7 +2558,11 @@
       row1.appendChild(toggleBtn); row1.appendChild(pbTag);
     } else {
       const ccLbl=document.createElement('span'); ccLbl.className='mini-lbl'; ccLbl.textContent='CC';
-      ccn=document.createElement('input'); ccn.type='number'; ccn.className='ccn'; ccn.min=0; ccn.max=127; ccn.value=lane.cc;
+      // CC# — a button (not a free-typing number field) that opens the
+      // shared #ccPopover listing all 128 CC values by number + name (see
+      // openCcPopover above), same UX shift the Channel button already went
+      // through. Lives in row 1, same as before.
+      ccn=document.createElement('button'); ccn.type='button'; ccn.className='ccn'; ccn.textContent=lane.cc;
       ccn.title='CC '+lane.cc+(ccName(lane.cc)?' – '+ccName(lane.cc):'');
       row1.appendChild(toggleBtn); row1.appendChild(ccLbl); row1.appendChild(ccn);
     }
@@ -2561,15 +2717,19 @@
     ltags.addEventListener('blur',()=>{ commitTags(); exitTagEdit(); });
     ltags.addEventListener('keydown',e=>{ if(e.key==='Enter') ltags.blur(); });
 
-    // CC number
+    // CC number — click opens the shared #ccPopover (see openCcPopover
+    // above); selecting an entry there applies the exact same side effects
+    // the old free-typing input's 'input' handler used to (button label,
+    // title tooltip, Name field's title + its placeholder when unnamed).
     if(!laneIsPb(lane)){
-      ccn.addEventListener('input',ev=>{
-        lane.cc=clamp(+ev.target.value||0,0,127);
+      function applyCcSideEffects(){
+        ccn.textContent=lane.cc;
         const name=ccName(lane.cc);
-        ev.target.title='CC '+lane.cc+(name?' – '+name:'');
+        ccn.title='CC '+lane.cc+(name?' – '+name:'');
         lname.title=name;
         if(!lane.name){ lname.placeholder=name||'Lane name…'; }
-      });
+      }
+      ccn.addEventListener('click',e=>{ e.stopPropagation(); openCcPopover(lane,ccn,applyCcSideEffects); });
     }
     // Steps ("snap-to"): 0/1 = off (full granularity). Committed on
     // blur/Enter (not live on every keystroke) because the floor of 2 would
@@ -5181,6 +5341,20 @@
     // Setup panel toggle
     $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
     $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); } });
+    // Note Info manual minimize/maximize — same ▾/▸ two-state convention as
+    // the CC lane toggle, independent of the existing auto-collapse (see
+    // updateNoteInfo()); a UI-only in-memory preference, not persisted.
+    (()=>{
+      const btn=$('niToggleBtn');
+      function refresh(){
+        const min=!!state.noteInfoManuallyCollapsed;
+        btn.textContent=min?'▸':'▾';
+        btn.title=min?'Maximize Note Info':'Minimize Note Info';
+        btn.classList.toggle('on',min);
+      }
+      btn.addEventListener('click',e=>{ e.stopPropagation(); state.noteInfoManuallyCollapsed=!state.noteInfoManuallyCollapsed; refresh(); updateNoteInfo(); });
+      refresh();
+    })();
     // ── Advanced Generate panel ──
     (()=>{
       const btn=$('genAdvBtn'), panel=$('genAdvPanel');
@@ -5562,18 +5736,19 @@
       el.addEventListener('input',e=>{ state[key]=clamp(+e.target.value||0,0,127); drawAbPreview(); });
     });
 
-    ensureChPopover();
+    ensureChPopover(); ensureCcPopover();
     document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; }
       if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; }
       if(!$('recWrapper').contains(e.target)){ $('recPopover').classList.remove('open'); }
       if(!$('projWrapper').contains(e.target)){ $('projPopover').classList.remove('open'); }
-      if(!$('chPopover').contains(e.target)){ closeChPopover(); } });
-    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); closeChPopover(); } });
+      if(!$('chPopover').contains(e.target)){ closeChPopover(); }
+      if(!$('ccPopover').contains(e.target)){ closeCcPopover(); } });
+    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); closeChPopover(); closeCcPopover(); } });
     window.addEventListener('resize',resizeCanvases); resizeCanvases();
     attachGrip($('gripVel'), $('velRow'), ()=>velCanvas, ()=>velScroll, 'down');
     (()=>{ const sp=$('prSplitter'),pr=document.querySelector('.piano-row'); let spd=null;
       sp.addEventListener('mousedown',e=>{ e.preventDefault(); spd={y:e.clientY,h:pr.offsetHeight}; sp.classList.add('dragging'); document.body.style.cursor='ns-resize'; });
-      window.addEventListener('mousemove',e=>{ if(!spd) return; pr.style.height=Math.max(70,spd.h+(e.clientY-spd.y))+'px'; resizeCanvases(); });
+      window.addEventListener('mousemove',e=>{ if(!spd) return; pr.style.height=Math.max(28,spd.h+(e.clientY-spd.y))+'px'; resizeCanvases(); });
       window.addEventListener('mouseup',()=>{ if(spd){ spd=null; sp.classList.remove('dragging'); document.body.style.cursor=''; } }); })();
     document.querySelector('.editor').addEventListener('wheel',e=>{
       if(e.ctrlKey){ e.preventDefault(); zoomHAt(e.deltaY<0?1.12:1/1.12, e.clientX); return; }
