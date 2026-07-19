@@ -104,6 +104,14 @@ function buildTestHtml() {
     [
       'window._TEST_openMigratePicker=()=>openMigratePicker();',
       '    window._TEST_openMigrateSheet=(entry)=>openMigrateSheet(entry);',
+      // Playwright round-trips an object passed into page.evaluate() via
+      // structured clone, so it's a disconnected copy inside the page, not
+      // the live isfHistory entry — fine for read-only checks, but a test
+      // that needs a second action (e.g. re-export) to see the first
+      // action's mutation (entry.source updated in place) must look the
+      // entry up by id inside the page instead, same as the real Migrate
+      // button flow always does.
+      '    window._TEST_openMigrateSheetById=(id)=>openMigrateSheet(state.isfHistory.find(e=>e.id===id));',
       '    window._TEST_isLaneAutomated=(id)=>isLaneAutomated(state.ccLanes.find(l=>l.id===id));',
       '    window._TEST_computeModifiers=(row)=>computeModifiers(row);',
       '    window._TEST_ccToNative=(row,cc)=>ccToNative(row,cc);',
@@ -2060,6 +2068,29 @@ async function run() {
     }, laneId);
     check('Val row shows a "X/N" step-index badge for the active point when Steps is on',
       badge.visible && /^\d+\/12$/.test(badge.text), badge);
+
+    // Clicking the badge toggles between MME's 1-indexed display (1/N..N/N)
+    // and MMV's own 0-indexed display for a Step modifier (0/(N-1)..(N-1)/(N-1))
+    // — same underlying step, just numbered the way each app numbers it.
+    const mmeIdx = parseInt(badge.text.split('/')[0], 10);
+    await page.evaluate((laneId) => { window._TEST_state.ccLanes.find(l => l.id === laneId)._stepBadge.click(); }, laneId);
+    const afterToggle = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._stepBadge.textContent, laneId);
+    check('Clicking the step badge switches to MMV\'s 0-indexed numbering (same step, index-1, denominator N-1)',
+      afterToggle === (mmeIdx - 1) + '/11', { before: badge.text, after: afterToggle });
+
+    // The toggle is global, not per-lane: switching it via one lane's badge
+    // must also flip a DIFFERENT lane's badge that's showing at the same time.
+    const laneId2 = await page.evaluate(() => window._TEST_addLane(31, 0));
+    await page.evaluate((laneId2) => { const l = window._TEST_state.ccLanes.find(x => x.id === laneId2); l.steps = 4; window._TEST_upsertPoint(laneId2, 480, 42); }, laneId2);
+    await page.evaluate((laneId2) => { const l = window._TEST_state.ccLanes.find(x => x.id === laneId2); l._activePt = l.points[0]; }, laneId2);
+    await page.evaluate((laneId2) => window._TEST_updateLaneValInput(laneId2), laneId2);
+    const badge2Before = await page.evaluate((laneId2) => window._TEST_state.ccLanes.find(l => l.id === laneId2)._stepBadge.textContent, laneId2);
+    await page.evaluate((laneId) => { window._TEST_state.ccLanes.find(l => l.id === laneId)._stepBadge.click(); }, laneId); // toggle back via lane 1
+    const badge1Back = await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._stepBadge.textContent, laneId);
+    const badge2After = await page.evaluate((laneId2) => window._TEST_state.ccLanes.find(l => l.id === laneId2)._stepBadge.textContent, laneId2);
+    check('Toggling back via lane 1 restores its own MME-style badge', badge1Back === badge.text, { badge1Back, original: badge.text });
+    check('The mode is global: toggling via lane 1 also flips lane 2\'s badge back to MME-style, not just lane 1\'s',
+      badge2Before !== badge2After, { badge2Before, badge2After });
   });
 
   await withPage(browser, async (page) => {
@@ -2189,6 +2220,8 @@ async function run() {
     check('isfHistory entry retains the raw ISF source text (the prerequisite gap from the strategy notes is closed)',
       typeof entry.source === 'string' && entry.source.includes('CutType'), entry.source.slice(0, 40));
     check('every imported lane\'s isf.batchId matches its isfHistory entry id', linked.every(l => l.batchId === entry.id), { entryId: entry.id, batchIds: linked.map(l => l.batchId) });
+    check('The working filename gets " (MME)" appended on import, not left as the raw uploaded name',
+      entry.filename === 'gem (MME).fs', entry.filename);
 
     const girdleId = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.isf && l.isf.name === 'GirdleRadius').id);
     await page.evaluate((id) => window._TEST_upsertPoint(id, 10000, 100), girdleId); // makes GirdleRadius automated
@@ -2208,18 +2241,26 @@ async function run() {
     check('Migrate sheet pre-checks "Update Default" for every row regardless of automation state',
       rowsInfo.every(r => r.updateChecked === true), rowsInfo);
 
+    await page.evaluate(() => { window._TEST_state.projectName = 'Gem Demo'; });
+
     const downloads = [];
     page.on('download', (d) => downloads.push(d));
     await page.click('#isfMigrateDialog button:has-text("Export")');
     await page.waitForTimeout(400);
-    check('Export produces two downloads: the migrated ISF and the wiring sheet', downloads.length === 2,
-      downloads.map(d => d.suggestedFilename()));
+    check('Export produces two downloads: the updated (MME) ISF and the wiring sheet (no project folder set, so both fall back to a download)',
+      downloads.length === 2, downloads.map(d => d.suggestedFilename()));
 
-    const isfDl = downloads.find(d => d.suggestedFilename().endsWith('.migrated.fs'));
+    const isfDl = downloads.find(d => d.suggestedFilename() === 'gem (MME).fs');
     const sheetDl = downloads.find(d => d.suggestedFilename().endsWith('-wiring-sheet.txt'));
+    check('The exported ISF keeps the SAME "(MME)" filename used at import — not a new "...migrated.fs" copy',
+      !!isfDl, downloads.map(d => d.suggestedFilename()));
+    check('The wiring sheet\'s own filename is also based on the "(MME)" working name',
+      sheetDl && sheetDl.suggestedFilename() === 'gem (MME)-wiring-sheet.txt', sheetDl && sheetDl.suggestedFilename());
+
+    let isfContent = '';
     if (isfDl) {
-      const content = fs.readFileSync(await isfDl.path(), 'utf8');
-      const m = content.match(/\/\*\s*([\s\S]*?)\s*\*\//);
+      isfContent = fs.readFileSync(await isfDl.path(), 'utf8');
+      const m = isfContent.match(/\/\*\s*([\s\S]*?)\s*\*\//);
       const newHeader = m && JSON.parse(m[1]);
       const cutInput = newHeader && newHeader.INPUTS.find(i => i.NAME === 'CutType');
       // playhead is at tick 0; CutType's lane still holds only its import-time
@@ -2229,6 +2270,12 @@ async function run() {
       // not a bug to round away.
       check('Exported ISF rewrites a static parameter\'s DEFAULT to the playhead-derived native value (through real CC quantization)',
         cutInput && Math.abs(cutInput.DEFAULT - 126 / 127) < 1e-6, cutInput);
+      check('Exported ISF\'s DESCRIPTION names the MME project and lists both the updated default and the wiring row',
+        newHeader.DESCRIPTION.includes('Gem Demo') && newHeader.DESCRIPTION.includes('CutType') && newHeader.DESCRIPTION.includes('GirdleRadius'),
+        newHeader.DESCRIPTION);
+      check('Exported ISF also carries the same migration notes as a trailing GLSL comment (safeguard if the .fs and the .txt sheet get separated)',
+        /--- MME Migration Notes/.test(isfContent) && isfContent.lastIndexOf('MME Migration Notes') > isfContent.indexOf('*/'),
+        isfContent.slice(isfContent.lastIndexOf('MME Migration Notes') - 40));
     } else {
       check('Exported ISF download present', false, downloads.map(d => d.suggestedFilename()));
     }
@@ -2240,6 +2287,38 @@ async function run() {
         /Scale.*ABOVE.*Offset/.test(sheetText), sheetText.includes('ABOVE'));
     } else {
       check('Wiring sheet download present', false, downloads.map(d => d.suggestedFilename()));
+    }
+
+    // Re-export (e.g. after the user tweaks the playhead again) must UPDATE
+    // the embedded notes block in place, not stack a second copy alongside
+    // the first — this is the whole point of the marker-delimited replace.
+    // Uses openMigrateSheetById (looks the entry up live inside the page)
+    // rather than re-passing the `entry` object from Node: page.evaluate()
+    // structured-clones any object argument into a disconnected copy, so
+    // reusing the earlier `entry` reference here would silently re-migrate
+    // the ORIGINAL (pre-notes) source and never exercise the real
+    // replace-not-duplicate path the way the actual Migrate button does.
+    if (isfDl) {
+      // The notes are embedded in TWO places by design (DESCRIPTION and the
+      // trailing GLSL comment), so 2 occurrences is the correct count after
+      // ONE export too — the thing under test is that this stays at 2 after
+      // a SECOND export, proving each location got replaced in place rather
+      // than growing to 4 (a duplicate stacked in each spot).
+      const occurrences1 = (isfContent.match(/--- MME Migration Notes/g) || []).length;
+      check('A single export embeds exactly one notes block per location (DESCRIPTION + trailing comment = 2 total)',
+        occurrences1 === 2, occurrences1);
+
+      await page.evaluate((id) => window._TEST_openMigrateSheetById(id), entry.id);
+      await page.waitForTimeout(150);
+      const downloads2 = [];
+      page.on('download', (d) => downloads2.push(d));
+      await page.click('#isfMigrateDialog button:has-text("Export")');
+      await page.waitForTimeout(400);
+      const isfDl2 = downloads2.find(d => d.suggestedFilename() === 'gem (MME).fs');
+      const content2 = isfDl2 && fs.readFileSync(await isfDl2.path(), 'utf8');
+      const occurrences2 = content2 ? (content2.match(/--- MME Migration Notes/g) || []).length : 0;
+      check('Re-exporting the same entry replaces each location\'s block in place — still 2 total, not 4 (a stacked duplicate in each spot)',
+        occurrences2 === 2, { occurrences2, hadContent: !!content2 });
     }
   });
 
@@ -2286,6 +2365,78 @@ async function run() {
     await page.waitForTimeout(100);
     const sheetTitle = await page.locator('#isfMigrateDialog').isVisible().catch(() => false);
     check('Clicking a picker entry opens that entry\'s migrate sheet', sheetTitle === true, sheetTitle);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Default master checkbox must start ticked (matching every row,
+    // which starts ticked) and its click toggles between unticking
+    // everything and restoring the prior per-row state — the reported bug
+    // was it starting unticked while rows were all ticked, so its first
+    // click was a silent no-op. Wiring's master (starts unticked, rows
+    // mixed) must keep its existing tick-all/restore behavior unchanged.
+    const header = {
+      INPUTS: [
+        { NAME: 'A', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 },
+        { NAME: 'B', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 },
+      ],
+    };
+    const source = '/*\n' + JSON.stringify(header, null, 2) + '\n*/\nvoid main(){}\n';
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'masters.fs', s), { h: header, s: source });
+    await page.waitForTimeout(100);
+    await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+    const bId = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.isf && l.isf.name === 'B').id);
+    await page.evaluate((id) => window._TEST_upsertPoint(id, 8000, 100), bId); // B automated, A stays static
+
+    const entry = await page.evaluate(() => { const h = window._TEST_state.isfHistory; return h[h.length - 1]; });
+    await page.evaluate((e) => window._TEST_openMigrateSheet(e), entry);
+    await page.waitForTimeout(100);
+
+    const readState = () => page.evaluate(() => {
+      const dlg = document.querySelector('#isfMigrateDialog');
+      const rows = Array.from(dlg.querySelectorAll('tbody tr')).map(tr => {
+        const tds = tr.querySelectorAll('td');
+        return { update: tds[4].querySelector('input').checked, wire: tds[5].querySelector('input').checked };
+      });
+      const heads = dlg.querySelectorAll('thead input[type=checkbox]');
+      return { rows, hdrUpdate: heads[0].checked, hdrWire: heads[1].checked };
+    });
+
+    const initial = await readState();
+    check('Default master checkbox starts ticked, matching every row (the reported bug: it started unticked)', initial.hdrUpdate === true, initial);
+    check('Wiring master checkbox starts unticked, matching the mixed row state (unchanged behavior)', initial.hdrWire === false, initial);
+    check('Every row starts with Default ticked', initial.rows.every(r => r.update === true), initial.rows);
+
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[0].click(); });
+    const afterUntick = await readState();
+    check('Clicking the Default master (now unticking) clears every row\'s Default checkbox — the reported "does nothing" bug', afterUntick.rows.every(r => r.update === false), afterUntick.rows);
+
+    const countText = await page.evaluate(() => document.querySelector('#isfMigrateDialog').textContent.match(/\d+ defaults? to update/)[0]);
+    check('The footer count refreshes when the master checkbox is used, not just individual rows (setting .checked directly skips the change event)',
+      countText === '0 defaults to update', countText);
+
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[0].click(); });
+    const afterRetick = await readState();
+    check('Re-ticking the Default master restores every row to its prior (ticked) state', afterRetick.rows.every(r => r.update === true), afterRetick.rows);
+
+    // Hand-untick just one row's Default, then use the master to untick+restore
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog tbody tr')[0].querySelectorAll('td')[4].querySelector('input').click(); });
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[0].click(); }); // untick all
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[0].click(); }); // restore
+    const restored = await readState();
+    check('Untick-all-then-restore brings back the exact prior mixed state (row 0 stays unticked, row 1 stays ticked), not a blanket re-tick',
+      restored.rows[0].update === false && restored.rows[1].update === true, restored.rows);
+
+    // Wiring master: unchanged tick-all/restore-mixed behavior
+    const wireBefore = (await readState()).rows.map(r => r.wire);
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[1].click(); }); // tick all
+    const afterWireTick = await readState();
+    check('Wiring master still ticks every row on click (unchanged)', afterWireTick.rows.every(r => r.wire === true), afterWireTick.rows);
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[1].click(); }); // restore
+    const afterWireRestore = await readState();
+    check('Wiring master still restores the prior mixed state on untick (unchanged)',
+      JSON.stringify(afterWireRestore.rows.map(r => r.wire)) === JSON.stringify(wireBefore), { wireBefore, after: afterWireRestore.rows.map(r => r.wire) });
   });
 
   // ---------------- ISF import: point2D inputs + float-with-VALUES (bug fix) ----------------
@@ -2401,7 +2552,7 @@ async function run() {
     page.on('download', (d) => downloads.push(d));
     await page.click('#isfMigrateDialog button:has-text("Export")');
     await page.waitForTimeout(400);
-    const isfDl = downloads.find(d => d.suggestedFilename().endsWith('.migrated.fs'));
+    const isfDl = downloads.find(d => d.suggestedFilename() === 'ComplexDiamond_xyz_Optimised (MME).fs');
     const content = fs.readFileSync(await isfDl.path(), 'utf8');
     const m = content.match(/\/\*\s*([\s\S]*?)\s*\*\//);
     const newHeader = JSON.parse(m[1]);
@@ -2933,6 +3084,63 @@ async function run() {
     await page.waitForTimeout(50);
     const savedInDir = await page.evaluate(() => window.__mockDir._files.has('brand-new-song.mmvp'));
     check('Save Project writes directly into the remembered folder when one is set', savedInDir === true, savedInDir);
+
+    await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  await withPage(browser, async (page) => {
+    // ISF import copies its working "(MME)" copy into the Projects Folder,
+    // and Migrate to MMV's export updates that SAME file in place — no
+    // browser download at all — when a folder is set. Same mock pattern as
+    // the Recent Projects / Save Project FSA tests above.
+    await page.evaluate(() => {
+      class MockFileHandle {
+        constructor(name, content) { this.kind = 'file'; this.name = name; this._content = content; }
+        async createWritable() {
+          const self = this;
+          return { async write(s) { this._buf = s; }, async close() { self._content = this._buf; } };
+        }
+      }
+      class MockDirHandle {
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); }
+        async queryPermission() { return 'granted'; }
+        async requestPermission() { return 'granted'; }
+        async getFileHandle(name, opts) {
+          if (!this._files.has(name)) {
+            if (opts && opts.create) this._files.set(name, new MockFileHandle(name, ''));
+            else { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          }
+          return this._files.get(name);
+        }
+      }
+      window.__mockIsfDir = new MockDirHandle('MyProjects');
+      window._TEST_setProjDirHandle(window.__mockIsfDir);
+    });
+
+    const header = { INPUTS: [{ NAME: 'CutType', TYPE: 'long', MIN: 0, MAX: 7, DEFAULT: 1 }] };
+    const source = '/*\n' + JSON.stringify(header, null, 2) + '\n*/\nvoid main(){}\n';
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'inplace.fs', s), { h: header, s: source });
+    await page.waitForTimeout(100);
+    await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(150); // copyIsfToProjectFolder is fire-and-forget async — give it a moment
+
+    const afterImport = await page.evaluate(() => [...window.__mockIsfDir._files.keys()]);
+    check('Import copies the working "(MME)" file into the Projects Folder (not the raw uploaded name)',
+      afterImport.includes('inplace (MME).fs') && !afterImport.includes('inplace.fs'), afterImport);
+
+    const entryId = await page.evaluate(() => window._TEST_state.isfHistory[window._TEST_state.isfHistory.length - 1].id);
+    await page.evaluate((id) => window._TEST_openMigrateSheetById(id), entryId);
+    await page.waitForTimeout(100);
+
+    let downloadFired = false;
+    page.on('download', () => { downloadFired = true; });
+    await page.click('#isfMigrateDialog button:has-text("Export")');
+    await page.waitForTimeout(300);
+
+    const folderContent = await page.evaluate(() => window.__mockIsfDir._files.get('inplace (MME).fs')._content);
+    check('Export updates the SAME file already in the Projects Folder in place, not a browser download',
+      !downloadFired && typeof folderContent === 'string' && folderContent.includes('MME Migration Notes'), { downloadFired, hasContent: typeof folderContent === 'string' });
 
     await page.evaluate(() => window._TEST_setProjDirHandle(null));
   });

@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.16
+  MMV MIDI & CC Curve Editor v0.9.17
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -437,6 +437,28 @@
   type still not recognized (e.g. point3D) now shows a visible "Not shown"
   notice in the import dialog naming it, instead of disappearing silently —
   the general fix for the class of bug point2D fell into.
+  v0.9.17 Migrate to MMV refinements from real-world use. The working ISF
+  copy is now named with " (MME)" appended on import (e.g. "Shader (MME).fs")
+  — Export updates this SAME file in place (Projects Folder write if one's
+  set, matching download-with-the-same-name otherwise) instead of piling up
+  a fresh "...migrated.fs" per export. Every export now also writes a
+  migration-notes summary (project name, which defaults changed and to
+  what, the wiring table) into the ISF's own DESCRIPTION field — so MMV's
+  right-click > Help shows it — and as a trailing GLSL comment, a safeguard
+  in case the .fs and the wiring-sheet .txt get separated (e.g. by MMV's
+  "collect project assets"). Both are marker-delimited, so re-exporting the
+  same shader replaces the previous notes block instead of stacking a
+  duplicate. Fixed: the migrate sheet's "Default" column header checkbox
+  started unticked while every row started ticked, so its first click did
+  nothing, and unticking it afterward wrongly restored everything instead
+  of clearing it — it now starts ticked and unticks/restores correctly
+  (matching how the Wiring column's master already worked, just the
+  opposite starting polarity), and the row-count footer now refreshes when
+  the master checkbox is used, not only individual rows. Added: the CC
+  lane's step-index badge (the "X/N" shown next to a Steps-enabled point)
+  can now be clicked to toggle between MME's own 1-indexed display and
+  MMV's 0-indexed one for the same Step modifier value — a global
+  preference, not per-lane.
 -->
 
 <style>
@@ -2418,12 +2440,23 @@
   function clearCcSel(lane){ if(typeof window._clearAdvPreview==='function') window._clearAdvPreview(lane); ccSel.clear(); }
   // "step 11/12" — which of the lane's Steps levels a value lands on. Empty
   // string when Steps is off, so callers can just check truthiness.
+  // Two display modes, toggled by clicking the badge itself: MME's own
+  // 1-indexed convention (1/N .. N/N), or MMV's — a Step modifier there
+  // numbers a discrete parameter's levels from 0, so its own CC data box
+  // reads 0/(N-1) .. (N-1)/(N-1) for the same points. A global (not
+  // per-lane) preference — it's how you're thinking about step numbers
+  // generally, not a per-lane setting.
+  let stepBadgeMmvMode=false;
   function stepIndexLabel(lane,v){
     if(!lane.steps||lane.steps<2) return '';
     const r=laneRange(lane), n=Math.min(Math.round(lane.steps),r.max-r.min+1);
     if(n<2) return '';
     const i=Math.round((v-r.min)/(r.max-r.min)*(n-1));
-    return (i+1)+'/'+n;
+    return stepBadgeMmvMode?(i+'/'+(n-1)):((i+1)+'/'+n);
+  }
+  function toggleStepBadgeMode(){
+    stepBadgeMmvMode=!stepBadgeMmvMode;
+    state.ccLanes.forEach(function(l){ updateLaneValInput(l); });
   }
   function updateLaneValInput(lane){
     if(!lane._valInput) return;
@@ -2444,7 +2477,7 @@
     if(lane._stepBadge){
       const label=valid?stepIndexLabel(lane,pt.v):'';
       lane._stepBadge.textContent=label;
-      lane._stepBadge.title=label?('Step '+label+' of the lane\'s Steps grid'):'';
+      lane._stepBadge.title=label?('Step '+label+' of the lane\'s Steps grid ('+(stepBadgeMmvMode?'MMV 0-indexed':'MME 1-indexed')+' — click to toggle)'):'';
       lane._stepBadge.style.display=label?'':'none';
     }
   }
@@ -2904,6 +2937,8 @@
     // costs nothing for lanes not using the feature. Kept prefix-free (no
     // "step " text) so it has room to show 2-3 digit step counts.
     const stepBadge=document.createElement('span'); stepBadge.className='step-badge'; stepBadge.style.display='none';
+    stepBadge.style.cursor='pointer';
+    stepBadge.addEventListener('click',function(e){ e.stopPropagation(); toggleStepBadgeMode(); });
     const posLbl=document.createElement('span'); posLbl.className='mini-lbl'; posLbl.textContent='P'; posLbl.title='Position';
     const posInput=document.createElement('input'); posInput.type='text'; posInput.className='pos-input';
     posInput.placeholder='—'; posInput.title='Position (Bar.Beat.16th.Tick)\nScroll or ↑↓ = ±1 tick\nShift = ±1/16th\nCtrl = ±1 beat\nAlt = ±1 bar\nType B.B.S.T and press Enter';
@@ -5239,6 +5274,20 @@
       return state.ccLanes.some(l=>l.ch===ch&&l.cc===cc);
     }
 
+    // The copy MME keeps of an imported shader is a working copy, distinct
+    // from whatever original the user gave it — named with " (MME)" so it's
+    // obvious at a glance in a file listing, and so re-exporting can update
+    // this one file in place instead of piling up "...migrated.fs",
+    // "...migrated (2).fs" etc. Idempotent: re-importing an already-renamed
+    // copy (e.g. the user re-opens their own exported file) doesn't stack a
+    // second "(MME) (MME)".
+    function mmeIsfName(rawFilename){
+      const dotIdx=rawFilename.lastIndexOf('.');
+      const base=dotIdx>0?rawFilename.slice(0,dotIdx):rawFilename;
+      const ext=dotIdx>0?rawFilename.slice(dotIdx):'.fs';
+      return /\(MME\)$/.test(base)?(base+ext):(base+' (MME)'+ext);
+    }
+
     // Best-effort copy of the imported shader into the current Projects
     // Folder (if one has been chosen — see pickProjectsFolder), mirroring
     // audio file handling. Silent no-op when no folder is set, permission is
@@ -5248,6 +5297,24 @@
       if(!await verifyDirPermission(projDirHandle,true)) return;
       const fh=await projDirHandle.getFileHandle(filename,{create:true});
       const w=await fh.createWritable(); await w.write(text); await w.close();
+    }
+
+    // Migrate to MMV's export target: the same "(MME)" working copy every
+    // time, updated in place — not a fresh "...migrated.fs" per export.
+    // Mirrors saveProject()'s own try-the-project-folder-then-download
+    // fallback. Returns true if it wrote straight into the folder, false if
+    // it fell back to a browser download the user needs to save over the
+    // original themselves.
+    async function writeIsfUpdateInPlace(filename,text){
+      if(projDirHandle && await verifyDirPermission(projDirHandle,true)){
+        try{
+          const fh=await projDirHandle.getFileHandle(filename,{create:true});
+          const w=await fh.createWritable(); await w.write(text); await w.close();
+          return true;
+        }catch(e){ /* fall through to download */ }
+      }
+      downloadText(filename,text,'text/plain');
+      return false;
     }
 
     // ── Show the ISF import modal ────────────────────────────────
@@ -5589,7 +5656,12 @@
         const sceneTag=sceneInput.value.trim().replace(/[,\s]+/g,'-');
         const importTags=sceneTag?[shaderTag,sceneTag]:[shaderTag];
         const batchId=state.nextId++;
-        const historyEntry={id:batchId, filename:filename, label:shaderTitle, importedAt:new Date().toISOString(),
+        // The working filename (what gets copied into the project folder,
+        // referenced by the wiring sheet, and updated in place on every
+        // export) carries " (MME)" — the auto-tag above still derives from
+        // the plain original filename, so lane tags stay clean.
+        const mmeFilename=mmeIsfName(filename);
+        const historyEntry={id:batchId, filename:mmeFilename, label:shaderTitle, importedAt:new Date().toISOString(),
           source:sourceText||'', lanes:[]};
         toImport.forEach(function(ref){
           const ch=(parseInt(ref.chInput.value)||1)-1;
@@ -5608,7 +5680,7 @@
         });
         if(!state.isfHistory) state.isfHistory=[];
         state.isfHistory.push(historyEntry);
-        if(sourceText) copyIsfToProjectFolder(filename,sourceText).catch(function(){});
+        if(sourceText) copyIsfToProjectFolder(mmeFilename,sourceText).catch(function(){});
         setActiveLane(state.activeLaneId);
         refreshTagBar();
         resizeCanvases();
@@ -5722,13 +5794,66 @@
       a.download=filename; a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); },1000);
     }
 
+    // Same migration summary gets embedded in two places — the ISF
+    // DESCRIPTION (MMV's right-click > Help shows this verbatim) and a
+    // trailing GLSL comment (a safeguard: if MMV's "collect project assets"
+    // moves the .fs away from the MME project, the wiring info travels with
+    // the shader file itself, not just the separate .txt sheet). Both are
+    // delimited by these markers so a later re-export replaces the previous
+    // block in place instead of stacking a duplicate on every migration.
+    const MME_NOTES_START='--- MME Migration Notes (auto-generated by MME — safe to remove) ---';
+    const MME_NOTES_END='--- End MME Migration Notes ---';
+    function escapeRegExp(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+
+    function buildMigrationNotesText(entry,defaultUpdates,wireRefs){
+      const lines=[];
+      lines.push(MME_NOTES_START);
+      lines.push('ISF values updated by MME project "'+(state.projectName||'(untitled)')+'".');
+      lines.push('Shader: '+entry.filename);
+      lines.push('Migrated: '+new Date().toLocaleString());
+      if(defaultUpdates.length){
+        lines.push('');
+        lines.push('Defaults updated:');
+        defaultUpdates.forEach(function(u){ lines.push('  '+u.name+': '+fmtNum(u.oldVal)+' -> '+fmtNum(u.newVal)); });
+      }
+      if(wireRefs.length){
+        lines.push('');
+        lines.push('MMV wiring — connect each parameter\'s Source/Feature to this CC, then add');
+        lines.push('a Scale modifier ABOVE an Offset modifier (Scale first, then Offset — the');
+        lines.push('stacking order changes the result):');
+        wireRefs.forEach(function(r){
+          let line='  '+r.row.name+': Ch'+(r.lane.ch+1)+' CC'+r.lane.cc+', Scale='+fmtNum(r.mods.scale)+', Offset='+fmtNum(r.mods.offset);
+          if(r.mods.step!=null) line+=', Step='+fmtNum(r.mods.step);
+          if(r.mods.warning) line+='  ['+r.mods.warning+']';
+          lines.push(line);
+        });
+      }
+      lines.push(MME_NOTES_END);
+      return lines.join('\n');
+    }
+
+    function embedNotesInDescription(desc,notesText){
+      const re=new RegExp(escapeRegExp(MME_NOTES_START)+'[\\s\\S]*?'+escapeRegExp(MME_NOTES_END));
+      if(re.test(desc)) return desc.replace(re,notesText);
+      const trimmed=(desc||'').replace(/\s+$/,'');
+      return trimmed?(trimmed+'\n\n'+notesText):notesText;
+    }
+
+    function embedNotesInSource(sourceText,notesText){
+      const commentRe=/\/\*\s*--- MME Migration Notes[\s\S]*?--- End MME Migration Notes ---\s*\*\//;
+      const block='/*\n'+notesText+'\n*/';
+      if(commentRe.test(sourceText)) return sourceText.replace(commentRe,block);
+      return sourceText.replace(/\s+$/,'')+'\n\n'+block+'\n';
+    }
+
     // Deep-clones the entry's header, writes each checked row's playhead
     // value into its INPUT's DEFAULT (recombining color R/G/B/A rows, or
-    // point2D X/Y rows, back into a single array), and returns the new
-    // header object. Looks the INPUT up by row.srcName (the original ISF
-    // NAME every row carries, regardless of how many rows it was split
-    // into) rather than re-deriving it from the display name.
-    function buildUpdatedHeader(entry,rows,nativeByName,updateSet){
+    // point2D X/Y rows, back into a single array), embeds the migration
+    // notes into DESCRIPTION, and returns the new header object. Looks the
+    // INPUT up by row.srcName (the original ISF NAME every row carries,
+    // regardless of how many rows it was split into) rather than
+    // re-deriving it from the display name.
+    function buildUpdatedHeader(entry,rows,nativeByName,updateSet,notesText){
       const header=JSON.parse(JSON.stringify(parseISFHeader(entry.source)));
       const inputs=header.INPUTS||header.inputs||[];
       rows.forEach(function(row){
@@ -5748,15 +5873,20 @@
           inp[key]=row.type==='bool'?!!native:native;
         }
       });
+      const descKey=header.DESCRIPTION!=null?'DESCRIPTION':(header.description!=null?'description':'DESCRIPTION');
+      header[descKey]=embedNotesInDescription(header[descKey]||'',notesText);
       return header;
     }
 
-    // Reserializes an updated header back into the original shader text,
-    // replacing only the /* JSON */ header block (same regex parseISFHeader
-    // matches — first occurrence, GLSL body untouched).
-    function serializeIsf(entry,header){
+    // Reserializes an updated header back into the original shader text
+    // (replacing only the /* JSON */ header block — first occurrence, GLSL
+    // body otherwise untouched), then embeds/updates the trailing notes
+    // comment.
+    function serializeIsf(entry,header,notesText){
       const json=JSON.stringify(header,null,2);
-      return entry.source.replace(/\/\*\s*[\s\S]*?\s*\*\//,'/*\n'+json+'\n*/');
+      let out=entry.source.replace(/\/\*\s*[\s\S]*?\s*\*\//,'/*\n'+json+'\n*/');
+      out=embedNotesInSource(out,notesText);
+      return out;
     }
 
     function buildWiringSheetText(entry,wireRefs){
@@ -5832,15 +5962,20 @@
       function th(txt,align,extra){ const t=document.createElement('th'); t.style.cssText='padding:6px 6px;text-align:'+(align||'left')+';white-space:nowrap;'+(extra||''); t.textContent=txt; return t; }
       function thEl(el,align){ const t=document.createElement('th'); t.style.cssText='padding:6px 6px;text-align:'+(align||'center')+';'; t.appendChild(el); return t; }
 
-      function masterCb(label,title){
+      function masterCb(label,title,initialChecked){
         const wrap=document.createElement('div'); wrap.style.cssText='display:flex;flex-direction:column;align-items:center;gap:2px;';
-        const cb=document.createElement('input'); cb.type='checkbox'; cb.title=title;
+        const cb=document.createElement('input'); cb.type='checkbox'; cb.title=title; cb.checked=!!initialChecked;
         const lbl=document.createElement('span'); lbl.style.cssText='font-size:10px;color:#7a8099;'; lbl.textContent=label;
         wrap.appendChild(cb); wrap.appendChild(lbl);
         return {wrap:wrap,cb:cb};
       }
-      const hdrUpdate=masterCb('Default','Tick all / restore previous');
-      const hdrWire=masterCb('Wiring','Tick all / restore previous');
+      // Default starts ticked on every row, so its master checkbox starts
+      // ticked too (matching what's actually on screen) — its primary action
+      // is unticking everything. Wiring starts mixed (ticked only where
+      // automated), so its master starts unticked and its primary action is
+      // ticking everything.
+      const hdrUpdate=masterCb('Default','Untick all / restore previous',true);
+      const hdrWire=masterCb('Wiring','Tick all / restore previous',false);
 
       thr.appendChild(th('Parameter','left','padding-left:14px;'));
       thr.appendChild(th('ISF Default','right'));
@@ -5911,20 +6046,30 @@
       tableWrap.appendChild(tbl);
       dlg.appendChild(tableWrap);
 
-      function wireMaster(masterObj,pick){
+      // forceValue is whichever checkbox state the master's own click sets
+      // every row to; the OTHER state restores whatever the rows held right
+      // before that (or forceValue's opposite, the first time). Wiring
+      // starts all-unticked, so forceValue=true ("tick all" is the master's
+      // main job). Default starts all-ticked, so forceValue=false ("untick
+      // all" is its main job) — same mechanism, opposite starting polarity.
+      function wireMaster(masterObj,pick,forceValue){
         let saved=null;
         masterObj.cb.addEventListener('change',function(){
-          if(masterObj.cb.checked){
+          if(masterObj.cb.checked===forceValue){
             saved=rowRefs.map(function(r){ return pick(r).checked; });
-            rowRefs.forEach(function(r){ pick(r).checked=true; });
+            rowRefs.forEach(function(r){ pick(r).checked=forceValue; });
           } else {
-            rowRefs.forEach(function(r,i){ pick(r).checked=saved?saved[i]:false; });
+            rowRefs.forEach(function(r,i){ pick(r).checked=saved?saved[i]:!forceValue; });
             saved=null;
           }
+          // Setting .checked directly (above) doesn't fire each row's own
+          // 'change' listener, so the footer count would otherwise go stale
+          // the moment the master checkbox is used instead of a row.
+          updateCount();
         });
       }
-      wireMaster(hdrUpdate,function(r){ return r.updateCb; });
-      wireMaster(hdrWire,function(r){ return r.wireCb; });
+      wireMaster(hdrUpdate,function(r){ return r.updateCb; },false);
+      wireMaster(hdrWire,function(r){ return r.wireCb; },true);
 
       const footer=document.createElement('div');
       footer.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;gap:8px;align-items:center;';
@@ -5946,25 +6091,34 @@
       const exportBtn=document.createElement('button');
       exportBtn.textContent='Export';
       exportBtn.style.cssText='background:#4fa3ff;color:#0d0f14;border:none;border-radius:4px;padding:6px 18px;cursor:pointer;font-size:13px;font-weight:700;';
-      exportBtn.addEventListener('click',function(){
+      exportBtn.addEventListener('click',async function(){
         const updateSet=new Set(rowRefs.filter(function(r){ return r.updateCb.checked; }).map(function(r){ return r.ref.row.name; }));
         const wireRefs=rowRefs.filter(function(r){ return r.wireCb.checked; }).map(function(r){ return r.ref; });
         const nativeByName={};
         rowRefs.forEach(function(r){ nativeByName[r.ref.row.name]=r.ref.playheadNative; });
 
-        const dotIdx=entry.filename.lastIndexOf('.');
-        const base=dotIdx>0?entry.filename.slice(0,dotIdx):entry.filename;
-        const ext=dotIdx>0?entry.filename.slice(dotIdx):'.fs';
+        const defaultUpdates=rows.filter(function(row){ return updateSet.has(row.name)&&nativeByName[row.name]!=null; })
+          .map(function(row){ return {name:row.name, oldVal:row.defaultVal, newVal:nativeByName[row.name]}; });
 
-        if(updateSet.size){
-          const header=buildUpdatedHeader(entry,rows,nativeByName,updateSet);
-          downloadText(base+'.migrated'+ext,serializeIsf(entry,header),'text/plain');
+        if(!defaultUpdates.length&&!wireRefs.length){
+          flash('Nothing ticked — nothing to export.');
+          return;
         }
+
+        const notesText=buildMigrationNotesText(entry,defaultUpdates,wireRefs);
+        const header=buildUpdatedHeader(entry,rows,nativeByName,updateSet,notesText);
+        const newSource=serializeIsf(entry,header,notesText);
+
+        // Same "(MME)" file every time, updated in place — not a fresh
+        // "...migrated.fs" copy per export (see mmeIsfName).
+        const wroteInPlace=await writeIsfUpdateInPlace(entry.filename,newSource);
+        entry.source=newSource; // keep the retained source in sync for a second export later in the same session
+
         if(wireRefs.length){
-          downloadText(base+'-wiring-sheet.txt',buildWiringSheetText(entry,wireRefs),'text/plain');
+          downloadText(entry.filename.replace(/\.[^.]+$/,'')+'-wiring-sheet.txt',buildWiringSheetText(entry,wireRefs),'text/plain');
         }
         dlg.close(); dlg.remove();
-        flash('Exported'+(updateSet.size?' updated ISF':'')+(updateSet.size&&wireRefs.length?' +':'')+(wireRefs.length?' wiring sheet':'')+'.');
+        flash((wroteInPlace?'Updated ':'Downloaded ')+entry.filename+(wireRefs.length?' + wiring sheet':'')+'.');
       });
 
       footer.appendChild(countLbl);
