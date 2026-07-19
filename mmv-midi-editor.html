@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.13
+  MMV MIDI & CC Curve Editor v0.9.14
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -381,7 +381,32 @@
   drag-to-reorder handle moves back into row 1 (after Colour) now that it
   has room, which also restores the ability to drag-reorder a MINIMIZED lane
   without expanding it first.
+  v0.9.14 New CC/PB lanes default to a "New" tag when no tag filter is
+  active (an active filter's tags are still inherited as before, unchanged)
+  — freshly-added lanes are easy to find and re-tag later instead of
+  starting untagged. Each tag chip in the Show: bar (and the All chip) gets
+  a minimize/maximize toggle before its label, same ▾/▸ + .on visual
+  language as an individual CC lane's own toggle — a smart group click
+  minimizes every lane in that tag if any aren't already minimized, or
+  maximizes all of them if every lane already is; the chip's own lit state
+  now correctly tracks a lane being minimized/maximized by its own
+  individual toggle too, not just via the group action.
+  Fix: Note Info's minimize toggle used to only hide the literal "Note
+  Info" text — the row's real height never changed, so nothing actually
+  got more compact. It now genuinely shrinks #velRow down to the CC lane's
+  own minimized floor (30px) and restores whatever height it had before
+  (the 84px default, or a custom height previously dragged via the
+  velocity lane's own resize grip) on maximize — the velocity-bar data
+  keeps rendering throughout, just compressed, the same as an ordinary
+  grip-drag resize. The "Note Info" title text no longer disappears when
+  manually minimized; only the existing width-based rule and the
+  unrelated "nothing selected" auto-collapse can still hide it. Also fixed
+  a stale-state bug found during verification: an individual lane's own
+  minimize toggle didn't refresh the tag bar, so a tag chip's lit state
+  could go stale (e.g. staying lit after one lane in an all-minimized
+  group was manually maximized again).
 -->
+
 <style>
   * { box-sizing: border-box; }
   :root{
@@ -496,18 +521,24 @@
      hidden text still reserving its row. When hidden, it takes zero space:
      it's one flex child among the others in .ni-row, not a separate row. */
   @container (max-width: 190px){ .ni-title{display:none;} }
-  /* Manually minimized (or nothing selected — see autoCollapse in
-     updateNoteInfo()) always hides the title outright, regardless of width
-     — the whole point of minimizing is maximum compactness, so it shouldn't
-     wait on a width threshold that expanded mode uses. */
+  /* Nothing selected (autoCollapse in updateNoteInfo()) hides the title
+     outright, regardless of width — the whole point of that state is
+     maximum compactness, so it shouldn't wait on a width threshold that
+     expanded mode uses. This is driven purely by selection state via
+     .ni-collapsed. It is deliberately NOT tied to the manual minimize
+     toggle below (state.noteInfoManuallyCollapsed / .ni-min) — the manual
+     toggle only shrinks the row's height (see #velRow height JS, near the
+     #niToggleBtn click handler); the "Note Info" text itself stays put
+     either way, only ever disappearing at the width threshold above or
+     when there's genuinely no selection. */
   .note-info-left.ni-collapsed .ni-title{display:none;}
   /* Manual minimize/maximize toggle for the whole Note Info box — same
      .move-btn/.toggle-btn visual language as the CC lane row-1 toggle
      (▾ expanded / ▸ minimized, same .on convention), just scoped to
-     .note-info-left instead of .lane. This is independent of the existing
-     auto-collapse-on-no-selection behavior above (.ni-collapsed) — both
-     apply the same collapsed look, but this one is driven by a manual
-     state.noteInfoManuallyCollapsed flag instead of selection state. */
+     .note-info-left instead of .lane. Independent of the auto-collapse
+     above: it does NOT touch .ni-title (see comment above) — its whole
+     effect is on #velRow's real height, applied in JS next to the
+     #niToggleBtn click handler. */
   .note-info-left .move-btn{
     width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
     display:inline-flex;align-items:center;justify-content:center;
@@ -810,10 +841,21 @@
   .lane.lane-dimmed{opacity:.4;}
   .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
   .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
-  .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px 2px 10px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
+  .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
   .tag-chip:hover{border-color:#4fa3ff;}
   .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
   .tag-chip-label{background:none;border:none;color:inherit;font-size:11px;padding:0;cursor:pointer;}
+  /* Group minimize/maximize toggle — first element in the chip (before the
+     label), same .move-btn/.toggle-btn visual language + ▾/▸ glyphs + .on
+     convention as a CC lane's own row-1 toggle (see buildLaneDom) and Note
+     Info's #niToggleBtn, just scoped to .tag-chip instead of .lane/
+     .note-info-left. */
+  .tag-chip .toggle-btn{width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
+    display:inline-flex;align-items:center;justify-content:center;
+    border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
+    padding:0;line-height:1;flex-shrink:0;font-size:10px;cursor:pointer;}
+  .tag-chip .toggle-btn:hover{border-color:var(--line);background:var(--panel2);color:var(--accent);}
+  .tag-chip .toggle-btn.on{color:var(--accent2);border-color:rgba(79,209,255,.4);}
   /* >=16px hit target — same bump as the per-lane M/S/hide/delete icons below. */
   .tag-mini-btn{touch-action:manipulation;user-select:none;-webkit-user-select:none;
     font-size:9px;font-weight:700;line-height:1;min-width:16px;min-height:16px;padding:2px 5px;
@@ -2219,18 +2261,23 @@
     // Note Info is now a single row at ALL times (true one-row minimized
     // view, v0.9.13) — minimized, expanded-with-nothing-selected, and
     // expanded-with-a-selection all render the exact same row structure,
-    // just with "—" placeholders when nothing is selected (set above). The
-    // only thing .ni-collapsed still changes is whether the "Note Info"
-    // title shows (see the CSS) — there is no more separate collapsed-only
-    // placeholder element/DOM branch to swap in.
-    // state.noteInfoManuallyCollapsed (set by the ▾/▸ toggle button) is a
-    // SEPARATE, manual override: when on, it forces the collapsed look
-    // regardless of selection (the user wants the title's little bit of
-    // space back even while something IS selected); when off, this auto
-    // behavior alone decides collapse state, unchanged from before.
+    // just with "—" placeholders when nothing is selected (set above).
+    // .ni-collapsed hides the "Note Info" title text and is driven purely
+    // by selection state (autoCollapse below) — see the CSS comment by
+    // .note-info-left.ni-collapsed .ni-title. state.noteInfoManuallyCollapsed
+    // (set by the ▾/▸ toggle button) is a SEPARATE concern entirely: it
+    // shrinks #velRow's real height (applied where the button is wired, near
+    // #niToggleBtn) rather than hiding the title — minimizing keeps the
+    // data readable, just compressed, matching how a minimized CC lane still
+    // shows its row 1 rather than disappearing. .ni-min reflects that flag
+    // on the element for anything that wants to key off it, but no CSS rule
+    // currently hides content because of it.
     const nil=$('noteInfoLeft');
     const autoCollapse=sel.length===0 && (typeof ccSel==='undefined'||ccSel.size===0);
-    if(nil) nil.classList.toggle('ni-collapsed', state.noteInfoManuallyCollapsed || autoCollapse);
+    if(nil){
+      nil.classList.toggle('ni-collapsed', autoCollapse);
+      nil.classList.toggle('ni-min', !!state.noteInfoManuallyCollapsed);
+    }
   }
   // keep old name as alias so velocity drag calls still work
   const updateVelValInput=updateNoteInfo;
@@ -2543,6 +2590,26 @@
     lanes.forEach(l=>{ field==='muted'?setLaneMuted(l,true):setLaneSoloed(l,true); });
     refreshMuteSoloUI();
   }
+  // Bulk minimize/maximize for a group of lanes (a #tag, or every lane for
+  // ALL) — same smart-toggle convention as groupSmartToggle above: if every
+  // lane in scope is already minimized, maximize them all; otherwise
+  // minimize them all. Mirrors what each lane's own toggleLaneMin() (in
+  // buildLaneDom) does per-lane, via the lane._row/_updateToggleBtn refs
+  // exposed there for exactly this kind of external group-level access
+  // (same pattern as lane._muteBtn/_soloBtn for groupSmartToggle). Not
+  // pushed onto the undo stack — the individual per-lane minimize toggle
+  // isn't undoable either, so this stays consistent with that.
+  function groupMinToggle(lanes){
+    if(!lanes.length) return;
+    const target=!lanes.every(l=>l.visible===false); // true = minimize all
+    lanes.forEach(l=>{
+      l.visible=target?false:true;
+      if(l._row) l._row.classList.toggle('lane-hidden',l.visible===false);
+      if(l._updateToggleBtn) l._updateToggleBtn();
+    });
+    resizeCanvases();
+    refreshTagBar();
+  }
   // Attaches a short click (smart toggle) and a press-and-hold (>500ms,
   // force-on) gesture to a tag/ALL group's M or S button. Uses pointer
   // events rather than mouse events so the hold works from a touchscreen
@@ -2573,12 +2640,26 @@
     if(all.size===0){ bar.style.display='none'; applyTagFilter(); return; }
     bar.style.display='flex';
     const lbl=document.createElement('span'); lbl.className='tag-bar-lbl'; lbl.textContent='Show:'; bar.appendChild(lbl);
-    // Each chip is a small pill: a label button (the existing show/hide
-    // filter toggle) plus M/S mini-buttons that bulk mute/solo every lane
-    // in that group (a #tag, or every lane for "All") — lit when every
-    // lane in the group currently shares that state.
+    // Each chip is a small pill: a minimize/maximize mini-toggle (same
+    // ▾/▸ + .on visual language as a CC lane's own row-1 toggle-btn),
+    // then the label button (the existing show/hide filter toggle), then
+    // M/S mini-buttons that bulk mute/solo every lane in that group (a
+    // #tag, or every lane for "All") — all three lit when every lane in
+    // the group currently shares that state.
     function chip(label,on,fn,title,lanesForGroup,tagName){
       const wrap=document.createElement('span'); wrap.className='tag-chip'+(on?' on':'');
+      const allMin=lanesForGroup.length>0&&lanesForGroup.every(l=>l.visible===false);
+      // Reuses the exact .move-btn/.toggle-btn classes + ▾/▸ glyphs + .on
+      // convention the individual CC lane toggle uses (see buildLaneDom) —
+      // just a smart group-toggle instead of a single lane's own state.
+      // No long-press-force variant here (unlike M/S): visible is a plain
+      // bool with no per-lane "override" concept a force action would need
+      // to fight through, so a single smart click covers every case.
+      const minBtn=document.createElement('button'); minBtn.className='move-btn toggle-btn'+(allMin?' on':'');
+      minBtn.type='button'; minBtn.textContent=allMin?'▸':'▾';
+      minBtn.title='Minimize/maximize every lane in this group';
+      minBtn.addEventListener('click',e=>{ e.stopPropagation(); groupMinToggle(lanesForGroup); });
+      wrap.appendChild(minBtn);
       const b=document.createElement('button'); b.className='tag-chip-label'; b.textContent=label;
       if(title) b.title=title; b.addEventListener('click',fn); wrap.appendChild(b);
       // Right-click to rename — only real tags have one (not the "All" chip).
@@ -2608,8 +2689,13 @@
   function addPbLane(ch){ return _addLane('pb', null, ch); }
   function _addLane(type, cc, ch){ const id=state.nextId++; const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
     const ctr=0;
+    // New lanes inherit whatever tag(s) are currently active as a filter
+    // (so e.g. filtering to "kaleido" then adding a lane keeps it visible
+    // in that filtered view). When there's no active filter — the common
+    // case — default the lane to a "New" tag instead of leaving it
+    // untagged, so freshly-added lanes are easy to find/group later.
     const lane={id,type,cc:cc??(state.ccLanes.length?state.ccLanes[state.ccLanes.length-1].cc+1:1),ch:ch??0,color,name:'',visible:true,
-      tags:[...tagFilter],steps:0,muted:false,soloed:false,points:[{t:0,v:ctr}],_preview:null};
+      tags:tagFilter.size?[...tagFilter]:['New'],steps:0,muted:false,soloed:false,points:[{t:0,v:ctr}],_preview:null};
     state.ccLanes.push(lane); buildLaneDom(lane); setActiveLane(id); resizeCanvases(); refreshTagBar(); return lane; }
   // ---------- Channel picker popover (one shared instance for every lane's
   // Channel button — the lane list can be long, so this is appended once
@@ -2864,9 +2950,15 @@
     function toggleLaneMin(){
       lane.visible=lane.visible===false?true:false;
       row.classList.toggle('lane-hidden',lane.visible===false);
-      updateToggleBtn(); resizeCanvases();
+      updateToggleBtn(); resizeCanvases(); refreshTagBar();
     }
     toggleBtn.addEventListener('click',toggleLaneMin);
+    // Exposed the same way _muteBtn/_soloBtn are, so a tag/ALL group-level
+    // minimize toggle (see groupMinToggle, near refreshTagBar) can flip
+    // lane.visible + the row's .lane-hidden class + this button's own
+    // icon/.on state from outside this closure, without duplicating the
+    // update logic here.
+    lane._toggleBtn=toggleBtn; lane._updateToggleBtn=updateToggleBtn;
 
     // Name
     lname.addEventListener('input',ev=>{ lane.name=ev.target.value; });
@@ -5517,14 +5609,55 @@
     // the CC lane toggle, independent of the existing auto-collapse (see
     // updateNoteInfo()); a UI-only in-memory preference, not persisted.
     (()=>{
-      const btn=$('niToggleBtn');
+      const btn=$('niToggleBtn'), velRow=$('velRow');
+      // Matches the CC lane's own minimized floor exactly (.lane.lane-hidden
+      // {min-height:30px!important} — see the LANE_MIN_H/LANE_FULL_H comment
+      // near attachGrip above), so Note Info minimizes to the same visual
+      // height a minimized CC lane does.
+      const NI_MIN_VEL_H=30;
+      // Remembers whatever real height #velRow had right before minimizing
+      // (the 84px CSS default, or a height the user previously dragged to
+      // via #gripVel) so maximizing restores exactly THAT, not always the
+      // 84px default.
+      let prevVelH=null;
       function refresh(){
         const min=!!state.noteInfoManuallyCollapsed;
         btn.textContent=min?'▸':'▾';
         btn.title=min?'Maximize Note Info':'Minimize Note Info';
         btn.classList.toggle('on',min);
       }
-      btn.addEventListener('click',e=>{ e.stopPropagation(); state.noteInfoManuallyCollapsed=!state.noteInfoManuallyCollapsed; refresh(); updateNoteInfo(); });
+      btn.addEventListener('click',e=>{
+        e.stopPropagation();
+        state.noteInfoManuallyCollapsed=!state.noteInfoManuallyCollapsed;
+        // The bug this fixes: minimizing used to only hide the literal
+        // "Note Info" text (.ni-collapsed) — the row's real height never
+        // changed, so nothing actually got more compact. Now the toggle
+        // resizes #velRow itself, the same row/element the #gripVel manual
+        // drag already resizes (see attachGrip/resizeRowBy above), down to
+        // the CC lane's own minimized floor — and back to its prior height
+        // on maximize. Deliberately does NOT hide #velCanvas the way a
+        // minimized CC lane hides its own canvas: the velocity bars must
+        // keep rendering, just compressed, exactly like they already do
+        // whenever the row is manually dragged short via the grip.
+        if(velRow){
+          if(state.noteInfoManuallyCollapsed){
+            prevVelH=velRow.offsetHeight;
+            velRow.style.height=NI_MIN_VEL_H+'px'; velRow.style.flex='0 0 auto';
+          } else {
+            velRow.style.height=(prevVelH!=null?prevVelH:84)+'px'; velRow.style.flex='0 0 auto';
+            prevVelH=null;
+          }
+          // Same canvas-resize + redraw path a manual #gripVel drag already
+          // runs after changing the row's height (resizeRowBy calls this
+          // indirectly via cv.width/height + requestDraw; resizeCanvases()
+          // here covers every canvas including #velCanvas from its
+          // container's current, now-changed, clientWidth/clientHeight) —
+          // no separate hide-the-canvas path, since the point is
+          // compression, not hiding.
+          resizeCanvases();
+        }
+        refresh(); updateNoteInfo();
+      });
       refresh();
     })();
     // ── Advanced Generate panel ──

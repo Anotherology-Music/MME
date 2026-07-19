@@ -2198,9 +2198,61 @@ async function run() {
   // ---------------- Lane tags / filter bar ----------------
 
   await withPage(browser, async (page) => {
-    await page.evaluate(() => window._TEST_addLane(20, 0));
-    const display = await page.evaluate(() => document.getElementById('tagFilterBar').style.display);
-    check('tag filter bar stays hidden until a lane has a tag', display === 'none', display);
+    // withPage's own baseline lane is added with no active filter, so it
+    // already carries the default "New" tag (see _addLane / item 1 below) —
+    // the tag bar is therefore visible from the very start here, not
+    // hidden. Confirm that, then prove the bar's visibility still genuinely
+    // tracks "does any lane have any tag" (not just hardcoded on) by
+    // clearing that lane's only tag and checking the bar hides again.
+    const barState = await page.evaluate(() => ({
+      display: document.getElementById('tagFilterBar').style.display,
+      chipTexts: [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].map(b => b.textContent),
+    }));
+    check('a freshly added lane (no active filter) defaults to a "New" tag, so the tag bar shows immediately',
+      barState.display === 'flex' && barState.chipTexts.some(t => t.startsWith('New')), barState);
+
+    const firstId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.click(`.lane[data-id="${firstId}"] .tag-pill`);
+    await page.fill(`.lane[data-id="${firstId}"] input.ltags`, '');
+    await page.dispatchEvent(`.lane[data-id="${firstId}"] input.ltags`, 'change');
+    await page.waitForTimeout(50);
+    const displayAfterClear = await page.evaluate(() => document.getElementById('tagFilterBar').style.display);
+    check('clearing the only lane\'s tag hides the tag bar again (visibility still tracks "any lane has any tag", not hardcoded on)',
+      displayAfterClear === 'none', displayAfterClear);
+  });
+
+  // ---------------- Item 1: new lanes default to tag "New" ----------------
+
+  await withPage(browser, async (page) => {
+    // No active filter (the common case) -> defaults to tags:['New'].
+    const id = await page.evaluate(() => window._TEST_addLane(30, 0));
+    const tags = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, id);
+    check('a new lane added with no active tag filter defaults to tags:["New"]',
+      JSON.stringify(tags) === JSON.stringify(['New']), tags);
+  });
+
+  await withPage(browser, async (page) => {
+    // When a tag filter IS active, a newly added lane must inherit ONLY the
+    // active filter's tag(s), unchanged from the existing behavior — "New"
+    // must NOT also be tacked on top of that (that would just be clutter on
+    // an already-organized lane). Also covered incidentally by the older
+    // "lane created while a filter is active inherits the selected filter
+    // tags" test further down; this one isolates it against the new "New"
+    // default specifically.
+    const idA = await page.evaluate(() => window._TEST_addLane(31, 0));
+    await page.click(`.lane[data-id="${idA}"] .tag-pill`);
+    await page.fill(`.lane[data-id="${idA}"] input.ltags`, 'kaleido');
+    await page.dispatchEvent(`.lane[data-id="${idA}"] input.ltags`, 'change');
+    await page.waitForTimeout(50);
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(b => b.textContent.startsWith('kaleido'));
+      chip.click();
+    });
+    await page.waitForTimeout(50);
+    const idB = await page.evaluate(() => window._TEST_addLane(32, 0));
+    const tagsB = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).tags, idB);
+    check('a lane added while a tag filter is active inherits ONLY the filter\'s tag(s), not "New" on top',
+      JSON.stringify(tagsB) === JSON.stringify(['kaleido']), tagsB);
   });
 
   await withPage(browser, async (page) => {
@@ -3105,7 +3157,7 @@ async function run() {
 
     // ALL button reaches every lane, including untagged ones
     const allSoloBtn = async () => {
-      const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.trim().startsWith('All')));
+      const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.querySelector('.tag-chip-label').textContent.trim() === 'All'));
       return chip.asElement().$('.solo-btn');
     };
     await (await allSoloBtn()).click();
@@ -3555,6 +3607,103 @@ async function run() {
       Array.isArray(tapped) && tapped.every(m => m === false), tapped);
   });
 
+  // ---------------- Item 2: tag-group minimize toggle ----------------
+
+  await withPage(browser, async (page) => {
+    // A min/max mini-toggle on each tag chip (and "All"), mirroring the
+    // existing M/S mini-buttons' smart-toggle convention: if every lane in
+    // the group is already minimized, maximize them all; otherwise minimize
+    // them all. Verify the REAL functional effect (lane.visible + the
+    // .lane-hidden class on each row), not just the button's own look, and
+    // that a lane outside the group is untouched.
+    const ids = await page.evaluate(() => ({
+      a: window._TEST_addLane(70, 0), b: window._TEST_addLane(71, 0), c: window._TEST_addLane(72, 0),
+    }));
+    await page.evaluate((ids) => {
+      [ids.a, ids.b].forEach(id => {
+        const inp = document.querySelector(`.lane[data-id="${id}"] input.ltags`);
+        inp.value = 'minGrp'; inp.dispatchEvent(new Event('change'));
+      });
+    }, ids);
+    await page.waitForTimeout(80);
+
+    async function laneState(id) {
+      return page.evaluate((id) => ({
+        visible: window._TEST_state.ccLanes.find(l => l.id === id).visible,
+        hiddenClass: document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'),
+      }), id);
+    }
+    async function minGrpToggleBtn() {
+      const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.includes('minGrp')));
+      return chip.asElement().$('.toggle-btn');
+    }
+    async function minGrpChipOn() {
+      return page.evaluate(() => {
+        const chip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.textContent.includes('minGrp'));
+        return chip.querySelector('.toggle-btn').classList.contains('on');
+      });
+    }
+
+    const beforeOn = await minGrpChipOn();
+    check('the group minimize toggle is NOT lit before anything in the group is minimized', beforeOn === false, beforeOn);
+
+    await (await minGrpToggleBtn()).click();
+    await page.waitForTimeout(50);
+    const [aAfter1, bAfter1, cAfter1, chipOn1] = await Promise.all([laneState(ids.a), laneState(ids.b), laneState(ids.c), minGrpChipOn()]);
+    check('the tag-group minimize toggle minimizes every lane in the group (lane.visible=false AND .lane-hidden set)',
+      aAfter1.visible === false && aAfter1.hiddenClass === true && bAfter1.visible === false && bAfter1.hiddenClass === true,
+      { aAfter1, bAfter1 });
+    check('a lane NOT tagged into the group is untouched by the group minimize toggle',
+      cAfter1.visible !== false && cAfter1.hiddenClass === false, cAfter1);
+    check('the chip\'s own minimize toggle lights up (.on) once every lane in the group is minimized',
+      chipOn1 === true, chipOn1);
+
+    // Mixed state: maximize just A by hand -> group is now mixed (A up, B
+    // still minimized) -> the chip must NOT show "on" for a mixed group,
+    // and clicking it again must be a smart toggle (minimize everyone),
+    // not a naive "flip from last-known state".
+    await page.click(`.lane[data-id="${ids.a}"] .toggle-btn`);
+    await page.waitForTimeout(50);
+    const chipOnMixed = await minGrpChipOn();
+    check('the chip\'s minimize toggle is NOT lit while the group is in a mixed state (one up, one still minimized)',
+      chipOnMixed === false, chipOnMixed);
+
+    await (await minGrpToggleBtn()).click();
+    await page.waitForTimeout(50);
+    const [aAfter2, bAfter2] = await Promise.all([laneState(ids.a), laneState(ids.b)]);
+    check('clicking the group toggle on a MIXED group minimizes everyone (smart toggle: not-all-minimized -> minimize all)',
+      aAfter2.visible === false && aAfter2.hiddenClass === true && bAfter2.visible === false && bAfter2.hiddenClass === true,
+      { aAfter2, bAfter2 });
+
+    // Now every lane in the group is minimized again -> clicking once more
+    // (all already minimized) must maximize the whole group back.
+    await (await minGrpToggleBtn()).click();
+    await page.waitForTimeout(50);
+    const [aAfter3, bAfter3, chipOn3] = await Promise.all([laneState(ids.a), laneState(ids.b), minGrpChipOn()]);
+    check('clicking the group toggle again (all already minimized) maximizes the whole group back',
+      aAfter3.visible !== false && aAfter3.hiddenClass === false && bAfter3.visible !== false && bAfter3.hiddenClass === false,
+      { aAfter3, bAfter3 });
+    check('the chip\'s minimize toggle un-lights once the whole group is maximized again', chipOn3 === false, chipOn3);
+  });
+
+  await withPage(browser, async (page) => {
+    // The "All" chip gets the same min/max toggle as every tag chip, same
+    // as it already has M/S — reaches every lane, tagged or not.
+    const ids = await page.evaluate(() => [window._TEST_addLane(73, 0), window._TEST_addLane(74, 0)]);
+    async function allToggleBtn() {
+      const chip = await page.evaluateHandle(() => [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.querySelector('.tag-chip-label').textContent.trim() === 'All'));
+      return chip.asElement().$('.toggle-btn');
+    }
+    await (await allToggleBtn()).click();
+    await page.waitForTimeout(50);
+    const states = await page.evaluate((ids) => ids.map(id => ({
+      visible: window._TEST_state.ccLanes.find(l => l.id === id).visible,
+      hiddenClass: document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-hidden'),
+    })), ids);
+    check('the ALL chip\'s minimize toggle reaches every lane, tagged or not',
+      states.every(s => s.visible === false && s.hiddenClass === true), states);
+  });
+
   // ---------------- Note Info: true one-row layout (v0.9.13) ----------------
 
   await withPage(browser, async (page) => {
@@ -3730,11 +3879,13 @@ async function run() {
 
   await withPage(browser, async (page) => {
     // Manual minimize/maximize toggle (#niToggleBtn) — independent of the
-    // existing auto-collapse-on-no-selection behavior, but now that Note
-    // Info is a single row at all times, the only thing collapsing actually
-    // changes is the "Note Info" title's visibility (forced hidden
-    // regardless of width) — the note/vel/pos/ch fields keep showing their
-    // real values throughout.
+    // existing auto-collapse-on-no-selection behavior (.ni-collapsed, driven
+    // purely by selection state). Bug fix: the manual toggle used to ALSO
+    // force .ni-collapsed (hiding the literal "Note Info" title) even while
+    // a note was selected — that's gone. The manual toggle no longer touches
+    // the title at all; its only effect now is on #velRow's real height
+    // (covered by the dedicated tests below). The note/vel/pos/ch fields
+    // keep showing their real values throughout, unchanged.
     const noSel = await page.evaluate(() => ({
       collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
@@ -3753,32 +3904,39 @@ async function run() {
     check('selecting a note auto-expands Note Info (manual toggle still off, unchanged legacy behavior)',
       withSel === false, withSel);
 
-    // Manually collapse WHILE a note is selected — the whole point of this
-    // toggle: force the title away even with something selected.
+    // Manually minimize WHILE a note is selected — this must NOT force
+    // .ni-collapsed or hide the title anymore; it only sets the manual flag
+    // (state.noteInfoManuallyCollapsed / .ni-min) and shrinks #velRow (see
+    // the dedicated height tests below).
     await page.click('#niToggleBtn');
     const manualWithSel = await page.evaluate(() => ({
       collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
+      niMinClass: document.getElementById('noteInfoLeft').classList.contains('ni-min'),
       selSize: window._TEST_state.selection.size,
       glyph: document.getElementById('niToggleBtn').textContent,
       titleHidden: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display === 'none',
       noteText: document.getElementById('noteInfoNote').textContent,
     }));
-    check('the manual toggle force-collapses Note Info (hides the title) even while a note IS selected',
-      manualWithSel.collapsed === true && manualWithSel.manual === true && manualWithSel.selSize === 1
-      && manualWithSel.glyph === '▸' && manualWithSel.titleHidden === true, manualWithSel);
-    check('manually collapsing does NOT blank the still-selected note\'s own info — only the title hides',
+    check('the manual toggle sets the manual-minimized flag/glyph/.ni-min while a note IS selected, but does NOT set .ni-collapsed',
+      manualWithSel.collapsed === false && manualWithSel.manual === true && manualWithSel.niMinClass === true
+      && manualWithSel.selSize === 1 && manualWithSel.glyph === '▸', manualWithSel);
+    check('manually minimizing no longer hides the "Note Info" title text at all (only the width-based rule can do that)',
+      manualWithSel.titleHidden === false, manualWithSel);
+    check('manually minimizing does NOT blank the still-selected note\'s own info',
       manualWithSel.noteText !== '—' && manualWithSel.noteText.length > 0, manualWithSel.noteText);
 
-    // Toggling back off defers to auto-collapse again (still selected -> expanded, title shows).
+    // Toggling back off — still selected, so .ni-collapsed was never
+    // involved and stays false throughout; the manual flag/.ni-min clear.
     await page.click('#niToggleBtn');
     const backToAuto = await page.evaluate(() => ({
       collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
+      niMinClass: document.getElementById('noteInfoLeft').classList.contains('ni-min'),
       titleShown: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display !== 'none',
     }));
-    check('un-toggling the manual override hands control back to auto-collapse (expanded, title shows again)',
-      backToAuto.collapsed === false && backToAuto.manual === false && backToAuto.titleShown === true, backToAuto);
+    check('un-toggling the manual override clears the manual flag/.ni-min (still expanded, title still shows)',
+      backToAuto.collapsed === false && backToAuto.manual === false && backToAuto.niMinClass === false && backToAuto.titleShown === true, backToAuto);
 
     // Clearing the selection while the manual toggle is off returns to
     // auto-collapsed — proving the manual flag didn't get stuck "on" and
@@ -3786,6 +3944,88 @@ async function run() {
     await page.evaluate(() => { window._TEST_state.selection.clear(); window._TEST_updateNoteInfo(); });
     const clearedSel = await page.evaluate(() => document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'));
     check('clearing the selection with the manual toggle off re-collapses via auto-collapse alone', clearedSel === true, clearedSel);
+  });
+
+  // ---------------- Item 3: Note Info minimize actually shrinks #velRow ----------------
+
+  await withPage(browser, async (page) => {
+    // The bug this fixes: the Note Info min/max toggle used to only hide
+    // the literal "Note Info" text — the row's real height never changed,
+    // so nothing was actually more compact. Now it must resize #velRow down
+    // to the CC lane's own minimized floor (30px, matching
+    // .lane.lane-hidden{min-height:30px}) and restore whatever height it
+    // had before on maximize, all WITHOUT hiding #velCanvas — it must keep
+    // rendering at the compressed height, same as an ordinary #gripVel drag.
+    // A note must be selected here — with nothing selected, the title
+    // legitimately hides via the separate, unrelated "nothing selected"
+    // auto-collapse rule, which would make the title-stays-visible check
+    // below pass for the wrong reason (or fail here for a reason that has
+    // nothing to do with the manual-minimize behavior under test).
+    await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 67, start: 0, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      window._TEST_updateNoteInfo();
+    });
+    const initialH = await page.evaluate(() => document.getElementById('velRow').getBoundingClientRect().height);
+    check('#velRow starts at its 84px CSS default height', Math.round(initialH) === 84, initialH);
+
+    await page.click('#niToggleBtn');
+    await page.waitForTimeout(80);
+    const afterMin = await page.evaluate(() => {
+      const row = document.getElementById('velRow');
+      const cv = document.getElementById('velCanvas');
+      return {
+        rowH: row.getBoundingClientRect().height,
+        cvDisplay: getComputedStyle(cv).display,
+        cvW: cv.width, cvH: cv.height,
+        titleDisplay: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display,
+      };
+    });
+    check('minimizing Note Info shrinks #velRow\'s REAL (measured) height down to the ~30px CC-lane-minimized floor',
+      Math.round(afterMin.rowH) === 30, afterMin.rowH);
+    check('the velocity canvas is NOT hidden while Note Info is minimized, and is resized (not just clipped) to the compressed row',
+      afterMin.cvDisplay !== 'none' && afterMin.cvW > 0 && afterMin.cvH > 0 && afterMin.cvH < 60, afterMin);
+    check('the "Note Info" title text stays visible while manually minimized (compression, not hiding)',
+      afterMin.titleDisplay !== 'none', afterMin);
+
+    await page.click('#niToggleBtn');
+    await page.waitForTimeout(80);
+    const afterMax = await page.evaluate(() => {
+      const row = document.getElementById('velRow');
+      const cv = document.getElementById('velCanvas');
+      return { rowH: row.getBoundingClientRect().height, cvDisplay: getComputedStyle(cv).display, cvH: cv.height };
+    });
+    check('maximizing restores #velRow to its previous (84px default) height', Math.round(afterMax.rowH) === 84, afterMax.rowH);
+    check('the velocity canvas is still visible and resized back up after maximizing',
+      afterMax.cvDisplay !== 'none' && afterMax.cvH > 60, afterMax);
+  });
+
+  await withPage(browser, async (page) => {
+    // If the user had previously dragged #velRow to a custom height via
+    // #gripVel, minimizing then maximizing Note Info must restore that
+    // exact custom height, not silently reset to the 84px CSS default.
+    const grip = await page.$('#gripVel');
+    const box = await grip.boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2, box.y + 60, { steps: 5 }); // drag down -> grows the row (dir:'down' in attachGrip)
+    await page.mouse.up();
+    await page.waitForTimeout(80);
+    const draggedH = await page.evaluate(() => document.getElementById('velRow').getBoundingClientRect().height);
+    check('dragging #gripVel resizes #velRow to a custom (non-default) height', draggedH > 100, draggedH);
+
+    await page.click('#niToggleBtn');
+    await page.waitForTimeout(80);
+    const minH = await page.evaluate(() => document.getElementById('velRow').getBoundingClientRect().height);
+    check('minimizing after a manual drag still shrinks to the ~30px floor', Math.round(minH) === 30, minH);
+
+    await page.click('#niToggleBtn');
+    await page.waitForTimeout(80);
+    const restoredH = await page.evaluate(() => document.getElementById('velRow').getBoundingClientRect().height);
+    check('maximizing restores the CUSTOM dragged height (not the 84px default)',
+      Math.abs(restoredH - draggedH) <= 2, { draggedH, restoredH });
   });
 
   // ---------------- Piano roll: lower resize floor ----------------
