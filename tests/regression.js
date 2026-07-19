@@ -96,8 +96,19 @@ function buildTestHtml() {
     ].join('\n')
   );
   html = html.replace(
-    'function showISFDialog(header, filename){',
-    'window._TEST_showISFDialog=(h,f)=>showISFDialog(h,f);\n    function showISFDialog(header, filename){'
+    'function showISFDialog(header, filename, sourceText){',
+    'window._TEST_showISFDialog=(h,f,s)=>showISFDialog(h,f,s);\n    function showISFDialog(header, filename, sourceText){'
+  );
+  html = html.replace(
+    'function openMigrateSheet(entry){',
+    [
+      'window._TEST_openMigratePicker=()=>openMigratePicker();',
+      '    window._TEST_openMigrateSheet=(entry)=>openMigrateSheet(entry);',
+      '    window._TEST_isLaneAutomated=(id)=>isLaneAutomated(state.ccLanes.find(l=>l.id===id));',
+      '    window._TEST_computeModifiers=(row)=>computeModifiers(row);',
+      '    window._TEST_ccToNative=(row,cc)=>ccToNative(row,cc);',
+      '    function openMigrateSheet(entry){',
+    ].join('\n')
   );
   return html;
 }
@@ -116,7 +127,7 @@ async function withPage(browser, fn) {
   // minimum size and silently overflow its scroll container's clipped box
   // — a real, but purely viewport-driven, layout edge case unrelated to
   // whatever a given test is actually exercising.
-  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
   page.on('pageerror', e => console.log('  [page error]', e.message));
   await page.goto(URL);
   await page.waitForTimeout(250);
@@ -157,7 +168,7 @@ async function run() {
     // baseline lane as scaffolding for the rest of this suite) must start
     // with zero CC lanes — the old always-add-a-default-CC1-lane startup
     // behavior was removed in v0.9.10.
-    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
     await page.goto(URL);
     await page.waitForTimeout(250);
     const laneCount = await page.evaluate(() => window._TEST_state.ccLanes.length);
@@ -2100,6 +2111,181 @@ async function run() {
     const ccVals = Object.values(parsed.ccMap || {}).flatMap(l => l.points.map(p => p.v));
     check('exported MIDI CC values are plain 0-127 integers regardless of Steps (no proprietary encoding)',
       ccVals.length > 0 && ccVals.every(v => Number.isInteger(v) && v >= 0 && v <= 127), ccVals.slice(0, 5));
+  });
+
+  // ---------------- Migrate to MMV: automation classifier + modifier math ----------------
+
+  await withPage(browser, async (page) => {
+    // isLaneAutomated must classify by whether the sampled value ever
+    // changes, not by where the points sit on the timeline — a lane with
+    // two points at different ticks but the same value should still read as
+    // static (this is the exact refinement over a position-based heuristic
+    // discussed in the strategy notes).
+    const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
+    await page.evaluate((id) => window._TEST_upsertPoint(id, 0, 50), laneId);
+    let auto = await page.evaluate((id) => window._TEST_isLaneAutomated(id), laneId);
+    check('isLaneAutomated: a single point is always static', auto === false, auto);
+
+    await page.evaluate((id) => window._TEST_upsertPoint(id, 5000, 50), laneId);
+    auto = await page.evaluate((id) => window._TEST_isLaneAutomated(id), laneId);
+    check('isLaneAutomated: two points, same value, second one far from bar 1 -> still static (value-based, not position-based)', auto === false, auto);
+
+    await page.evaluate((id) => window._TEST_upsertPoint(id, 5000, 100), laneId);
+    auto = await page.evaluate((id) => window._TEST_isLaneAutomated(id), laneId);
+    check('isLaneAutomated: value actually changes across the timeline -> automated', auto === true, auto);
+  });
+
+  await withPage(browser, async (page) => {
+    // computeModifiers: Scale=MAX-MIN / Offset=MIN for every type, Step only
+    // for discrete long/bool with even native spacing, and an explicit
+    // warning (never a silently wrong guess) for an irregular VALUES array.
+    const cutTypeRow = { name: 'CutType', type: 'long', min: 0, max: 7, steps: 8, values: null };
+    const girdleRow = { name: 'GirdleRadius', type: 'float', min: 0.1, max: 10 };
+    const weirdRow = { name: 'Weird', type: 'long', min: 0, max: 9, values: [0, 1, 2, 5, 9], steps: 5 };
+    const boolRow = { name: 'Enabled', type: 'bool', min: 0, max: 1 };
+    const modsCut = await page.evaluate((r) => window._TEST_computeModifiers(r), cutTypeRow);
+    const modsGirdle = await page.evaluate((r) => window._TEST_computeModifiers(r), girdleRow);
+    const modsWeird = await page.evaluate((r) => window._TEST_computeModifiers(r), weirdRow);
+    const modsBool = await page.evaluate((r) => window._TEST_computeModifiers(r), boolRow);
+    check('computeModifiers: integer long range -> Scale=MAX-MIN, Offset=MIN, Step=1 (matches the CutType example from the strategy notes)',
+      modsCut.scale === 7 && modsCut.offset === 0 && modsCut.step === 1, modsCut);
+    check('computeModifiers: continuous float -> Scale=MAX-MIN, Offset=MIN, Step not applicable',
+      Math.abs(modsGirdle.scale - 9.9) < 1e-9 && Math.abs(modsGirdle.offset - 0.1) < 1e-9 && modsGirdle.step === null, modsGirdle);
+    check('computeModifiers: bool -> Step=1', modsBool.step === 1, modsBool);
+    check('computeModifiers: irregular VALUES spacing flags a warning instead of guessing a Step',
+      modsWeird.step === null && !!modsWeird.warning, modsWeird);
+
+    const native0 = await page.evaluate((r) => window._TEST_ccToNative(r, 0), girdleRow);
+    const native127 = await page.evaluate((r) => window._TEST_ccToNative(r, 127), girdleRow);
+    check('ccToNative maps CC 0 -> MIN and CC 127 -> MAX', Math.abs(native0 - 0.1) < 1e-9 && Math.abs(native127 - 10) < 1e-9, { native0, native127 });
+  });
+
+  await withPage(browser, async (page) => {
+    // Full migrate-sheet flow: import an ISF (including a color, which
+    // splits into 4 lanes), automate one parameter, open the sheet, and
+    // check the table reflects automation state correctly before exporting.
+    const migHeader = {
+      INPUTS: [
+        { NAME: 'CutType', TYPE: 'long', MIN: 0, MAX: 7, DEFAULT: 1 },
+        { NAME: 'GirdleRadius', TYPE: 'float', MIN: 0.1, MAX: 10, DEFAULT: 3.0 },
+        { NAME: 'TintColor', TYPE: 'color', DEFAULT: [0.2, 0.4, 0.6, 1] },
+      ],
+    };
+    const migSource = '/*\n' + JSON.stringify(migHeader, null, 2) + '\n*/\nvoid main(){ gl_FragColor = vec4(1.0); }\n';
+
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'gem.fs', s), { h: migHeader, s: migSource });
+    await page.waitForTimeout(150);
+    await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+
+    const linked = await page.evaluate(() => window._TEST_state.ccLanes.filter(l => l.isf).map(l => ({ name: l.isf.name, min: l.isf.min, max: l.isf.max, type: l.isf.type, batchId: l.isf.batchId })));
+    const cutLinked = linked.find(l => l.name === 'CutType');
+    check('ISF import links each lane to its source param via lane.isf (name/min/max/type)',
+      cutLinked && cutLinked.min === 0 && cutLinked.max === 7 && cutLinked.type === 'long', cutLinked);
+    check('ISF import creates 4 linked lanes for a color input (R/G/B/A)', linked.filter(l => l.name.startsWith('TintColor.')).length === 4, linked.map(l => l.name));
+
+    const entry = await page.evaluate(() => { const h = window._TEST_state.isfHistory; return h[h.length - 1]; });
+    check('isfHistory entry retains the raw ISF source text (the prerequisite gap from the strategy notes is closed)',
+      typeof entry.source === 'string' && entry.source.includes('CutType'), entry.source.slice(0, 40));
+    check('every imported lane\'s isf.batchId matches its isfHistory entry id', linked.every(l => l.batchId === entry.id), { entryId: entry.id, batchIds: linked.map(l => l.batchId) });
+
+    const girdleId = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.isf && l.isf.name === 'GirdleRadius').id);
+    await page.evaluate((id) => window._TEST_upsertPoint(id, 10000, 100), girdleId); // makes GirdleRadius automated
+
+    await page.evaluate((e) => window._TEST_openMigrateSheet(e), entry);
+    await page.waitForTimeout(150);
+    const rowsInfo = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => {
+      const tds = tr.querySelectorAll('td');
+      return { name: tds[0].textContent, automated: tds[3].textContent.trim(), updateChecked: tds[4].querySelector('input').checked, wireChecked: tds[5].querySelector('input').checked };
+    }));
+    const girdleRow = rowsInfo.find(r => r.name === 'GirdleRadius');
+    const cutRow = rowsInfo.find(r => r.name === 'CutType');
+    check('Migrate sheet marks the modified lane as automated, with Wiring Sheet pre-checked',
+      girdleRow && girdleRow.automated === 'automated' && girdleRow.wireChecked === true, girdleRow);
+    check('Migrate sheet marks an untouched lane as static, with Wiring Sheet NOT pre-checked',
+      cutRow && cutRow.automated === 'static' && cutRow.wireChecked === false, cutRow);
+    check('Migrate sheet pre-checks "Update Default" for every row regardless of automation state',
+      rowsInfo.every(r => r.updateChecked === true), rowsInfo);
+
+    const downloads = [];
+    page.on('download', (d) => downloads.push(d));
+    await page.click('#isfMigrateDialog button:has-text("Export")');
+    await page.waitForTimeout(400);
+    check('Export produces two downloads: the migrated ISF and the wiring sheet', downloads.length === 2,
+      downloads.map(d => d.suggestedFilename()));
+
+    const isfDl = downloads.find(d => d.suggestedFilename().endsWith('.migrated.fs'));
+    const sheetDl = downloads.find(d => d.suggestedFilename().endsWith('-wiring-sheet.txt'));
+    if (isfDl) {
+      const content = fs.readFileSync(await isfDl.path(), 'utf8');
+      const m = content.match(/\/\*\s*([\s\S]*?)\s*\*\//);
+      const newHeader = m && JSON.parse(m[1]);
+      const cutInput = newHeader && newHeader.INPUTS.find(i => i.NAME === 'CutType');
+      // playhead is at tick 0; CutType's lane still holds only its import-time
+      // default CC (round((1-0)/7*127) = 18), so baking it back through
+      // ccToNative should land on 18/127*7 = 126/127, not the original 1 —
+      // this is the CC-quantization loss the feature is expected to apply,
+      // not a bug to round away.
+      check('Exported ISF rewrites a static parameter\'s DEFAULT to the playhead-derived native value (through real CC quantization)',
+        cutInput && Math.abs(cutInput.DEFAULT - 126 / 127) < 1e-6, cutInput);
+    } else {
+      check('Exported ISF download present', false, downloads.map(d => d.suggestedFilename()));
+    }
+    if (sheetDl) {
+      const sheetText = fs.readFileSync(await sheetDl.path(), 'utf8');
+      check('Wiring sheet includes the automated parameter but not the static one',
+        sheetText.includes('GirdleRadius') && !sheetText.includes('CutType'), sheetText.slice(0, 200));
+      check('Wiring sheet states the Scale-before-Offset stacking requirement',
+        /Scale.*ABOVE.*Offset/.test(sheetText), sheetText.includes('ABOVE'));
+    } else {
+      check('Wiring sheet download present', false, downloads.map(d => d.suggestedFilename()));
+    }
+  });
+
+  await withPage(browser, async (page) => {
+    // lane.isf and isfHistory[].source must survive the same snapshot()/
+    // applyState() roundtrip every other piece of lane/project data does
+    // (undo, save/load) — otherwise a reloaded project would silently lose
+    // its ability to migrate.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.evaluate((id) => {
+      window._TEST_state.ccLanes.find(l => l.id === id).isf = { batchId: 99, name: 'Foo', type: 'float', min: 0, max: 1, steps: 0, values: null, isColor: false, colorCh: null };
+      window._TEST_state.isfHistory.push({ id: 99, filename: 'foo.fs', label: 'Foo', importedAt: new Date().toISOString(), source: '/* {"INPUTS":[]} */', lanes: [] });
+    }, laneId);
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    await page.evaluate((id) => { window._TEST_state.ccLanes.find(l => l.id === id).isf = null; window._TEST_state.isfHistory = []; }, laneId);
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    const restored = await page.evaluate((id) => ({
+      isf: window._TEST_state.ccLanes.find(l => l.id === id).isf,
+      historyLen: window._TEST_state.isfHistory.length,
+      source: window._TEST_state.isfHistory[0] && window._TEST_state.isfHistory[0].source,
+    }), laneId);
+    check('lane.isf survives snapshot()/applyState() roundtrip', restored.isf && restored.isf.name === 'Foo' && restored.isf.min === 0 && restored.isf.max === 1, restored.isf);
+    check('isfHistory[].source survives snapshot()/applyState() roundtrip', restored.historyLen === 1 && restored.source === '/* {"INPUTS":[]} */', restored);
+  });
+
+  await withPage(browser, async (page) => {
+    // With more than one retained-source import, the picker lists both and
+    // clicking an entry opens that entry's sheet.
+    const h1 = { INPUTS: [{ NAME: 'A', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 }] };
+    const h2 = { INPUTS: [{ NAME: 'B', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 }] };
+    for (const [h, name] of [[h1, 'one.fs'], [h2, 'two.fs']]) {
+      const src = '/*\n' + JSON.stringify(h, null, 2) + '\n*/\nvoid main(){}\n';
+      await page.evaluate(({ hh, ss, nn }) => window._TEST_showISFDialog(hh, nn, ss), { hh: h, ss: src, nn: name });
+      await page.waitForTimeout(100);
+      await page.evaluate(() => { document.querySelectorAll('#isfDialog tbody tr').forEach(tr => tr.querySelector('input[type=checkbox]').click()); });
+      await page.click('#isfDialog button:has-text("Import Lanes")');
+      await page.waitForTimeout(100);
+    }
+    await page.evaluate(() => window._TEST_openMigratePicker());
+    await page.waitForTimeout(100);
+    const pickerCount = await page.locator('#isfMigratePicker button').count(); // includes Cancel
+    check('Migrate picker lists both retained-source imports (plus Cancel)', pickerCount === 3, pickerCount);
+    await page.click('#isfMigratePicker button:has-text("two.fs")');
+    await page.waitForTimeout(100);
+    const sheetTitle = await page.locator('#isfMigrateDialog').isVisible().catch(() => false);
+    check('Clicking a picker entry opens that entry\'s migrate sheet', sheetTitle === true, sheetTitle);
   });
 
   // ---------------- GENERATE strip: 6 shapes + direction toggle (item 6) ----------------

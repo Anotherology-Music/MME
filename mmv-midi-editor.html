@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.14
+  MMV MIDI & CC Curve Editor v0.9.15
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -405,6 +405,23 @@
   minimize toggle didn't refresh the tag bar, so a tag chip's lit state
   could go stale (e.g. staying lit after one lane in an all-minimized
   group was manually maximized again).
+  v0.9.15 "Migrate to MMV": ISF import now retains the shader's full raw
+  source text (previously discarded after the header was parsed) and links
+  each imported lane back to its source parameter (name/type/min/max) via
+  lane.isf — both survive save/load. A new "Migrate to MMV" button opens a
+  review sheet per import: for every linked lane it shows the ISF's current
+  default, the project's value at the playhead, and whether the lane is
+  actually automated (its sampled value ever changes across the whole
+  timeline, using the same tick-spacing and rounding as playback — not just
+  "how many points are drawn" or "where they sit"). Two independently
+  checkable columns per row: bake the playhead value into the ISF's DEFAULT,
+  and/or include the row on an exported wiring sheet with MMV's Scale/Offset/
+  Step for that parameter's native range (Scale=MAX-MIN, Offset=MIN, Step for
+  discrete params with even spacing — an irregular VALUES array is flagged
+  rather than guessed) plus the required Scale-above-Offset stacking order.
+  Export downloads an updated .fs (original untouched) and, when any row is
+  wiring-checked, a plain-text wiring sheet. Imported ISFs are also now
+  copied into the current Projects Folder on import, when one is set.
 -->
 
 <style>
@@ -1094,6 +1111,7 @@
           <div class="setup-row">
             <button id="isfImportBtn" title="Import ISF shader parameters as CC lanes (v0.5.0)">&#x2B21; Import ISF</button>
             <input type="file" id="isfFileInput" accept=".fs,.glsl,.isf,.frag" style="display:none">
+            <button id="isfMigrateBtn" title="Review which imported ISF parameters are automated vs. static, bake updated defaults, and export a wiring sheet for MMV's Source/Feature/CC + Modifiers">&#x21C4; Migrate to MMV</button>
           </div>
         </div>
         <div class="setup-section" id="chNamesSection">
@@ -1733,7 +1751,7 @@
   // ---------- Undo / Redo ----------
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
-    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points})),
+    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points,isf:l.isf||null})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     isfHistory:state.isfHistory||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
@@ -1781,7 +1799,7 @@
     const prevActiveId=state.activeLaneId;
     state.ccLanes.forEach(l=>{ if(l._row){ if(l._row.style.height) savedHeightById.set(l.id,l._row.style.height); l._row.remove(); } });
     state.ccLanes=[];
-    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,muted:!!ld.muted,soloed:!!ld.soloed,points:ld.points,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
+    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,muted:!!ld.muted,soloed:!!ld.soloed,points:ld.points,isf:ld.isf||null,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
       const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; updateLaneCompactness(lane._row); } });
     refreshMuteSoloUI();
     state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
@@ -5180,8 +5198,19 @@
       return state.ccLanes.some(l=>l.ch===ch&&l.cc===cc);
     }
 
+    // Best-effort copy of the imported shader into the current Projects
+    // Folder (if one has been chosen — see pickProjectsFolder), mirroring
+    // audio file handling. Silent no-op when no folder is set, permission is
+    // denied, or the File System Access API isn't available at all.
+    async function copyIsfToProjectFolder(filename,text){
+      if(!projDirHandle) return;
+      if(!await verifyDirPermission(projDirHandle,true)) return;
+      const fh=await projDirHandle.getFileHandle(filename,{create:true});
+      const w=await fh.createWritable(); await w.write(text); await w.close();
+    }
+
     // ── Show the ISF import modal ────────────────────────────────
-    function showISFDialog(header, filename){
+    function showISFDialog(header, filename, sourceText){
       const inputs=header.INPUTS||header.inputs||[];
       const rows=buildMappingRows(inputs);
       if(!rows.length){ flash('No mappable parameters found in ISF shader.'); return; }
@@ -5497,14 +5526,19 @@
         if(!toImport.length){ flash('No rows ticked — nothing to import.'); return; }
         const sceneTag=sceneInput.value.trim().replace(/[,\s]+/g,'-');
         const importTags=sceneTag?[shaderTag,sceneTag]:[shaderTag];
-        const historyEntry={filename:filename, label:shaderTitle, importedAt:new Date().toISOString(), lanes:[]};
+        const batchId=state.nextId++;
+        const historyEntry={id:batchId, filename:filename, label:shaderTitle, importedAt:new Date().toISOString(),
+          source:sourceText||'', lanes:[]};
         toImport.forEach(function(ref){
           const ch=(parseInt(ref.chInput.value)||1)-1;
           const cc=Math.max(0,Math.min(127,parseInt(ref.ccInput.value)||0));
           const id=state.nextId++;
           const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
+          const isf={batchId, name:ref.row.name, type:ref.row.type, min:ref.row.min, max:ref.row.max,
+            steps:ref.row.steps||0, values:ref.row.values||null,
+            isColor:!!ref.row.isColor, colorCh:ref.row.colorCh!=null?ref.row.colorCh:null};
           const lane={id, type:'cc', cc, ch, color, name:ref.row.name, visible:true, tags:[...importTags],
-            steps:ref.row.steps||0, points:[{t:0, v:ref.defCCVal}], _preview:null};
+            steps:ref.row.steps||0, points:[{t:0, v:ref.defCCVal}], _preview:null, isf};
           state.ccLanes.push(lane);
           buildLaneDom(lane);
           historyEntry.lanes.push({name:ref.row.name, cc, ch:ch+1, defVal:ref.defCCVal,
@@ -5512,6 +5546,7 @@
         });
         if(!state.isfHistory) state.isfHistory=[];
         state.isfHistory.push(historyEntry);
+        if(sourceText) copyIsfToProjectFolder(filename,sourceText).catch(function(){});
         setActiveLane(state.activeLaneId);
         refreshTagBar();
         resizeCanvases();
@@ -5542,11 +5577,382 @@
             flash('Could not parse ISF header. Make sure the file starts with a /* JSON */ block.');
             return;
           }
-          showISFDialog(header, f.name);
+          showISFDialog(header, f.name, text);
         };
         reader.readAsText(f);
         e.target.value='';
       });
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // MIGRATE TO MMV — review which imported ISF parameters are static
+    // vs. automated, bake updated defaults, and export a wiring sheet
+    // for MMV's Source/Feature/CC + Modifiers (Scale/Offset/Step).
+    // ═══════════════════════════════════════════════════════════════
+
+    // CC (0–127) -> native ISF units for a given row's MIN/MAX.
+    function ccToNative(row,cc){
+      if(row.type==='bool') return cc>=64?1:0;
+      const range=row.max-row.min;
+      return row.min+(clamp(cc,0,127)/127)*range;
+    }
+
+    // Does this lane's value ever change across the whole timeline, sampled
+    // at the same tick spacing and rounding the playback scheduler itself
+    // uses (see schedulerTick/buildPassEvents)? "Automated" means "would
+    // ever actually send a second distinct CC value" — not just "has more
+    // than one point drawn".
+    function isLaneAutomated(lane){
+      if(!lane.points||lane.points.length<2) return false;
+      const step=Math.max(1,Math.round(state.ppq/state.ccRes));
+      const end=totalTicks();
+      const first=Math.round(clamp(laneValueAt(lane,0),0,127));
+      for(let t=0;t<=end;t+=step){
+        if(Math.round(clamp(laneValueAt(lane,t),0,127))!==first) return true;
+      }
+      return false;
+    }
+
+    // MMV Scale/Offset/Step for a row's native MIN/MAX. Scale=MAX-MIN,
+    // Offset=MIN — and Scale must be stacked ABOVE Offset in MMV's modifier
+    // list for this to land on the right range (confirmed against MMV's own
+    // User's Guide: modifiers apply top-to-bottom, and Scale->Offset gives a
+    // different result than Offset->Scale). Step only applies to discrete
+    // long/bool parameters, and only when their native spacing is even — an
+    // irregular VALUES array can't be represented by a single "round to
+    // nearest multiple of N" modifier, so that case is flagged rather than
+    // guessed.
+    function computeModifiers(row){
+      const scale=row.max-row.min, offset=row.min;
+      if(row.type!=='long'&&row.type!=='bool') return {scale,offset,step:null,warning:null};
+      if(row.type==='bool') return {scale,offset,step:1,warning:null};
+      if(Array.isArray(row.values)&&row.values.length>1){
+        const diffs=[]; for(let i=1;i<row.values.length;i++) diffs.push(row.values[i]-row.values[i-1]);
+        const d0=diffs[0], even=diffs.every(function(d){ return Math.abs(d-d0)<1e-6; });
+        if(!even) return {scale,offset,step:null,warning:'Irregular VALUES spacing — set Step manually in MMV.'};
+        return {scale,offset,step:d0,warning:null};
+      }
+      return {scale,offset,step:1,warning:null};
+    }
+
+    function findRowLane(batchId,row){
+      return state.ccLanes.find(function(l){ return l.isf&&l.isf.batchId===batchId&&l.isf.name===row.name; });
+    }
+
+    // Rebuild {name,type,min,max,defaultVal,...} rows fresh from the entry's
+    // retained source text — the single source of truth for what actually
+    // gets written back into the exported ISF, rather than trusting each
+    // lane's import-time snapshot (which could predate a re-import).
+    function rowsForEntry(entry){
+      const header=parseISFHeader(entry.source);
+      if(!header) return null;
+      return buildMappingRows(header.INPUTS||header.inputs||[]);
+    }
+
+    function downloadText(filename,text,mime){
+      const blob=new Blob([text],{type:mime||'text/plain'});
+      const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+      a.download=filename; a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); },1000);
+    }
+
+    // Deep-clones the entry's header, writes each checked row's playhead
+    // value into its INPUT's DEFAULT (recombining color R/G/B/A rows back
+    // into a single 4-element array), and returns the new header object.
+    function buildUpdatedHeader(entry,rows,nativeByName,updateSet){
+      const header=JSON.parse(JSON.stringify(parseISFHeader(entry.source)));
+      const inputs=header.INPUTS||header.inputs||[];
+      rows.forEach(function(row){
+        if(!updateSet.has(row.name)) return;
+        const native=nativeByName[row.name];
+        if(native==null) return;
+        if(row.isColor){
+          const baseName=row.name.slice(0,row.name.lastIndexOf('.'));
+          const inp=inputs.find(function(i){ return (i.NAME||i.name)===baseName; });
+          if(!inp) return;
+          const key=inp.DEFAULT!=null?'DEFAULT':'default';
+          if(!Array.isArray(inp[key])) inp[key]=[0,0,0,1];
+          inp[key][row.colorCh]=native;
+        } else {
+          const inp=inputs.find(function(i){ return (i.NAME||i.name)===row.name; });
+          if(!inp) return;
+          const key=inp.DEFAULT!=null?'DEFAULT':'default';
+          inp[key]=row.type==='bool'?!!native:native;
+        }
+      });
+      return header;
+    }
+
+    // Reserializes an updated header back into the original shader text,
+    // replacing only the /* JSON */ header block (same regex parseISFHeader
+    // matches — first occurrence, GLSL body untouched).
+    function serializeIsf(entry,header){
+      const json=JSON.stringify(header,null,2);
+      return entry.source.replace(/\/\*\s*[\s\S]*?\s*\*\//,'/*\n'+json+'\n*/');
+    }
+
+    function buildWiringSheetText(entry,wireRefs){
+      const lines=[];
+      lines.push('MMV Migration Sheet — '+(entry.label||entry.filename));
+      lines.push('Source: '+entry.filename);
+      lines.push('Generated: '+new Date().toLocaleString());
+      lines.push('');
+      const cols=['Parameter','Channel','CC#','Scale','Offset','Step'];
+      const rowsOut=wireRefs.map(function(r){
+        return [r.row.name, String(r.lane.ch+1), String(r.lane.cc), fmtNum(r.mods.scale), fmtNum(r.mods.offset), r.mods.step==null?'—':fmtNum(r.mods.step)];
+      });
+      const widths=cols.map(function(c,i){ return Math.max(c.length,...rowsOut.map(function(r){ return r[i].length; }))+2; });
+      function padRow(cells){ return cells.map(function(c,i){ return c.padEnd(widths[i]); }).join(''); }
+      lines.push(padRow(cols));
+      lines.push(widths.map(function(w){ return ''.padEnd(w-1,'-')+' '; }).join(''));
+      rowsOut.forEach(function(r){ lines.push(padRow(r)); });
+      lines.push('');
+      lines.push('For every row above: in MMV, add a Scale modifier ABOVE an Offset');
+      lines.push('modifier (Scale applies first, then Offset) — reversing the stacking');
+      lines.push('order changes the result. See MMV\'s Modifiers > Order of Modifier');
+      lines.push('Operations for why.');
+      const warns=wireRefs.filter(function(r){ return r.mods.warning; });
+      if(warns.length){
+        lines.push('');
+        lines.push('Warnings:');
+        warns.forEach(function(r){ lines.push('  '+r.row.name+': '+r.mods.warning); });
+      }
+      return lines.join('\n');
+    }
+
+    // ── Migrate sheet dialog for one ISF import batch ──────────────
+    function openMigrateSheet(entry){
+      const rows=rowsForEntry(entry);
+      if(!rows){ flash('Could not re-parse the retained ISF source for '+entry.filename+'.'); return; }
+
+      const refs=[];
+      rows.forEach(function(row){
+        const lane=findRowLane(entry.id,row);
+        if(!lane) return; // param wasn't imported, or its lane was later deleted — nothing to migrate
+        const ccAtPlayhead=Math.round(clamp(laneValueAt(lane,state.playhead),0,127));
+        const playheadNative=ccToNative(row,ccAtPlayhead);
+        refs.push({row:row, lane:lane, automated:isLaneAutomated(lane),
+          playheadNative:playheadNative, mods:computeModifiers(row)});
+      });
+      if(!refs.length){ flash('No lanes from this import remain — nothing to migrate.'); return; }
+
+      const existing=document.getElementById('isfMigrateDialog');
+      if(existing) existing.remove();
+
+      const dlg=document.createElement('dialog');
+      dlg.id='isfMigrateDialog';
+      dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+        +'width:min(980px,95vw);max-height:90vh;overflow:hidden;display:flex;flex-direction:column;';
+
+      const hdr=document.createElement('div');
+      hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;';
+      hdr.innerHTML=
+        '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x21C4; Migrate to MMV</div>'
+        +'<div style="font-size:12px;color:#4fa3ff;margin-top:3px;">'+escHtml(entry.label||entry.filename)+'</div>'
+        +'<div style="font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;">'+escHtml(entry.filename)+'</div>'
+        +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Static rows get their ISF default updated to the current playhead value. Automated rows get a wiring-sheet entry (channel, CC, Scale/Offset/Step) for MMV\'s modifiers.</div>';
+      dlg.appendChild(hdr);
+
+      const tableWrap=document.createElement('div');
+      tableWrap.style.cssText='overflow-y:auto;flex:1;padding:0 0 4px;';
+      const tbl=document.createElement('table');
+      tbl.style.cssText='width:100%;border-collapse:collapse;font-size:12px;';
+
+      const thead=document.createElement('thead');
+      const thr=document.createElement('tr');
+      thr.style.cssText='color:#7a8099;border-bottom:1px solid #2c313b;position:sticky;top:0;background:#1d2027;z-index:1;';
+      function th(txt,align,extra){ const t=document.createElement('th'); t.style.cssText='padding:6px 6px;text-align:'+(align||'left')+';white-space:nowrap;'+(extra||''); t.textContent=txt; return t; }
+      function thEl(el,align){ const t=document.createElement('th'); t.style.cssText='padding:6px 6px;text-align:'+(align||'center')+';'; t.appendChild(el); return t; }
+
+      function masterCb(label,title){
+        const wrap=document.createElement('div'); wrap.style.cssText='display:flex;flex-direction:column;align-items:center;gap:2px;';
+        const cb=document.createElement('input'); cb.type='checkbox'; cb.title=title;
+        const lbl=document.createElement('span'); lbl.style.cssText='font-size:10px;color:#7a8099;'; lbl.textContent=label;
+        wrap.appendChild(cb); wrap.appendChild(lbl);
+        return {wrap:wrap,cb:cb};
+      }
+      const hdrUpdate=masterCb('Default','Tick all / restore previous');
+      const hdrWire=masterCb('Wiring','Tick all / restore previous');
+
+      thr.appendChild(th('Parameter','left','padding-left:14px;'));
+      thr.appendChild(th('ISF Default','right'));
+      thr.appendChild(th('Value @ Playhead','right'));
+      thr.appendChild(th('Automated?','center'));
+      thr.appendChild(thEl(hdrUpdate.wrap));
+      thr.appendChild(thEl(hdrWire.wrap));
+      thr.appendChild(th('Scale','right'));
+      thr.appendChild(th('Offset','right'));
+      thr.appendChild(th('Step','right'));
+      thead.appendChild(thr);
+      tbl.appendChild(thead);
+
+      const tbody=document.createElement('tbody');
+      const rowRefs=[];
+      refs.forEach(function(ref){
+        const tr=document.createElement('tr');
+        tr.style.borderBottom='1px solid #23272f';
+
+        const tdName=document.createElement('td');
+        tdName.style.cssText='padding:5px 6px 5px 14px;color:#e0e4ef;';
+        tdName.textContent=ref.row.name;
+
+        const tdDef=document.createElement('td');
+        tdDef.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
+        tdDef.textContent=fmtNum(ref.row.defaultVal);
+
+        const tdPh=document.createElement('td');
+        tdPh.style.cssText='padding:5px 6px;color:#c8cdd8;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
+        tdPh.textContent=fmtNum(ref.playheadNative);
+
+        const tdAuto=document.createElement('td');
+        tdAuto.style.cssText='padding:5px 6px;text-align:center;';
+        const autoBadge=document.createElement('span');
+        autoBadge.textContent=ref.automated?'automated':'static';
+        autoBadge.style.cssText='font-family:monospace;font-size:10px;letter-spacing:.04em;text-transform:uppercase;padding:2px 7px;border-radius:4px;'
+          +(ref.automated?'color:#ffb454;background:rgba(255,180,84,.14);':'color:#7ed957;background:rgba(126,217,87,.14);');
+        tdAuto.appendChild(autoBadge);
+
+        const updateCb=document.createElement('input'); updateCb.type='checkbox'; updateCb.checked=true;
+        const tdUpdate=document.createElement('td'); tdUpdate.style.cssText='padding:5px 6px;text-align:center;'; tdUpdate.appendChild(updateCb);
+
+        const wireCb=document.createElement('input'); wireCb.type='checkbox'; wireCb.checked=ref.automated;
+        const tdWire=document.createElement('td'); tdWire.style.cssText='padding:5px 6px;text-align:center;'; tdWire.appendChild(wireCb);
+
+        const tdScale=document.createElement('td');
+        tdScale.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
+        tdScale.textContent=fmtNum(ref.mods.scale);
+
+        const tdOffset=document.createElement('td');
+        tdOffset.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
+        tdOffset.textContent=fmtNum(ref.mods.offset);
+
+        const tdStep=document.createElement('td');
+        tdStep.style.cssText='padding:5px 6px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;'
+          +(ref.mods.warning?'color:#ffb454;':'color:#7a8099;');
+        tdStep.textContent=ref.mods.step==null?'—':fmtNum(ref.mods.step);
+        if(ref.mods.warning) tdStep.title=ref.mods.warning;
+
+        tr.appendChild(tdName); tr.appendChild(tdDef); tr.appendChild(tdPh); tr.appendChild(tdAuto);
+        tr.appendChild(tdUpdate); tr.appendChild(tdWire);
+        tr.appendChild(tdScale); tr.appendChild(tdOffset); tr.appendChild(tdStep);
+        tbody.appendChild(tr);
+
+        rowRefs.push({ref:ref, updateCb:updateCb, wireCb:wireCb});
+      });
+      tbl.appendChild(tbody);
+      tableWrap.appendChild(tbl);
+      dlg.appendChild(tableWrap);
+
+      function wireMaster(masterObj,pick){
+        let saved=null;
+        masterObj.cb.addEventListener('change',function(){
+          if(masterObj.cb.checked){
+            saved=rowRefs.map(function(r){ return pick(r).checked; });
+            rowRefs.forEach(function(r){ pick(r).checked=true; });
+          } else {
+            rowRefs.forEach(function(r,i){ pick(r).checked=saved?saved[i]:false; });
+            saved=null;
+          }
+        });
+      }
+      wireMaster(hdrUpdate,function(r){ return r.updateCb; });
+      wireMaster(hdrWire,function(r){ return r.wireCb; });
+
+      const footer=document.createElement('div');
+      footer.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;gap:8px;align-items:center;';
+      const countLbl=document.createElement('span');
+      countLbl.style.cssText='font-size:11px;color:#7a8099;';
+      function updateCount(){
+        const nu=rowRefs.filter(function(r){ return r.updateCb.checked; }).length;
+        const nw=rowRefs.filter(function(r){ return r.wireCb.checked; }).length;
+        countLbl.textContent=nu+' default'+(nu!==1?'s':'')+' to update, '+nw+' wiring-sheet row'+(nw!==1?'s':'');
+      }
+      rowRefs.forEach(function(r){ r.updateCb.addEventListener('change',updateCount); r.wireCb.addEventListener('change',updateCount); });
+      updateCount();
+
+      const closeBtn=document.createElement('button');
+      closeBtn.textContent='Cancel';
+      closeBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;margin-left:auto;';
+      closeBtn.addEventListener('click',function(){ dlg.close(); dlg.remove(); });
+
+      const exportBtn=document.createElement('button');
+      exportBtn.textContent='Export';
+      exportBtn.style.cssText='background:#4fa3ff;color:#0d0f14;border:none;border-radius:4px;padding:6px 18px;cursor:pointer;font-size:13px;font-weight:700;';
+      exportBtn.addEventListener('click',function(){
+        const updateSet=new Set(rowRefs.filter(function(r){ return r.updateCb.checked; }).map(function(r){ return r.ref.row.name; }));
+        const wireRefs=rowRefs.filter(function(r){ return r.wireCb.checked; }).map(function(r){ return r.ref; });
+        const nativeByName={};
+        rowRefs.forEach(function(r){ nativeByName[r.ref.row.name]=r.ref.playheadNative; });
+
+        const dotIdx=entry.filename.lastIndexOf('.');
+        const base=dotIdx>0?entry.filename.slice(0,dotIdx):entry.filename;
+        const ext=dotIdx>0?entry.filename.slice(dotIdx):'.fs';
+
+        if(updateSet.size){
+          const header=buildUpdatedHeader(entry,rows,nativeByName,updateSet);
+          downloadText(base+'.migrated'+ext,serializeIsf(entry,header),'text/plain');
+        }
+        if(wireRefs.length){
+          downloadText(base+'-wiring-sheet.txt',buildWiringSheetText(entry,wireRefs),'text/plain');
+        }
+        dlg.close(); dlg.remove();
+        flash('Exported'+(updateSet.size?' updated ISF':'')+(updateSet.size&&wireRefs.length?' +':'')+(wireRefs.length?' wiring sheet':'')+'.');
+      });
+
+      footer.appendChild(countLbl);
+      footer.appendChild(closeBtn);
+      footer.appendChild(exportBtn);
+      dlg.appendChild(footer);
+
+      document.body.appendChild(dlg);
+      dlg.showModal();
+    }
+
+    // ── Picker across past ISF imports (skips straight to the sheet when
+    //    there's only one with retained source) ────────────────────────
+    function openMigratePicker(){
+      const entries=(state.isfHistory||[]).filter(function(e){ return e.source; });
+      if(!entries.length){ flash('No ISF imports with retained source yet — import an ISF first.'); return; }
+      if(entries.length===1){ openMigrateSheet(entries[0]); return; }
+
+      const existing=document.getElementById('isfMigratePicker');
+      if(existing) existing.remove();
+      const dlg=document.createElement('dialog');
+      dlg.id='isfMigratePicker';
+      dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+        +'width:min(520px,95vw);max-height:80vh;overflow:hidden;display:flex;flex-direction:column;';
+      const hdr=document.createElement('div');
+      hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;font-size:14px;font-weight:700;color:#e0e4ef;';
+      hdr.textContent='Migrate which ISF import?';
+      dlg.appendChild(hdr);
+      const list=document.createElement('div');
+      list.style.cssText='overflow-y:auto;padding:8px;';
+      entries.slice().reverse().forEach(function(entry){
+        const b=document.createElement('button');
+        b.style.cssText='display:block;width:100%;text-align:left;background:#20242d;color:#c8cdd8;border:1px solid #2c313b;border-radius:5px;padding:8px 10px;margin-bottom:6px;cursor:pointer;font-size:12px;';
+        const when=entry.importedAt?new Date(entry.importedAt).toLocaleString():'';
+        b.innerHTML='<div style="color:#e0e4ef;font-weight:600;">'+escHtml(entry.label||entry.filename)+'</div>'
+          +'<div style="color:#7a8099;font-size:11px;margin-top:2px;">'+escHtml(entry.filename)+' · '+escHtml(when)+' · '+entry.lanes.length+' lane'+(entry.lanes.length!==1?'s':'')+'</div>';
+        b.addEventListener('click',function(){ dlg.close(); dlg.remove(); openMigrateSheet(entry); });
+        list.appendChild(b);
+      });
+      dlg.appendChild(list);
+      const footer=document.createElement('div');
+      footer.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;';
+      const closeBtn=document.createElement('button');
+      closeBtn.textContent='Cancel';
+      closeBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;margin-left:auto;';
+      closeBtn.addEventListener('click',function(){ dlg.close(); dlg.remove(); });
+      footer.appendChild(closeBtn);
+      dlg.appendChild(footer);
+      document.body.appendChild(dlg);
+      dlg.showModal();
+    }
+
+    // Wire up the Migrate to MMV button
+    document.addEventListener('DOMContentLoaded',function(){
+      const btn=document.getElementById('isfMigrateBtn');
+      if(!btn) return;
+      btn.addEventListener('click',openMigratePicker);
     });
   })();
 
