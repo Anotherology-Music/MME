@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.12
+  MMV MIDI & CC Curve Editor v0.9.13
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -348,6 +348,39 @@
   small margin, not a jarring gap. tickToX/xToTick and the on-screen
   scroll/zoom math are unchanged; clicking, dragging, and zoom-at-mouse
   still resolve to the same tick as before.
+  v0.9.13 Third round of lane-row/Note Info tuning from real usage.
+  Note Info is now a TRUE one-row minimized view: the old header row (title
+  + toggle) and the 4-column Note/Vel/Pos/Ch grid below it are gone,
+  replaced by a single row that renders the same way whether minimized,
+  expanded-with-nothing-selected, or expanded-with-a-selection (only "—"
+  placeholders change, the same convention the CC lane's V/P/S fields
+  already use). The "NOTE INFO" title only renders when the leftcol is wide
+  enough not to crowd the row (a real layout collapse via CSS container
+  query on --keys-w, not just hidden text still taking up space) or when
+  manually minimized, where it always hides regardless of width. The note
+  display now reads "A#4  82" (name, two spaces, MIDI number — no colon).
+  Channel is now a button opening the same shared channel-picker popover the
+  CC lane's Channel button uses (openChPopover() was generalized to take a
+  channel number + onSelect(ch) callback instead of a lane object, so both
+  call sites share one popover component) — selecting a channel applies it
+  to every currently-selected note.
+  CC lane fixes: the curve canvas is full lane height again when expanded
+  (row 1 + row 2 + row 3 combined, not just rows 2+3) — reclaiming the "dead"
+  strip next to row 1 that appeared when row 1 became a sibling of .lanebody
+  back in v0.9.9. The canvas's scroll wrapper is now absolutely positioned
+  against the lane (top:0 to bottom:7px, clear of the grip; left:var(--keys-w)
+  to the lane's right edge) while staying a DOM descendant of .lanebody, so
+  minimizing still hides it completely exactly as before. The CC# popover
+  now shows a used CC's actual custom lane name (e.g. "18: CutType") instead
+  of always falling back to the generic GM default name. Row 2's Position
+  field is widened to fit a full 4-digit-bar BBT string ("1234.12.12.123")
+  without truncating (was ~38px, enough for "1.1.1." before clipping), and
+  now splits into three explicit groups — × hard left, Value/Position/Steps
+  centered, Mute/Solo hard right — instead of one large right-hand block, so
+  the value fields read as centered rather than crowding Mute/Solo. The
+  drag-to-reorder handle moves back into row 1 (after Colour) now that it
+  has room, which also restores the ability to drag-reorder a MINIMIZED lane
+  without expanding it first.
 -->
 <style>
   * { box-sizing: border-box; }
@@ -403,30 +436,63 @@
   #tsPanel{position:absolute;top:calc(100% + 3px);left:0;width:320px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;padding:9px 14px;flex-direction:column;gap:6px;}
   #tsPanel.open{display:flex;}
   #tsBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
-  /* ── Note Info columns (replaces velocity leftcol) ── */
-  .note-info-left{padding:4px 5px!important;justify-content:center!important;}
-  .ni-title{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);padding-bottom:3px;white-space:nowrap;}
-  .note-info-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:3px;width:100%;}
-  .ni-col{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;}
-  .ni-lbl{font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em;}
-  .ni-input,.ni-disp{box-sizing:border-box;width:100%;height:19px;padding:2px 3px;font-size:10px;line-height:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:4px;overflow:hidden;white-space:nowrap;}
+  /* ── Note Info: true one-row layout (v0.9.13) ── replaces the old two-row
+     header+4-column-grid structure. There is now exactly ONE row at all
+     times — minimized, expanded-with-nothing-selected, and expanded-with-a-
+     selection all render the same simple row, just with "—" placeholders
+     when nothing is selected (mirroring how the CC lane's own V/P/S fields
+     already behave with no active point). Minimize/expand no longer swaps
+     in a separate DOM branch; the only thing it changes is the "Note Info"
+     title's visibility (see the container-query + .ni-collapsed rules
+     below) — a deliberately minimal difference, since collapsing the old
+     SECOND row (the 4-column grid) is what actually mattered, and that row
+     no longer exists to collapse. state.noteInfoManuallyCollapsed and
+     "is anything selected" (autoCollapse in updateNoteInfo()) remain two
+     independent flags feeding the same .ni-collapsed class — they just
+     produce near-identical visuals now that there's only one layout. */
+  .note-info-left{padding:4px 5px!important;justify-content:center!important;container-type:inline-size;}
+  .ni-row{display:flex;align-items:center;gap:4px;width:100%;min-width:0;}
+  .ni-title{flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);white-space:nowrap;}
+  .note-info-left .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
+  /* Note details ("A#4  82") — no label above it (self-evident from its own
+     content, per explicit instruction), unlike V/Pos/Ch which either have a
+     mini-label (V) or are self-evident buttons/mono fields. Gets the most
+     flex-shrink room since it's the least critical field to keep full-width
+     under a squeezed leftcol. */
+  .ni-note{flex:1 1 50px;min-width:30px;}
+  /* -moz-appearance/-webkit-appearance below hide the number-input spinner
+     arrows (same treatment the CC lane's .stepsn field already uses) — at
+     this field's narrow width the spinner otherwise ate most of the box,
+     squeezing the "—" placeholder/typed value down to an unreadable
+     sliver. flex:0 0 (not 0 1) — a shrinkable basis let this field get
+     squeezed below the width a 3-digit velocity (1-127) needs whenever the
+     row's other flexible fields (note/pos) were fighting it for space,
+     clipping "100" down to "1". A fixed 32px is enough for 3 digits and
+     small enough to not crowd the rest of the row. */
+  #velValInput{flex:0 0 32px;width:32px;-moz-appearance:textfield;}
+  #velValInput::-webkit-outer-spin-button,#velValInput::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  /* No mini-label (per explicit instruction) — the mono font + BBT dots
+     already read unambiguously as a position. */
+  #noteInfoPos{flex:1 1 50px;min-width:34px;}
+  #noteInfoCh{flex:0 0 auto;}
+  .ni-input,.ni-disp,.ni-note{box-sizing:border-box;height:19px;padding:2px 3px;font-size:10px;line-height:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:4px;overflow:hidden;white-space:nowrap;}
   .ni-input{color:var(--accent2);}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
-  .ni-disp{color:var(--txt);display:flex;align-items:center;justify-content:center;}
-  /* Collapsed to a single slim row when nothing is selected (item 5) — the
-     title + grid stay in the DOM (field ids/editing behavior unchanged when
-     expanded) and just hide, so nothing about the actual editing wiring
-     needs to know about collapse state. Same mechanism now also drives a
-     SEPARATE manual minimize toggle (state.noteInfoManuallyCollapsed) — see
-     the ni-header/.toggle-btn wiring near #noteInfoLeft — which forces this
-     same collapsed look regardless of selection when the user just wants
-     the vertical space back. */
-  .ni-empty{display:none;font-size:10px;color:var(--txt2);white-space:nowrap;}
-  .note-info-left.ni-collapsed .ni-title,.note-info-left.ni-collapsed .note-info-grid{display:none;}
-  .note-info-left.ni-collapsed .ni-empty{display:block;}
-  .ni-header{display:flex;align-items:center;gap:4px;width:100%;justify-content:center;}
-  .ni-header .toggle-btn{flex-shrink:0;}
-  .note-info-left.ni-collapsed .ni-header{justify-content:space-between;}
+  .ni-disp,.ni-note{color:var(--txt);display:flex;align-items:center;justify-content:center;}
+  /* "NOTE INFO" only renders when the leftcol is wide enough not to crowd
+     the rest of the row (tested at several --keys-w values; below ~190px
+     the title started visibly pushing the Position/Channel fields into
+     truncation, so that's the cutoff) — a real layout collapse via
+     container query (this element's own inline size tracks var(--keys-w)
+     exactly, the same width the CC lanes' leftcol already uses), not just
+     hidden text still reserving its row. When hidden, it takes zero space:
+     it's one flex child among the others in .ni-row, not a separate row. */
+  @container (max-width: 190px){ .ni-title{display:none;} }
+  /* Manually minimized (or nothing selected — see autoCollapse in
+     updateNoteInfo()) always hides the title outright, regardless of width
+     — the whole point of minimizing is maximum compactness, so it shouldn't
+     wait on a width threshold that expanded mode uses. */
+  .note-info-left.ni-collapsed .ni-title{display:none;}
   /* Manual minimize/maximize toggle for the whole Note Info box — same
      .move-btn/.toggle-btn visual language as the CC lane row-1 toggle
      (▾ expanded / ▸ minimized, same .on convention), just scoped to
@@ -549,21 +615,52 @@
      so a lane can still be manually shrunk that far, but nothing — pure
      lane count included — can crush it smaller than that; the container
      scrolls instead, as it already could. */
-  .lane{height:92px;min-height:64px;flex-shrink:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;}
+  .lane{height:92px;min-height:64px;flex-shrink:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;position:relative;}
   .lanebody{flex:1;display:flex;min-height:0;}
   .lane.active .leftcol{box-shadow:inset 3px 0 0 var(--accent2);}
+  /* Full-height curve canvas (v0.9.13): the curve used to only span rows
+     2+3's height because .lane-canvas-scroll (the .scroll.hx wrapping the
+     curve <canvas>) is a normal-flow child of .lanebody, which sits BELOW
+     row 1 (row 1 was pulled out to be a sibling of .lanebody back in v0.9.9
+     specifically so it stays visible when minimized — see the comment on
+     .lane-row1 below). That left a "dead" strip to the right of row 1,
+     row-1's own height tall, where the curve used to be drawn before row 1
+     existed as a separate strip — the user wants that reclaimed so the
+     curve spans the lane's FULL height again, while row 1 keeps behaving
+     exactly as it does today (still outside whatever hides on minimize).
+     Fix: .lane-canvas-scroll is taken out of .lanebody's flex flow and
+     absolutely positioned against .lane itself (position:relative, above) —
+     top:0 (level with row 1's own top, not .lanebody's) down to bottom:7px
+     (stopping short of the .grip resize handle, which is exactly 7px tall —
+     see .grip below — so the canvas never visually covers it), starting at
+     left:var(--keys-w) (.leftcol's own right edge) to the lane's right
+     edge. It stays a DOM descendant of .lanebody (no DOM/JS restructuring
+     needed) so `.lane.lane-hidden .lanebody{display:none}` still hides it
+     completely when minimized, exactly as before — display:none on an
+     ancestor hides an absolutely-positioned descendant too. Because it's
+     still the same element resizeCanvases()/attachGrip()/etc already size
+     off of (l._scroll.clientHeight -> l._canvas.height), the taller
+     clientHeight this position now produces flows through automatically:
+     no changes needed to canvas-height math, Y hit-testing (laneCoords()
+     reads _scroll's own getBoundingClientRect()), or the draw functions.
+     Row 1 and .leftcol occupy 0..var(--keys-w) horizontally, the canvas
+     occupies var(--keys-w)..100% — they never overlap, so no z-index
+     juggling is needed either. */
+  .lane .lane-canvas-scroll{position:absolute;top:0;left:var(--keys-w);right:0;bottom:7px;}
 
-  /* Row 1: Minimize/Maximize toggle, CC#/PB, Name, Channel, Colour — a
-     full-width strip that sits ABOVE .lanebody (not inside .leftcol), so it
-     stays in the DOM and is fully visible/interactive whether the lane is
-     expanded or minimized. This is the single source of truth for CC#/
-     Name/Channel/Colour now — there is no separate minimized-only
-     duplicate (the old .lane-top-bar / tb-* elements from v0.9.7 are gone
-     as of v0.9.9). min-height + flex-shrink:0 here is the same
-     lane-crushing guard used everywhere else in this file (see .lane and
-     .lane.lane-hidden below) — this is what a minimized lane's whole
+  /* Row 1: Minimize/Maximize toggle, CC#/PB, Name, Channel, Colour, Move
+     (drag-to-reorder handle, back here as of v0.9.13 — see .drag-handle
+     below) — a full-width strip that sits ABOVE .lanebody (not inside
+     .leftcol), so it stays in the DOM and is fully visible/interactive
+     whether the lane is expanded or minimized. This is the single source of
+     truth for CC#/Name/Channel/Colour/Move now — there is no separate
+     minimized-only duplicate (the old .lane-top-bar / tb-* elements from
+     v0.9.7 are gone as of v0.9.9). min-height + flex-shrink:0 here is the
+     same lane-crushing guard used everywhere else in this file (see .lane
+     and .lane.lane-hidden below) — this is what a minimized lane's whole
      visible height rests on now, replacing the old top-bar's hardcoded
-     22px floor. */
+     22px floor. Having the drag handle here also means a minimized lane can
+     be drag-reordered again without expanding it first. */
   /* Width-matched to .leftcol (var(--keys-w)) rather than left to stretch
      across the whole .lane — without this, row 1's Name field (flex-grow:1)
      had the entire lane's width to expand into and visually spilled well
@@ -587,11 +684,11 @@
   .lane.lane-hidden .grip{display:none;}
   .lane.lane-hidden .lanebody{display:none;}
   .lane.lane-hidden{height:auto!important;min-height:30px!important;flex-shrink:0!important;}
-  /* Below the height that fits rows 1+2+3, hide row 3 (Tag pill + the
-     drag-to-reorder handle, the lowest-priority row) outright rather than
-     let it clip mid-row — keeps row 1 (always visible, outside .lanebody)
-     and row 2 (×/Val/Pos/Steps/Mute/Solo) always fully visible within the
-     lane's own bounds. */
+  /* Below the height that fits rows 1+2+3, hide row 3 (the Tag pill, the
+     lowest-priority row — the drag-to-reorder handle moved back to row 1 in
+     v0.9.13) outright rather than let it clip mid-row — keeps row 1 (always
+     visible, outside .lanebody) and row 2 (×/Val/Pos/Steps/Mute/Solo) always
+     fully visible within the lane's own bounds. */
   .lane.lane-compact2 .row3{display:none!important;}
 
   /* Lane row 1 content (see .lane-row1 above — it's a sibling of .leftcol,
@@ -610,12 +707,14 @@
   .lane .lane-row1 input.lname{flex:1 1 60px;min-width:0;max-width:140px;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
   /* Channel — a button (not a free-typing number field) labeled "Ch N" that
      opens the shared #chPopover listing all 16 MIDI channels by number and
-     configured name; see #chPopover below. Lives in row 1. */
-  .lane .lane-row1 .chn-btn{height:16px;min-width:30px;box-sizing:border-box;padding:0 5px;font-size:10px;
+     configured name; see #chPopover below. Lives in row 1 (CC lanes) and in
+     Note Info's one-row layout — same shared popover, same visual language,
+     styled identically via this same rule (not scoped to .lane only). */
+  .lane .lane-row1 .chn-btn,.note-info-left .chn-btn{height:16px;min-width:30px;box-sizing:border-box;padding:0 5px;font-size:10px;
     border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
     flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
-  .lane .lane-row1 .chn-btn:hover{border-color:var(--accent);color:var(--accent);}
-  .lane .lane-row1 .chn-btn.ch16{color:#ffb454;border-color:#ffb45488;}
+  .lane .lane-row1 .chn-btn:hover,.note-info-left .chn-btn:hover{border-color:var(--accent);color:var(--accent);}
+  .lane .lane-row1 .chn-btn.ch16,.note-info-left .chn-btn.ch16{color:#ffb454;border-color:#ffb45488;}
   /* Lane colour — same click-to-cycle-LANE_COLORS swatch it always had,
      now living in row 1 next to Channel. */
   .lane .lane-row1 .swatch{width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
@@ -670,8 +769,9 @@
 
   /* Lane leftcol — now 2 rows (row 1 lives outside it, see above): row 2
      (× on the left; Val/Pos/Steps/Mute/Solo on the right) is the protected
-     floor that's always visible whenever a lane is expanded; row 3 (Tag
-     pill + the drag-to-reorder handle) hides first as a lane shrinks. */
+     floor that's always visible whenever a lane is expanded; row 3 (just
+     the Tag pill — the drag-to-reorder handle moved back to row 1 in
+     v0.9.13) hides first as a lane shrinks. */
   /* No overflow clipping here (deliberate — mixing overflow-x:hidden with
      overflow-y:visible gets normalized to overflow-y:auto by the CSS spec,
      which *still* creates a scroll container). Any non-"visible" overflow-y
@@ -713,32 +813,41 @@
     display:inline-flex;align-items:center;justify-content:center;}
   .mute-btn.on{background:var(--sel)!important;color:#1a1200!important;border-color:var(--sel)!important;}
   .solo-btn.on{background:var(--play)!important;color:#2a0808!important;border-color:var(--play)!important;}
-  /* Row 2: × (delete — the only destructive control) sits alone on the left
-     edge; Value/Position/Steps + Mute/Solo group together on the right via
-     .row2-right (Channel and Colour moved out to row 1). The space-between
-     split is the visual separation — × can't be hit by accident while
-     reaching for the other controls. Every icon/input is a real >=16px hit
-     target. */
+  /* Row 2 (v0.9.13 retune): × (delete — the only destructive control) sits
+     alone on the hard left edge; Mute/Solo sit alone on the hard right edge
+     (.row2-right); Value/Steps/Position now form their OWN center group
+     (.row2-center) instead of sharing .row2-right with Mute/Solo — three
+     flex children total, laid out with justify-content:space-between across
+     all three, which distributes the free space into the two gaps either
+     side of the center group instead of concentrating it all into one gap
+     next to × (the too-big-gap complaint) and reads as genuinely centered
+     rather than "whatever's left after the other two". */
   .lane .leftcol .row2{gap:3px;padding-bottom:1px;justify-content:space-between;flex-wrap:nowrap;}
-  .lane .leftcol .row2-right{display:flex;align-items:center;gap:3px;min-width:0;}
+  .lane .leftcol .row2-center{display:flex;align-items:center;gap:3px;min-width:0;}
+  .lane .leftcol .row2-right{display:flex;align-items:center;gap:3px;min-width:0;flex-shrink:0;}
   .lane .leftcol .row2 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
   .lane .leftcol .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40px;}
   .lane .leftcol .val-input{flex:0 1 40px;width:40px;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
-  .lane .leftcol .pos-input{flex:0 1 38px;width:38px;min-width:0;max-width:44px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
+  /* Widened to comfortably fit the largest realistic BBT string,
+     "1234.12.12.123" (4-digit bar.beat.16th.tick) — measured at ~84px wide
+     in this exact font/size (10px ui-monospace/Consolas/monospace); 100px
+     leaves headroom for border/padding plus font-fallback variance without
+     truncating. Previously 38px, which only fit "1.1.1." before clipping. */
+  .lane .leftcol .pos-input{flex:0 1 100px;width:100px;min-width:0;max-width:110px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
   .lane .leftcol .stepsn{flex:0 0 22px;width:22px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
   .lane .leftcol .stepsn::-webkit-outer-spin-button,
   .lane .leftcol .stepsn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
-  .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle,.lane .lane-row1 .move-btn{
+  .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle,.lane .lane-row1 .move-btn,.lane .lane-row1 .drag-handle{
     width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
     display:inline-flex;align-items:center;justify-content:center;
     border:1px solid transparent;border-radius:4px;background:none;color:var(--txt2);
     padding:0;line-height:1;flex-shrink:0;}
-  .lane .leftcol .x:hover,.lane .leftcol .move-btn:hover,.lane .leftcol .drag-handle:hover,.lane .lane-row1 .move-btn:hover{
+  .lane .leftcol .x:hover,.lane .leftcol .move-btn:hover,.lane .leftcol .drag-handle:hover,.lane .lane-row1 .move-btn:hover,.lane .lane-row1 .drag-handle:hover{
     border-color:var(--line);background:var(--panel2);}
   .lane .leftcol .move-btn,.lane .lane-row1 .move-btn{font-size:10px;cursor:pointer;}
   .lane .leftcol .move-btn:hover,.lane .lane-row1 .move-btn:hover{color:var(--accent);}
-  .lane .leftcol .drag-handle{font-size:12px;cursor:grab;user-select:none;}
-  .lane .leftcol .drag-handle:active{cursor:grabbing;}
+  .lane .leftcol .drag-handle,.lane .lane-row1 .drag-handle{font-size:12px;cursor:grab;user-select:none;}
+  .lane .leftcol .drag-handle:active,.lane .lane-row1 .drag-handle:active{cursor:grabbing;}
   .lane .leftcol .x{color:var(--txt2);cursor:pointer;font-size:15px;}
   .lane .leftcol .x:hover{color:#ff6b6b;border-color:#ff6b6b55;background:rgba(255,107,107,.12);}
   .lane.drag-over-top{border-top:2px solid var(--accent);}
@@ -1073,28 +1182,14 @@
 
     <div class="row vel-row" id="velRow">
       <div class="leftcol note-info-left" id="noteInfoLeft">
-        <div class="ni-header">
-          <span class="ni-empty" id="noteInfoEmpty">Note Info — no selection</span>
-          <span class="ni-title">Note Info</span>
+        <div class="ni-row">
           <button type="button" class="move-btn toggle-btn" id="niToggleBtn" title="Minimize Note Info">▾</button>
-        </div>
-        <div class="note-info-grid">
-          <div class="ni-col">
-            <span class="ni-lbl">Note</span>
-            <span id="noteInfoNote" class="ni-disp" title="Pitch of selected note(s)">—</span>
-          </div>
-          <div class="ni-col">
-            <span class="ni-lbl">Vel</span>
-            <input type="number" id="velValInput" class="ni-input" min="1" max="127" placeholder="—" title="Velocity — applies to all selected notes">
-          </div>
-          <div class="ni-col">
-            <span class="ni-lbl">Pos</span>
-            <input type="text" id="noteInfoPos" class="ni-input mono" placeholder="—" title="Position (Bar.Beat.16th.Tick) — shown when selected notes share the same start. Editing shifts all selected notes together.&#10;Scroll or ↑↓ = ±1 tick, Shift = ±1/16th, Ctrl = ±1 beat, Alt = ±1 bar">
-          </div>
-          <div class="ni-col">
-            <span class="ni-lbl">Ch</span>
-            <input type="number" id="noteInfoCh" class="ni-input" min="1" max="16" placeholder="—" title="Channel — applies to all selected notes">
-          </div>
+          <span class="ni-title">Note Info</span>
+          <span id="noteInfoNote" class="ni-note" title="Pitch of selected note(s)">—</span>
+          <span class="mini-lbl">V</span>
+          <input type="number" id="velValInput" class="ni-input" min="1" max="127" placeholder="—" title="Velocity — applies to all selected notes">
+          <input type="text" id="noteInfoPos" class="ni-input mono" placeholder="—" title="Position (Bar.Beat.16th.Tick) — shown when selected notes share the same start. Editing shifts all selected notes together.&#10;Scroll or ↑↓ = ±1 tick, Shift = ±1/16th, Ctrl = ±1 beat, Alt = ±1 bar">
+          <button type="button" id="noteInfoCh" class="chn-btn" title="Channel — applies to all selected notes">Ch—</button>
         </div>
       </div>
       <div class="scroll hx" id="velScroll"><canvas id="velCanvas"></canvas><span class="vel-gutter-lbl">VEL</span></div>
@@ -1558,9 +1653,9 @@
   [rulerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
 
   // ---------- Pane resize (grips) ----------
-  // A CC lane is row 1 (Toggle/CC/Name/Channel/Colour — always visible,
+  // A CC lane is row 1 (Toggle/CC/Name/Channel/Colour/Move — always visible,
   // outside .lanebody) + .lanebody's leftcol, which holds row 2 (×/Val/Pos/
-  // Steps/Mute/Solo) and row 3 (Tag pill/Move, when there's room). LANE_MIN_H
+  // Steps/Mute/Solo) and row 3 (Tag pill, when there's room). LANE_MIN_H
   // is the total-lane-height floor when shrinking a lane via the grip —
   // always enough for row 1 + row 2, never less, so those can never spill
   // out of the lane's own bounds. LANE_FULL_H is the total height at which
@@ -2095,32 +2190,39 @@
     // Velocity
     const vi=$('velValInput');
     if(vi){ vi.value=(!sel.length)?'':sel.every(n=>n.vel===sel[0].vel)?sel[0].vel:''; }
-    // Note pitch display
+    // Note pitch display — "A#4  82" (name, a couple of spaces, MIDI
+    // number; no colon) when every selected note shares a pitch, "—"
+    // otherwise (including nothing selected) — same placeholder convention
+    // the CC lane's V/P/S fields already use with no active point.
     const nn=$('noteInfoNote');
-    if(nn){ nn.textContent=(!sel.length)?'—':sel.every(n=>n.pitch===sel[0].pitch)?(noteLabel(sel[0].pitch)+':'+sel[0].pitch):'—'; }
+    if(nn){ nn.textContent=(!sel.length)?'—':sel.every(n=>n.pitch===sel[0].pitch)?(noteLabel(sel[0].pitch)+'  '+sel[0].pitch):'—'; }
     // Position (only shown when all selected notes share the same start)
     const np=$('noteInfoPos');
     if(np && document.activeElement!==np){ np.value=(!sel.length)?'':sel.every(n=>n.start===sel[0].start)?tickToBBT(sel[0].start):''; }
-    // Channel
+    // Channel — a button (opens the shared openChPopover(), same component
+    // the CC lane's row-1 Channel button uses) rather than a free-typing
+    // number field; see the click handler below for the popover wiring.
     const nc=$('noteInfoCh');
-    if(nc){ nc.value=(!sel.length)?'':sel.every(n=>n.ch===sel[0].ch)?(sel[0].ch+1):''; }
-    // Collapse to a single slim row when nothing is selected — a note or a
-    // CC point (ccSel, defined below, tracks the latter across all lanes).
-    // Field ids/editing behavior are unchanged; only visibility toggles.
+    if(nc){
+      const allSame=sel.length>0 && sel.every(n=>n.ch===sel[0].ch);
+      nc.textContent=allSame?('Ch'+(sel[0].ch+1)):'Ch—';
+      nc.classList.toggle('ch16',allSame&&sel[0].ch===15);
+    }
+    // Note Info is now a single row at ALL times (true one-row minimized
+    // view, v0.9.13) — minimized, expanded-with-nothing-selected, and
+    // expanded-with-a-selection all render the exact same row structure,
+    // just with "—" placeholders when nothing is selected (set above). The
+    // only thing .ni-collapsed still changes is whether the "Note Info"
+    // title shows (see the CSS) — there is no more separate collapsed-only
+    // placeholder element/DOM branch to swap in.
     // state.noteInfoManuallyCollapsed (set by the ▾/▸ toggle button) is a
     // SEPARATE, manual override: when on, it forces the collapsed look
-    // regardless of selection (the user wants the vertical space back even
-    // while something IS selected); when off, this auto behavior alone
-    // decides collapse state, unchanged from before.
+    // regardless of selection (the user wants the title's little bit of
+    // space back even while something IS selected); when off, this auto
+    // behavior alone decides collapse state, unchanged from before.
     const nil=$('noteInfoLeft');
     const autoCollapse=sel.length===0 && (typeof ccSel==='undefined'||ccSel.size===0);
     if(nil) nil.classList.toggle('ni-collapsed', state.noteInfoManuallyCollapsed || autoCollapse);
-    // The collapsed placeholder text says "no selection", which would be
-    // misleading if the box is showing collapsed only because of the manual
-    // override while something IS actually selected — swap in a label that
-    // reflects that instead.
-    const ne=$('noteInfoEmpty');
-    if(ne) ne.textContent=(state.noteInfoManuallyCollapsed && !autoCollapse)?'Note Info — minimized':'Note Info — no selection';
   }
   // keep old name as alias so velocity drag calls still work
   const updateVelValInput=updateNoteInfo;
@@ -2150,15 +2252,22 @@
       updateNoteInfo(); requestDraw();
     });
     vi.addEventListener('keydown',e=>{ if(e.key==='Enter') vi.blur(); });
-    // Channel
+    // Channel — a button that opens the shared openChPopover() (the exact
+    // same channel-picker UI/UX the CC lane's row-1 Channel button uses).
+    // Selecting a channel applies it to every currently-selected note,
+    // mirroring the pushUndo()+requestDraw() convention the old free-typing
+    // number input's change handler used.
     const nc=$('noteInfoCh');
-    nc.addEventListener('change',()=>{
-      if(!state.selection.size) return;
-      const ch=clamp((+nc.value||1)-1,0,15);
-      pushUndo(); state.notes.forEach(n=>{ if(state.selection.has(n.id)) n.ch=ch; });
-      updateNoteInfo(); requestDraw();
+    nc.addEventListener('click',e=>{
+      e.stopPropagation();
+      const sel=[...state.selection].map(byId).filter(Boolean);
+      const curCh=(sel.length&&sel.every(n=>n.ch===sel[0].ch))?sel[0].ch:0;
+      openChPopover(curCh,nc,(ch)=>{
+        if(!state.selection.size) return;
+        pushUndo(); state.notes.forEach(n=>{ if(state.selection.has(n.id)) n.ch=ch; });
+        updateNoteInfo(); requestDraw();
+      });
     });
-    nc.addEventListener('keydown',e=>{ if(e.key==='Enter') nc.blur(); });
     // Position — shifts all selected notes by the same delta, preserving their
     // relative offsets (rather than collapsing them onto one absolute tick).
     const np=$('noteInfoPos');
@@ -2505,17 +2614,24 @@
     return pop;
   }
   function closeChPopover(){ const pop=$('chPopover'); if(pop) pop.classList.remove('open'); }
-  function openChPopover(lane,btnEl,onSelect){
+  // Generalized: takes the CURRENTLY selected channel (0-15) rather than a
+  // lane object, and hands the picked channel number to onSelect(ch) instead
+  // of mutating anything itself — this is the one shared popover UI/UX for
+  // EVERY channel picker in the app (the CC lane's row-1 Channel button, and
+  // Note Info's Channel button), not a lane-specific component. Each caller
+  // applies the selection to whatever it actually represents (lane.ch for
+  // the CC lane; every selected note's .ch for Note Info).
+  function openChPopover(currentCh,btnEl,onSelect){
     const pop=ensureChPopover();
     pop.innerHTML='';
     for(let ch=0;ch<16;ch++){
       const name=state.channelNames[ch];
       const label=(ch+1)+(name?' ('+name+')':'');
       const opt=document.createElement('button'); opt.type='button';
-      opt.className='ch-opt'+(ch===15?' ch16':'')+(ch===lane.ch?' current':'');
+      opt.className='ch-opt'+(ch===15?' ch16':'')+(ch===currentCh?' current':'');
       opt.textContent=label;
       if(ch===15) opt.title='Channel 16 is reserved for the Follow MMV sync-track — notes sent here are silently dropped.';
-      opt.addEventListener('click',()=>{ lane.ch=ch; if(onSelect) onSelect(); closeChPopover(); });
+      opt.addEventListener('click',()=>{ if(onSelect) onSelect(ch); closeChPopover(); });
       pop.appendChild(opt);
     }
     pop.classList.add('open');
@@ -2543,9 +2659,16 @@
     const pop=ensureCcPopover();
     pop.innerHTML='';
     for(let cc=0;cc<128;cc++){
-      const name=ccName(cc);
-      const label=name?(cc+': '+name):String(cc);
-      const usedByOther=state.ccLanes.some(l=>l.ch===lane.ch&&l.cc===cc&&l.id!==lane.id);
+      // Prefer the actual custom name of whichever OTHER lane on this same
+      // channel already claims this CC — that's the name the user will
+      // actually recognize it by (e.g. "CutType"), not the generic GM
+      // default. Falls back to the GM default when that lane has no custom
+      // name of its own, and to the bare number when the CC is unused.
+      const usedLane=state.ccLanes.find(l=>l.ch===lane.ch&&l.cc===cc&&l.id!==lane.id);
+      const usedByOther=!!usedLane;
+      const gmName=ccName(cc);
+      const displayName=usedByOther&&usedLane.name?usedLane.name:gmName;
+      const label=displayName?(cc+': '+displayName):String(cc);
       const isCurrent=cc===lane.cc;
       const opt=document.createElement('button'); opt.type='button';
       opt.className='cc-opt'+(isCurrent?' current':'')+(usedByOther?' used':'');
@@ -2615,24 +2738,35 @@
         : 'MIDI Channel — click to change';
     }
     updateChnBtn();
-    chnBtn.addEventListener('click',e=>{ e.stopPropagation(); openChPopover(lane,chnBtn,()=>{ updateChnBtn(); }); });
+    chnBtn.addEventListener('click',e=>{ e.stopPropagation(); openChPopover(lane.ch,chnBtn,(ch)=>{ lane.ch=ch; updateChnBtn(); }); });
     row1.appendChild(chnBtn);
     // Lane colour — same click-to-cycle-LANE_COLORS swatch behavior as
     // always, also moved to row 1 (next to Channel).
     const swatch=document.createElement('button'); swatch.className='swatch'; swatch.type='button';
     swatch.style.background=lane.color; swatch.title='Lane color — click to change';
     row1.appendChild(swatch);
+    // Drag-to-reorder handle — back in row 1 (v0.9.13; a couple of rounds
+    // ago it moved to row 3 because row 1 didn't have room, but it does
+    // now). Living in row 1 (outside .lanebody, always visible) also
+    // restores the ability to drag-reorder a MINIMIZED lane without
+    // expanding it first — a capability lost when the handle moved out of
+    // row 1, noted as a known tradeoff at the time. See the mousedown/
+    // dragstart/etc wiring further below, unchanged apart from which row
+    // the element itself lives in.
+    const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
+    row1.appendChild(dragHandle);
 
     const grip=document.createElement('div'); grip.className='grip'; grip.title='Drag to resize this lane';
     const body=document.createElement('div'); body.className='lanebody';
     const left=document.createElement('div'); left.className='leftcol';
 
     // Row 2 (inside .leftcol — hidden along with the rest of .lanebody
-    // while minimized): Delete (×) — the only destructive control — sits
-    // alone on the left edge; Value/Position/Steps + Mute/Solo group
-    // together on the right, so × can never be hit by accident while
-    // reaching for the other controls. Every icon here is a real >=16px
-    // hit target with visible spacing between them.
+    // while minimized): Delete (×) hard left, Value/Position/Steps grouped
+    // and centered (.row2-center), Mute/Solo hard right (.row2-right) —
+    // three groups so × can never be hit by accident while reaching for the
+    // other controls, and the value fields read as genuinely centered in
+    // the row instead of just tacked on next to Mute/Solo. Every icon here
+    // is a real >=16px hit target with visible spacing between them.
     const row2=document.createElement('div'); row2.className='lr row2';
     const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
     const valLbl=document.createElement('span'); valLbl.className='mini-lbl'; valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
@@ -2651,12 +2785,13 @@
     stepsInput.value=lane.steps||0; stepsInput.placeholder='0';
     const muteBtn=document.createElement('button'); muteBtn.className='move-btn mute-btn'+(lane.muted?' on':''); muteBtn.textContent='M'; muteBtn.title='Mute this lane';
     const soloBtn=document.createElement('button'); soloBtn.className='move-btn solo-btn'+(lane.soloed?' on':''); soloBtn.textContent='S'; soloBtn.title='Solo this lane';
+    const row2Center=document.createElement('span'); row2Center.className='row2-center';
+    row2Center.appendChild(valLbl); row2Center.appendChild(valInput); row2Center.appendChild(stepBadge);
+    row2Center.appendChild(posLbl); row2Center.appendChild(posInput);
+    row2Center.appendChild(stpLbl); row2Center.appendChild(stepsInput);
     const row2Right=document.createElement('span'); row2Right.className='row2-right';
-    row2Right.appendChild(valLbl); row2Right.appendChild(valInput); row2Right.appendChild(stepBadge);
-    row2Right.appendChild(posLbl); row2Right.appendChild(posInput);
-    row2Right.appendChild(stpLbl); row2Right.appendChild(stepsInput);
     row2Right.appendChild(muteBtn); row2Right.appendChild(soloBtn);
-    row2.appendChild(xBtn); row2.appendChild(row2Right);
+    row2.appendChild(xBtn); row2.appendChild(row2Center); row2.appendChild(row2Right);
 
     // Row 3 (inside .leftcol): Tag pill (click-to-edit, flex-grow) on the
     // left, the drag-to-reorder handle aligned hard right.
@@ -2687,8 +2822,9 @@
     function exitTagEdit(){ ltags.style.display='none'; tagPill.style.display=''; renderTagPill(); }
     tagPill.addEventListener('click',enterTagEdit);
     tagPill.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); enterTagEdit(); } });
-    const dragHandle=document.createElement('span'); dragHandle.className='drag-handle'; dragHandle.textContent='⠿'; dragHandle.title='Drag to reorder';
-    row3.appendChild(tagPill); row3.appendChild(ltags); row3.appendChild(dragHandle);
+    // Row 3 now keeps just the Tag pill — the drag-to-reorder handle moved
+    // back to row 1 (see above).
+    row3.appendChild(tagPill); row3.appendChild(ltags);
 
     // Wrapped so it can be sticky-centered within the lane row: when a lane is
     // resized very tall (Alt+wheel), the row can exceed the viewport, and
@@ -2699,7 +2835,7 @@
     left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
 
-    const sc=document.createElement('div'); sc.className='scroll hx';
+    const sc=document.createElement('div'); sc.className='scroll hx lane-canvas-scroll';
     const cv=document.createElement('canvas'); sc.appendChild(cv);
     body.appendChild(left); body.appendChild(sc);
     row.appendChild(row1); row.appendChild(body); row.appendChild(grip);

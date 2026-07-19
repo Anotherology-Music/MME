@@ -1051,8 +1051,15 @@ async function run() {
   // ---------------- Note Info panel ----------------
 
   await withPage(browser, async (page) => {
-    const order = await page.evaluate(() => [...document.querySelectorAll('.note-info-grid .ni-col .ni-lbl')].map(el => el.textContent));
-    check('Note Info column order is Note, Vel, Pos, Ch', JSON.stringify(order) === JSON.stringify(['Note', 'Vel', 'Pos', 'Ch']), order);
+    // Note Info is a true single row (v0.9.13, replacing the old header-row
+    // + 4-column-grid layout): toggle, title (width-permitting), note
+    // details, V label+value, Position, Channel button — all direct
+    // children of #noteInfoLeft .ni-row, in that left-to-right order.
+    const order = await page.evaluate(() =>
+      [...document.querySelectorAll('#noteInfoLeft .ni-row > *')].map(el => el.id || el.className));
+    check('Note Info renders as one row: toggle, title, note, V-label, V, Pos, Ch — in order',
+      JSON.stringify(order) === JSON.stringify(['niToggleBtn', 'ni-title', 'noteInfoNote', 'mini-lbl', 'velValInput', 'noteInfoPos', 'noteInfoCh']),
+      order);
   });
 
   await withPage(browser, async (page) => {
@@ -1068,11 +1075,19 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
+    // Note Info's whole box is one row now (v0.9.13) — Note/V/Pos/Ch (and
+    // the toggle/title) all share the same top, not just Ch and Pos.
     const tops = await page.evaluate(() => {
       const r = (id) => document.getElementById(id).getBoundingClientRect().top;
-      return { pos: r('noteInfoPos'), ch: r('noteInfoCh'), note: r('noteInfoNote') };
+      return { pos: r('noteInfoPos'), ch: r('noteInfoCh'), note: r('noteInfoNote'), vel: r('velValInput'), toggle: r('niToggleBtn') };
     });
-    check('Note Info Ch sits on the same row as Pos (and Note)', tops.pos === tops.ch && tops.ch === tops.note, tops);
+    // Small tolerance: the row's children have slightly different natural
+    // heights (e.g. the 16px Channel button vs the 19px Pos/Vel inputs) and
+    // are vertically centered (align-items:center), so their tops can differ
+    // by a couple of px while still genuinely sharing the same flex row.
+    const vals = Object.values(tops);
+    const spread = Math.max(...vals) - Math.min(...vals);
+    check('Note Info Ch/Pos/Note/Vel/toggle all sit on the same single row', spread <= 3, tops);
   });
 
   // ---------------- Toolbar / Setup panel restructuring ----------------
@@ -1387,15 +1402,17 @@ async function run() {
 
   await withPage(browser, async (page) => {
     // Row 1's icon/button controls (Minimize/Maximize toggle, Channel,
-    // Colour swatch) must be real, unclipped, >=16px hit targets that a
-    // genuine pointer click can land on, in the order: toggle — CC# — Name
-    // — Channel — Colour.
+    // Colour swatch, Move/drag-to-reorder handle — back in row 1 as of
+    // v0.9.13) must be real, unclipped, >=16px hit targets that a genuine
+    // pointer click can land on, in the order: toggle — CC# — Name —
+    // Channel — Colour — Move.
     const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
     await page.waitForTimeout(50);
     const sel = {
       toggle: `.lane[data-id="${laneId}"] .toggle-btn`,
       chn: `.lane[data-id="${laneId}"] .lane-row1 .chn-btn`,
       swatch: `.lane[data-id="${laneId}"] .lane-row1 .swatch`,
+      drag: `.lane[data-id="${laneId}"] .lane-row1 .drag-handle`,
     };
     const hittable = await page.evaluate((sel) => {
       const out = {};
@@ -1410,7 +1427,7 @@ async function run() {
       }
       return out;
     }, sel);
-    check('every per-lane row-1 icon (Minimize toggle/Channel/swatch) has a real, unclipped hit target at its own screen coordinates',
+    check('every per-lane row-1 icon (Minimize toggle/Channel/swatch/Move) has a real, unclipped hit target at its own screen coordinates',
       Object.values(hittable).every(Boolean), hittable);
 
     const sizes = await page.evaluate((sel) => {
@@ -1421,16 +1438,16 @@ async function run() {
       }
       return out;
     }, sel);
-    check('per-lane row-1 toggle/Channel/swatch icons are all >=16px hit targets',
+    check('per-lane row-1 toggle/Channel/swatch/Move icons are all >=16px hit targets',
       Object.values(sizes).every(s => s.w >= 16 && s.h >= 16), sizes);
 
     const positions = await page.evaluate((laneId) => {
       const row = document.querySelector(`.lane[data-id="${laneId}"] .lane-row1`);
       const q = sel => row.querySelector(sel).getBoundingClientRect().left;
-      return { toggle: q('.toggle-btn'), ccn: q('.ccn'), lname: q('.lname'), chn: q('.chn-btn'), swatch: q('.swatch') };
+      return { toggle: q('.toggle-btn'), ccn: q('.ccn'), lname: q('.lname'), chn: q('.chn-btn'), swatch: q('.swatch'), drag: q('.drag-handle') };
     }, laneId);
-    check('row 1 layout: Toggle is left of CC#, which is left of Name, which is left of Channel, which is left of Colour',
-      positions.toggle < positions.ccn && positions.ccn < positions.lname && positions.lname < positions.chn && positions.chn < positions.swatch, positions);
+    check('row 1 layout: Toggle is left of CC#, which is left of Name, which is left of Channel, which is left of Colour, which is left of Move',
+      positions.toggle < positions.ccn && positions.ccn < positions.lname && positions.lname < positions.chn && positions.chn < positions.swatch && positions.swatch < positions.drag, positions);
 
     // Real Playwright pointer click (no force:true, no dispatchEvent) must
     // actually land and trigger the real behavior, not just report a
@@ -1497,29 +1514,29 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // Row 3: the drag-to-reorder handle sits at the row's right edge, after
-    // the (flex-grow) Tag pill. Still a real, unclipped, >=16px hit target.
+    // v0.9.13: the drag-to-reorder handle moved back to row 1 (after
+    // Colour) — row 3 now keeps just the Tag pill. Still a real, unclipped,
+    // >=16px hit target, and it's no longer present in row 3 at all.
     const laneId = await page.evaluate(() => window._TEST_addLane(31, 0));
     await page.waitForTimeout(50);
     const info = await page.evaluate((id) => {
       const row = document.querySelector(`.lane[data-id="${id}"]`);
-      const drag = row.querySelector('.row3 .drag-handle');
-      if (!drag) return { found: false };
+      const drag = row.querySelector('.lane-row1 .drag-handle');
+      const row3HasDrag = !!row.querySelector('.row3 .drag-handle');
+      if (!drag) return { found: false, row3HasDrag };
       const r = drag.getBoundingClientRect();
-      const pillRect = row.querySelector('.row3 .tag-pill').getBoundingClientRect();
-      const row3Rect = row.querySelector('.row3').getBoundingClientRect();
+      const swatchRect = row.querySelector('.lane-row1 .swatch').getBoundingClientRect();
       const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
       const hit = document.elementFromPoint(cx, cy);
       return {
-        found: true,
+        found: true, row3HasDrag,
         w: Math.round(r.width), h: Math.round(r.height),
         hittable: !!hit && (hit === drag || drag.contains(hit) || hit.contains(drag)),
-        afterTagPill: r.left >= pillRect.right - 1,
-        atRightEdge: Math.abs(r.right - row3Rect.right) < 20,
+        afterSwatch: r.left >= swatchRect.right - 1,
       };
     }, laneId);
-    check('row 3 (Tag pill + Move) ends with a real, unclipped, >=16px drag-to-reorder handle at the row\'s right edge',
-      info.found && info.w >= 16 && info.h >= 16 && info.hittable && info.afterTagPill && info.atRightEdge, info);
+    check('row 1 ends with a real, unclipped, >=16px drag-to-reorder handle after Colour, and row 3 no longer has one',
+      info.found && info.w >= 16 && info.h >= 16 && info.hittable && info.afterSwatch && info.row3HasDrag === false, info);
   });
 
   await withPage(browser, async (page) => {
@@ -1556,6 +1573,168 @@ async function run() {
     const afterMin = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).color, laneId);
     check('a real pointer click on the swatch still cycles the lane\'s color while the lane is minimized (same element, no duplicate)',
       afterMin !== beforeMin, { beforeMin, afterMin });
+  });
+
+  // ---------------- Row 2: Position field width + 3-way alignment (v0.9.13) ----------------
+
+  await withPage(browser, async (page) => {
+    // .pos-input widened to comfortably fit up to a 4-digit-bar BBT string
+    // ("1234.12.12.123") without truncating — previously only ~38px wide,
+    // enough for "1.1.1." before clipping.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const fit = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      const input = lane._posInput;
+      input.value = '1234.12.12.123';
+      return { value: input.value, clientWidth: input.clientWidth, scrollWidth: input.scrollWidth };
+    }, laneId);
+    check('the widened .pos-input comfortably fits the largest realistic BBT string ("1234.12.12.123") without truncating',
+      fit.scrollWidth <= fit.clientWidth + 1, fit);
+  });
+
+  await withPage(browser, async (page) => {
+    // Row 2 now has three explicit groups: × hard left, Value/Position/
+    // Steps grouped and CENTERED (.row2-center), Mute/Solo hard right
+    // (.row2-right) — not just "whatever's left after the other two".
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const layout = await page.evaluate((laneId) => {
+      const row = document.querySelector(`.lane[data-id="${laneId}"] .row2`);
+      const rowRect = row.getBoundingClientRect();
+      const center = row.querySelector('.row2-center').getBoundingClientRect();
+      const right = row.querySelector('.row2-right').getBoundingClientRect();
+      const x = row.querySelector('.x').getBoundingClientRect();
+      return {
+        rowCenterX: rowRect.left + rowRect.width / 2,
+        centerGroupMidX: center.left + center.width / 2,
+        xRight: x.right, centerLeft: center.left, centerRight: center.right, rightLeft: right.left,
+      };
+    }, laneId);
+    const offset = Math.abs(layout.rowCenterX - layout.centerGroupMidX);
+    check('row 2\'s Value/Position/Steps group reads as genuinely centered in the row (not lopsided toward either edge)',
+      offset <= 15, { offset, ...layout });
+    check('× stays left of the center group, which stays left of Mute/Solo (3-way split, not clipped/overlapping)',
+      layout.xRight <= layout.centerLeft + 1 && layout.centerRight <= layout.rightLeft + 1, layout);
+  });
+
+  // ---------------- CC lane: full-height curve canvas (v0.9.13) ----------------
+
+  await withPage(browser, async (page) => {
+    // The curve canvas now visually spans the lane's FULL height (row 1 +
+    // row 2 + row 3 combined) when expanded, not just rows 2+3 — reclaiming
+    // the "dead" strip to the right of row 1 that existed since v0.9.9 (row
+    // 1 became a sibling of .lanebody so it stays visible when minimized,
+    // which meant the curve canvas — a normal-flow child of .lanebody —
+    // only ever spanned .lanebody's own height).
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const info = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      const laneRect = lane._row.getBoundingClientRect();
+      const scrollRect = lane._scroll.getBoundingClientRect();
+      const row1Rect = lane._row.querySelector('.lane-row1').getBoundingClientRect();
+      const gripRect = lane._row.querySelector('.grip').getBoundingClientRect();
+      return {
+        laneTop: laneRect.top, laneBottom: laneRect.bottom,
+        scrollTop: scrollRect.top, scrollBottom: scrollRect.bottom,
+        row1Top: row1Rect.top, row1Bottom: row1Rect.bottom,
+        gripTop: gripRect.top,
+        canvasHeight: lane._canvas.height,
+      };
+    }, laneId);
+    check('the curve canvas starts at the very top of the lane (level with row 1), not below row 1',
+      Math.abs(info.scrollTop - info.laneTop) <= 1, info);
+    check('the curve canvas extends down to just above the grip (full lane height), not stopping at rows 2+3',
+      info.scrollBottom > info.row1Bottom + 10 && Math.abs(info.scrollBottom - info.gripTop) <= 2, info);
+    check('the canvas\'s own pixel height (._canvas.height) matches the full lane height, not just rows 2+3',
+      Math.abs(info.canvasHeight - (info.laneBottom - info.laneTop - 7)) <= 2, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // Minimized lane: canvas must still be FULLY hidden (a confirmed
+    // decision from an earlier round) — this is not regressed by the
+    // full-height change, since the canvas's scroll wrapper is still a DOM
+    // descendant of .lanebody, which display:none hides regardless of its
+    // own position:absolute.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.click(`.lane[data-id="${laneId}"] .toggle-btn`);
+    await page.waitForTimeout(50);
+    const info = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      const r = lane._scroll.getBoundingClientRect();
+      return {
+        lanebodyDisplay: getComputedStyle(lane._row.querySelector('.lanebody')).display,
+        scrollVisible: r.width > 0 && r.height > 0,
+      };
+    }, laneId);
+    check('a minimized lane still shows NO canvas at all (the full-height change did not regress this)',
+      info.lanebodyDisplay === 'none' && info.scrollVisible === false, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // Click-to-value hit-testing must still resolve to the correct value
+    // given the new taller canvas — the Y math (laneCoords()/
+    // y2valForLane()) reads off lane._scroll's own getBoundingClientRect()
+    // and lane._canvas.height, both of which now reflect the full lane
+    // height, so this should "just work" without touching the hit-test math
+    // itself. Use the existing _TEST_laneClientPos bridge (computes real
+    // screen coordinates for a given tick/value) to click a specific value.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.evaluate(() => { window._TEST_state.tool = 'draw'; }); // pencil tool creates a point on mousedown unconditionally
+    const pos = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 480, 100), laneId);
+    await page.mouse.click(pos.x, pos.y);
+    await page.waitForTimeout(30);
+    const pt = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      return lane.points.find(p => Math.abs(p.t - 480) < 20);
+    }, laneId);
+    check('clicking at a computed (tick,value) screen position on the full-height canvas still creates a point at the correct value',
+      !!pt && Math.abs(pt.v - 100) <= 2, pt);
+  });
+
+  await withPage(browser, async (page) => {
+    // The grip still resizes the lane's overall height, and the canvas
+    // grows/shrinks along with it (its CSS height is derived from the
+    // lane's own height via top:0/bottom:7px, not a fixed value).
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const before = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      return { rowH: lane._row.offsetHeight, canvasH: lane._canvas.height };
+    }, laneId);
+    const gripBox = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      const r = lane._row.querySelector('.grip').getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }, laneId);
+    await page.mouse.move(gripBox.x, gripBox.y);
+    await page.mouse.down();
+    await page.mouse.move(gripBox.x, gripBox.y + 80, { steps: 4 });
+    await page.mouse.up();
+    await page.waitForTimeout(50);
+    const after = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      return { rowH: lane._row.offsetHeight, canvasH: lane._canvas.height };
+    }, laneId);
+    check('dragging the grip resizes the lane, and the canvas grows along with it',
+      after.rowH > before.rowH + 40 && after.canvasH > before.canvasH + 40, { before, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // Horizontal scroll sync: scrolling the timeline still keeps the
+    // curve's horizontal position correct relative to the ruler/piano-roll/
+    // other lanes — worth re-confirming since the canvas's scroll wrapper
+    // switched from normal flex flow to position:absolute.
+    const laneId = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    await page.evaluate(() => { window._TEST_state.pxPerTick = 0.5; window._TEST_requestDraw(); });
+    await page.evaluate(() => { document.getElementById('prScroll').scrollLeft = 300; });
+    await page.waitForTimeout(50);
+    const synced = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      return {
+        prScrollLeft: document.getElementById('prScroll').scrollLeft,
+        laneScrollLeft: lane._scroll.scrollLeft,
+      };
+    }, laneId);
+    check('scrolling the timeline keeps the CC lane canvas horizontally in sync with the piano roll',
+      synced.laneScrollLeft === synced.prScrollLeft && synced.prScrollLeft === 300, synced);
   });
 
   // ---------------- Channel picker popover ----------------
@@ -1628,40 +1807,44 @@ async function run() {
       closedAfterEscape, closedAfterEscape);
   });
 
-  // ---------------- Minimized-lane drag-to-reorder (v0.9.9 behavior change) ----------------
+  // ---------------- Minimized-lane drag-to-reorder (v0.9.13: restored) ----------------
 
   await withPage(browser, async (page) => {
-    // v0.9.9 tradeoff: since the old duplicate .lane-top-bar (and its own
-    // ⠿ tb-drag handle) is gone, row 3 — the only place the drag handle now
-    // lives — is hidden along with the rest of .lanebody while a lane is
-    // minimized, so a minimized lane can no longer be reordered without
-    // first maximizing it. Confirm that's true (no usable drag handle while
-    // minimized), and that maximizing restores full drag-to-reorder via the
-    // same row-3 handle used by any expanded lane — this drives a real
-    // HTML5 DnD sequence (mousedown arms row.draggable, then dragstart/
-    // dragover/drop) rather than just checking the element exists.
+    // v0.9.9 moved the drag-to-reorder handle out of row 1 into row 3
+    // (hidden along with the rest of .lanebody while minimized) because row
+    // 1 didn't have room; that meant a minimized lane could no longer be
+    // reordered without maximizing it first. v0.9.13 moves the handle back
+    // into row 1 (after Colour) now that there's room, which — as a direct
+    // consequence — restores the ability to drag-reorder a MINIMIZED lane
+    // without expanding it first. This test proves the NEW capability
+    // (replacing the old test that proved the opposite limitation): the
+    // handle stays usable while minimized, and a real HTML5 DnD sequence
+    // (mousedown arms row.draggable, then dragstart/dragover/drop) actually
+    // reorders a minimized lane.
     const idA = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
     const idB = await page.evaluate(() => window._TEST_addLane(50, 0));
     await page.waitForTimeout(50);
     await page.click(`.lane[data-id="${idB}"] .toggle-btn`);
     await page.waitForTimeout(50);
-    const minimizedDragUsable = await page.evaluate((idB) => {
+    const minimizedState = await page.evaluate((idB) => {
       const rowB = document.querySelector(`.lane[data-id="${idB}"]`);
-      const dragHandle = rowB.querySelector('.row3 .drag-handle');
-      return !!dragHandle && dragHandle.getBoundingClientRect().height > 0;
+      const dragHandle = rowB.querySelector('.lane-row1 .drag-handle');
+      return {
+        hidden: rowB.classList.contains('lane-hidden'),
+        dragUsable: !!dragHandle && dragHandle.getBoundingClientRect().height > 0,
+      };
     }, idB);
-    check('a minimized lane has no usable drag-to-reorder handle (row 3 is hidden along with the rest of .lanebody)',
-      minimizedDragUsable === false, minimizedDragUsable);
+    check('a minimized lane\'s row-1 drag-to-reorder handle is still a real, visible, usable hit target',
+      minimizedState.hidden === true && minimizedState.dragUsable === true, minimizedState);
 
-    // Maximize it back and confirm the SAME row-3 handle now works.
-    await page.click(`.lane[data-id="${idB}"] .toggle-btn`);
-    await page.waitForTimeout(50);
+    // Actually drag-reorder it WHILE STILL MINIMIZED (no maximize step).
     const orderBefore = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
     const result = await page.evaluate(({ idA, idB }) => {
       const rowA = document.querySelector(`.lane[data-id="${idA}"]`);
       const rowB = document.querySelector(`.lane[data-id="${idB}"]`);
-      const dragHandle = rowB.querySelector('.row3 .drag-handle');
-      if (!dragHandle) return { error: 'no row-3 drag handle on the maximized lane' };
+      if (!rowB.classList.contains('lane-hidden')) return { error: 'lane B unexpectedly not minimized' };
+      const dragHandle = rowB.querySelector('.lane-row1 .drag-handle');
+      if (!dragHandle) return { error: 'no row-1 drag handle on the minimized lane' };
       dragHandle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       if (!rowB.draggable) return { error: 'row.draggable not armed by drag-handle mousedown', draggable: rowB.draggable };
       const dt = new DataTransfer();
@@ -1674,7 +1857,7 @@ async function run() {
     }, { idA, idB });
     await page.waitForTimeout(50);
     const orderAfter = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
-    check('after maximizing, the same row-3 Move handle enables a functional drag-to-reorder',
+    check('a MINIMIZED lane can be drag-reordered via row 1\'s Move handle, with no maximize step required',
       !result.error && orderBefore.indexOf(idB) > orderBefore.indexOf(idA) && orderAfter.indexOf(idB) < orderAfter.indexOf(idA),
       { result, orderBefore, orderAfter });
   });
@@ -3189,6 +3372,18 @@ async function run() {
       return r.height > 8 && getComputedStyle(inp).display !== 'none' && getComputedStyle(inp).visibility !== 'hidden';
     }, ids[ids.length - 1]);
     check('the last of many expanded lanes still has a genuinely visible (non-zero-height) name field', nameVisible, nameVisible);
+
+    // v0.9.13: the curve canvas is now absolutely positioned to span the
+    // lane's FULL height (not just rows 2+3), re-verify this crush-guard
+    // scenario still leaves every canvas a real, non-crushed height too —
+    // the same class of regression this whole test exists to catch, now
+    // extended to the new canvas-sizing mechanism.
+    const canvasHeights = await page.evaluate((ids) => ids.map(id => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === id);
+      return lane._canvas.height;
+    }), ids);
+    check('with 27 expanded lanes, every lane\'s curve canvas still has a real, non-crushed height (>=64px, matching its lane)',
+      canvasHeights.every(h => h >= 64), canvasHeights);
   });
 
   // ---------------- Autosave & crash recovery ----------------
@@ -3360,12 +3555,20 @@ async function run() {
       Array.isArray(tapped) && tapped.every(m => m === false), tapped);
   });
 
-  // ---------------- Note Info: equal columns + manual minimize toggle ----------------
+  // ---------------- Note Info: true one-row layout (v0.9.13) ----------------
 
   await withPage(browser, async (page) => {
-    // Force the box open (a note selected) so the grid actually has layout
-    // to measure — with nothing selected it's auto-collapsed and every
-    // column would trivially measure 0.
+    // Exactly ONE row in the DOM at all times — minimized, expanded with
+    // nothing selected, and expanded with a selection all render the same
+    // single .ni-row; there is no more separate collapsed-only placeholder
+    // element/DOM branch swapped in (the old .ni-empty / .note-info-grid
+    // pair from before v0.9.13). Verify by counting #noteInfoLeft's own
+    // direct children, and confirm the box's own height doesn't grow when a
+    // selection appears (proof there's no second row hiding underneath).
+    const rowCountNoSel = await page.evaluate(() => document.querySelectorAll('#noteInfoLeft > *').length);
+    check('Note Info has exactly one direct child row with nothing selected', rowCountNoSel === 1, rowCountNoSel);
+    const heightNoSel = await page.evaluate(() => document.getElementById('noteInfoLeft').getBoundingClientRect().height);
+
     await page.evaluate(() => {
       const n = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 };
       window._TEST_state.notes.push(n);
@@ -3373,18 +3576,141 @@ async function run() {
       window._TEST_state.selection.add(n.id);
       window._TEST_updateNoteInfo();
     });
-    const widths = await page.evaluate(() =>
-      [...document.querySelectorAll('#noteInfoLeft .ni-col')].map(c => Math.round(c.getBoundingClientRect().width)));
-    check('Note Info renders exactly 4 columns (Note/Vel/Pos/Ch)', widths.length === 4, widths);
-    check('Note Info\'s 4 columns are all equal width (grid-template-columns: 1fr 1fr 1fr 1fr, not 0.5fr for Note)',
-      widths.every(w => Math.abs(w - widths[0]) <= 1), widths);
+    const rowCountSel = await page.evaluate(() => document.querySelectorAll('#noteInfoLeft > *').length);
+    const heightSel = await page.evaluate(() => document.getElementById('noteInfoLeft').getBoundingClientRect().height);
+    check('Note Info still has exactly one direct child row once a note is selected', rowCountSel === 1, rowCountSel);
+    check('Note Info\'s rendered height does not grow when a note is selected (no second row appears)',
+      Math.abs(heightSel - heightNoSel) <= 1, { heightNoSel, heightSel });
+
+    await page.click('#niToggleBtn');
+    const rowCountMin = await page.evaluate(() => document.querySelectorAll('#noteInfoLeft > *').length);
+    const heightMin = await page.evaluate(() => document.getElementById('noteInfoLeft').getBoundingClientRect().height);
+    check('Note Info still has exactly one direct child row when manually minimized (with a note still selected)',
+      rowCountMin === 1, rowCountMin);
+    check('minimizing does not grow Note Info\'s own height either (true one-row minimized view)',
+      heightMin <= heightSel + 1, { heightSel, heightMin });
   });
 
   await withPage(browser, async (page) => {
-    // Manual minimize/maximize toggle (#niToggleBtn) — a NEW mechanism,
-    // separate from the existing auto-collapse-on-no-selection behavior,
-    // that must coexist with it: off, it defers entirely to auto-collapse;
-    // on, it force-collapses regardless of selection.
+    // "NOTE INFO" only renders when the leftcol is wide enough not to
+    // crowd the row's other fields — a real layout collapse (the title
+    // contributes zero width when hidden, via a CSS container query keyed
+    // off this element's own inline size, which tracks var(--keys-w)
+    // exactly like the CC lanes' leftcol) — tested at a few different
+    // widths, not just one boundary guess. A note must be selected (i.e.
+    // Note Info is EXPANDED, not auto-collapsed) to isolate this width-only
+    // behavior from the separate .ni-collapsed rule, which always hides the
+    // title regardless of width — that's covered by its own test elsewhere.
+    await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      window._TEST_updateNoteInfo();
+    });
+    async function setKeysW(w) {
+      await page.evaluate((w) => {
+        window._TEST_state.keysW = w;
+        document.documentElement.style.setProperty('--keys-w', w + 'px');
+      }, w);
+      await page.waitForTimeout(30);
+    }
+    async function titleInfo() {
+      return page.evaluate(() => {
+        const el = document.querySelector('#noteInfoLeft .ni-title');
+        const cs = getComputedStyle(el);
+        return { display: cs.display, width: el.getBoundingClientRect().width };
+      });
+    }
+    await setKeysW(300);
+    const wide = await titleInfo();
+    check('at the default 300px --keys-w, the "Note Info" title shows and takes real width',
+      wide.display !== 'none' && wide.width > 0, wide);
+
+    await setKeysW(220);
+    const mid = await titleInfo();
+    check('at 220px --keys-w (still above the crowding threshold), the title still shows',
+      mid.display !== 'none' && mid.width > 0, mid);
+
+    await setKeysW(150);
+    const narrow = await titleInfo();
+    check('at 150px --keys-w (below the crowding threshold), the title hides entirely (display:none, zero width)',
+      narrow.display === 'none' && narrow.width === 0, narrow);
+  });
+
+  await withPage(browser, async (page) => {
+    // Note details format: "<name>  <pitch>" — a couple of spaces, no
+    // colon (changed from the old "A#4:82").
+    const pitch = 70;
+    await page.evaluate((pitch) => {
+      const n = { id: window._TEST_state.nextId++, pitch, start: 0, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(n.id);
+      window._TEST_updateNoteInfo();
+    }, pitch);
+    const text = await page.evaluate(() => document.getElementById('noteInfoNote').textContent);
+    const expectedName = await page.evaluate((pitch) => window._TEST_noteName(pitch), pitch);
+    check('Note Info note-details format is "<name>  <pitch>" (two spaces, no colon)',
+      text === (expectedName + '  ' + pitch) && !text.includes(':'), { text, expectedName, pitch });
+  });
+
+  await withPage(browser, async (page) => {
+    // Nothing selected -> "—" placeholders in note-details/V/Pos and a
+    // "Ch—" channel button, same convention the CC lane's V/P/S fields
+    // already use with no active point.
+    const placeholders = await page.evaluate(() => ({
+      note: document.getElementById('noteInfoNote').textContent,
+      vel: document.getElementById('velValInput').value,
+      pos: document.getElementById('noteInfoPos').value,
+      ch: document.getElementById('noteInfoCh').textContent,
+    }));
+    check('with nothing selected, Note Info shows "—" placeholders (note/vel/pos) and "Ch—"',
+      placeholders.note === '—' && placeholders.vel === '' && placeholders.pos === '' && placeholders.ch === 'Ch—', placeholders);
+  });
+
+  await withPage(browser, async (page) => {
+    // Channel is now a button (not a free-typing number field) that opens
+    // the SAME shared #chPopover the CC lane's row-1 Channel button uses —
+    // openChPopover() was generalized in v0.9.13 to take a channel number
+    // instead of a lane object. Verify it opens, lists all 16 channels, and
+    // selecting one applies to EVERY currently-selected note.
+    const ids = await page.evaluate(() => {
+      const a = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 };
+      const b = { id: window._TEST_state.nextId++, pitch: 64, start: 240, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(a, b);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(a.id); window._TEST_state.selection.add(b.id);
+      window._TEST_updateNoteInfo();
+      return [a.id, b.id];
+    });
+    const btnBefore = await page.evaluate(() => document.getElementById('noteInfoCh').textContent);
+    check('Note Info\'s Channel control is a button labeled "Ch N" (both notes share channel 1)', btnBefore === 'Ch1', btnBefore);
+
+    await page.click('#noteInfoCh');
+    await page.waitForTimeout(30);
+    const popState = await page.evaluate(() => ({
+      open: document.getElementById('chPopover').classList.contains('open'),
+      count: document.querySelectorAll('#chPopover .ch-opt').length,
+    }));
+    check('Note Info\'s Channel button opens the shared #chPopover listing all 16 channels',
+      popState.open && popState.count === 16, popState);
+
+    await page.click('#chPopover .ch-opt:nth-child(9)'); // channel index 8 (Ch9)
+    await page.waitForTimeout(30);
+    const chsAfter = await page.evaluate((ids) => ids.map(id => window._TEST_state.notes.find(n => n.id === id).ch), ids);
+    const btnAfter = await page.evaluate(() => document.getElementById('noteInfoCh').textContent);
+    check('selecting a channel from the popover applies it to every currently-selected note, and updates the button label',
+      chsAfter.every(ch => ch === 8) && btnAfter === 'Ch9', { chsAfter, btnAfter });
+  });
+
+  await withPage(browser, async (page) => {
+    // Manual minimize/maximize toggle (#niToggleBtn) — independent of the
+    // existing auto-collapse-on-no-selection behavior, but now that Note
+    // Info is a single row at all times, the only thing collapsing actually
+    // changes is the "Note Info" title's visibility (forced hidden
+    // regardless of width) — the note/vel/pos/ch fields keep showing their
+    // real values throughout.
     const noSel = await page.evaluate(() => ({
       collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
@@ -3404,29 +3730,31 @@ async function run() {
       withSel === false, withSel);
 
     // Manually collapse WHILE a note is selected — the whole point of this
-    // toggle: reclaim vertical space even with something selected.
+    // toggle: force the title away even with something selected.
     await page.click('#niToggleBtn');
     const manualWithSel = await page.evaluate(() => ({
       collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
       selSize: window._TEST_state.selection.size,
       glyph: document.getElementById('niToggleBtn').textContent,
-      emptyLabel: document.getElementById('noteInfoEmpty').textContent,
+      titleHidden: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display === 'none',
+      noteText: document.getElementById('noteInfoNote').textContent,
     }));
-    check('the manual toggle force-collapses Note Info even while a note IS selected',
-      manualWithSel.collapsed === true && manualWithSel.manual === true && manualWithSel.selSize === 1 && manualWithSel.glyph === '▸',
-      manualWithSel);
-    check('the collapsed placeholder does not falsely claim "no selection" when manually collapsed with a real selection',
-      manualWithSel.emptyLabel === 'Note Info — minimized', manualWithSel.emptyLabel);
+    check('the manual toggle force-collapses Note Info (hides the title) even while a note IS selected',
+      manualWithSel.collapsed === true && manualWithSel.manual === true && manualWithSel.selSize === 1
+      && manualWithSel.glyph === '▸' && manualWithSel.titleHidden === true, manualWithSel);
+    check('manually collapsing does NOT blank the still-selected note\'s own info — only the title hides',
+      manualWithSel.noteText !== '—' && manualWithSel.noteText.length > 0, manualWithSel.noteText);
 
-    // Toggling back off defers to auto-collapse again (still selected -> expanded).
+    // Toggling back off defers to auto-collapse again (still selected -> expanded, title shows).
     await page.click('#niToggleBtn');
     const backToAuto = await page.evaluate(() => ({
       collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
+      titleShown: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display !== 'none',
     }));
-    check('un-toggling the manual override hands control back to auto-collapse (expanded, since a note is still selected)',
-      backToAuto.collapsed === false && backToAuto.manual === false, backToAuto);
+    check('un-toggling the manual override hands control back to auto-collapse (expanded, title shows again)',
+      backToAuto.collapsed === false && backToAuto.manual === false && backToAuto.titleShown === true, backToAuto);
 
     // Clearing the selection while the manual toggle is off returns to
     // auto-collapsed — proving the manual flag didn't get stuck "on" and
@@ -3586,6 +3914,42 @@ async function run() {
       after.cc === 50 && after.btnText === '50' && after.btnTitle.includes('50') && after.lnamePlaceholder.length > 0,
       after);
     check('selecting a CC from the popover closes it', after.popOpen === false, after.popOpen);
+  });
+
+  await withPage(browser, async (page) => {
+    // v0.9.13 fix: a CC already used by another lane on the same channel
+    // should show that lane's own CUSTOM name in the popover label (e.g.
+    // "18: CutType"), not the generic GM default — falling back to the GM
+    // default only when the lane using it has no custom name of its own,
+    // and to the bare number when the CC is genuinely unused. The
+    // used/amber-highlight logic itself is unchanged (already correct);
+    // only the label TEXT is being fixed here.
+    const lane0 = await page.evaluate(() => window._TEST_state.ccLanes[0].id); // baseline CC1, Ch0
+    const namedLaneId = await page.evaluate(() => window._TEST_addLane(18, 0)); // GM default: "General Purpose Slider 3"
+    await page.evaluate((id) => {
+      const l = window._TEST_state.ccLanes.find(x => x.id === id);
+      l.name = 'CutType';
+    }, namedLaneId);
+    await page.evaluate(() => window._TEST_addLane(19, 0)); // used, but no custom name -> GM default should still show
+    await page.waitForTimeout(50);
+
+    await page.click(`.lane[data-id="${lane0}"] .lane-row1 .ccn`);
+    await page.waitForTimeout(30);
+    const info = await page.evaluate(() => {
+      const pop = document.getElementById('ccPopover');
+      const opts = [...pop.querySelectorAll('.cc-opt')];
+      return {
+        customNamedText: opts[18] ? opts[18].textContent : null, // CC 18, used by the "CutType" lane
+        customNamedClass: opts[18] ? opts[18].className : '',
+        fallbackGmText: opts[19] ? opts[19].textContent : null,  // CC 19, used but no custom name -> GM default
+      };
+    });
+    check('a used CC whose lane has a custom name shows that CUSTOM name, not the GM default (e.g. "18: CutType")',
+      info.customNamedText === '18: CutType', info.customNamedText);
+    check('the custom-named entry is still flagged "used" (amber) — only the label text changed, not the highlight logic',
+      info.customNamedClass.includes('used'), info.customNamedClass);
+    check('a used CC whose lane has NO custom name still falls back to the GM default name',
+      info.fallbackGmText === '19: General Purpose Slider 4', info.fallbackGmText);
   });
 
   await withPage(browser, async (page) => {
