@@ -114,7 +114,7 @@ function buildTestHtml() {
       '    window._TEST_openMigrateSheetById=(id)=>openMigrateSheet(state.isfHistory.find(e=>e.id===id));',
       '    window._TEST_isLaneAutomated=(id)=>isLaneAutomated(state.ccLanes.find(l=>l.id===id));',
       '    window._TEST_computeModifiers=(row)=>computeModifiers(row);',
-      '    window._TEST_ccToNative=(row,cc)=>ccToNative(row,cc);',
+      '    window._TEST_midiToNative=(row,lane,rawVal)=>midiToNative(row,lane,rawVal);',
       '    function openMigrateSheet(entry){',
     ].join('\n')
   );
@@ -2186,9 +2186,18 @@ async function run() {
     check('computeModifiers: irregular VALUES spacing flags a warning instead of guessing a Step',
       modsWeird.step === null && !!modsWeird.warning, modsWeird);
 
-    const native0 = await page.evaluate((r) => window._TEST_ccToNative(r, 0), girdleRow);
-    const native127 = await page.evaluate((r) => window._TEST_ccToNative(r, 127), girdleRow);
-    check('ccToNative maps CC 0 -> MIN and CC 127 -> MAX', Math.abs(native0 - 0.1) < 1e-9 && Math.abs(native127 - 10) < 1e-9, { native0, native127 });
+    const ccLaneLike = { type: 'cc' };
+    const pbLaneLike = { type: 'pb' };
+    const native0 = await page.evaluate(({ r, l }) => window._TEST_midiToNative(r, l, 0), { r: girdleRow, l: ccLaneLike });
+    const native127 = await page.evaluate(({ r, l }) => window._TEST_midiToNative(r, l, 127), { r: girdleRow, l: ccLaneLike });
+    check('midiToNative maps CC 0 -> MIN and CC 127 -> MAX', Math.abs(native0 - 0.1) < 1e-9 && Math.abs(native127 - 10) < 1e-9, { native0, native127 });
+
+    const pbMin = await page.evaluate(({ r, l }) => window._TEST_midiToNative(r, l, -8192), { r: girdleRow, l: pbLaneLike });
+    const pbMax = await page.evaluate(({ r, l }) => window._TEST_midiToNative(r, l, 8191), { r: girdleRow, l: pbLaneLike });
+    const pbMid = await page.evaluate(({ r, l }) => window._TEST_midiToNative(r, l, 0), { r: girdleRow, l: pbLaneLike });
+    check('midiToNative reads a Pitch Bend lane\'s -8192..8191 range instead of CC\'s 0..127 (same row, same MIN/MAX, different transport)',
+      Math.abs(pbMin - 0.1) < 1e-9 && Math.abs(pbMax - 10) < 1e-6 && Math.abs(pbMid - (0.1 + 10) / 2) < 0.01,
+      { pbMin, pbMax, pbMid });
   });
 
   await withPage(browser, async (page) => {
@@ -2265,7 +2274,7 @@ async function run() {
       const cutInput = newHeader && newHeader.INPUTS.find(i => i.NAME === 'CutType');
       // playhead is at tick 0; CutType's lane still holds only its import-time
       // default CC (round((1-0)/7*127) = 18), so baking it back through
-      // ccToNative should land on 18/127*7 = 126/127, not the original 1 —
+      // midiToNative should land on 18/127*7 = 126/127, not the original 1 —
       // this is the CC-quantization loss the feature is expected to apply,
       // not a bug to round away.
       check('Exported ISF rewrites a static parameter\'s DEFAULT to the playhead-derived native value (through real CC quantization)',
@@ -2559,6 +2568,147 @@ async function run() {
     const aspectInput = newHeader.INPUTS.find(i => i.NAME === 'AspectXZ');
     check('Exported ISF recombines AspectXZ X/Y back into a single 2-element DEFAULT array, not two orphaned fields',
       Array.isArray(aspectInput.DEFAULT) && aspectInput.DEFAULT.length === 2, aspectInput);
+  });
+
+  // ---------------- ISF import: Pitch Bend rows (higher-resolution MIDI) ----------------
+
+  await withPage(browser, async (page) => {
+    // Ticking PB for a row must: disable/ignore its CC# on import, create a
+    // type:'pb' lane instead of 'cc', and seed it with the PB-scaled
+    // default (defaultPbVal, -8192..8191) rather than the CC-scaled one.
+    const header = { INPUTS: [{ NAME: 'RotManualZ', TYPE: 'float', MIN: 0, MAX: 360, DEFAULT: 90 }] };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'rot.fs'), header);
+    await page.waitForTimeout(100);
+    await page.evaluate(() => {
+      const cbs = document.querySelectorAll('#isfDialog tbody tr input[type=checkbox]');
+      cbs[0].click(); // Import
+      cbs[1].click(); // PB
+    });
+    await page.waitForTimeout(80);
+    const midiDefaultShown = await page.evaluate(() => document.querySelector('#isfDialog tbody tr').querySelectorAll('td')[7].textContent);
+    // DEFAULT=90 of MIN=0..MAX=360 is exactly 1/4 of the way up: round(0.25*16383)-8192 = -4096
+    check('PB row shows the PB-scaled default (not the CC-scaled one) in the MIDI Default column', midiDefaultShown === '-4096', midiDefaultShown);
+
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+    const lane = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.isf && l.isf.name === 'RotManualZ'));
+    check('A PB-ticked row creates a type:"pb" lane (not "cc")', lane && lane.type === 'pb', lane);
+    check('The PB lane\'s starting point uses the PB-scaled default, not the CC one', lane && lane.points[0].v === -4096, lane && lane.points[0]);
+  });
+
+  await withPage(browser, async (page) => {
+    // Pitch Bend is one 14-bit stream per MIDI channel, not per-CC-number,
+    // so two rows both ticked PB on the same channel must conflict with
+    // EACH OTHER even though neither is a real lane yet — a collision
+    // regular CC conflict-checking (which keys on channel+CC#) never has to
+    // consider. Changing one row's channel must clear it.
+    const header = { INPUTS: [
+      { NAME: 'RotManualZ', TYPE: 'float', MIN: 0, MAX: 360, DEFAULT: 0 },
+      { NAME: 'RotManualY', TYPE: 'float', MIN: 0, MAX: 360, DEFAULT: 0 },
+    ]};
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'rot2.fs'), header);
+    await page.waitForTimeout(100);
+    await page.evaluate(() => {
+      document.querySelectorAll('#isfDialog tbody tr').forEach(tr => {
+        const cbs = tr.querySelectorAll('input[type=checkbox]');
+        cbs[0].click(); cbs[1].click(); // Import + PB, both default to channel 1
+      });
+    });
+    await page.waitForTimeout(80);
+    const conflictsBefore = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody tr')).map(tr => Array.from(tr.querySelectorAll('span')).find(s => s.textContent.includes('conflict')).style.display !== 'none'));
+    check('Two rows both ticked PB on the same channel conflict with EACH OTHER (within-batch, no real lane exists yet)',
+      conflictsBefore[0] === true && conflictsBefore[1] === true, conflictsBefore);
+
+    // Move row 2 to channel 2 (Ch input is the last <td> in the row)
+    await page.evaluate(() => {
+      const rows = document.querySelectorAll('#isfDialog tbody tr');
+      const chInput = rows[1].querySelector('td:last-child input');
+      chInput.value = '2';
+      chInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.waitForTimeout(80);
+    const conflictsAfter = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody tr')).map(tr => Array.from(tr.querySelectorAll('span')).find(s => s.textContent.includes('conflict')).style.display !== 'none'));
+    check('Moving one row to a different channel clears the PB conflict for both rows', conflictsAfter[0] === false && conflictsAfter[1] === false, conflictsAfter);
+
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+
+    // A THIRD row importing onto channel 1 (already occupied by RotManualZ's
+    // now-real PB lane) must conflict against that real lane too, not just
+    // against other rows in the same dialog.
+    const header2 = { INPUTS: [{ NAME: 'AnotherRot', TYPE: 'float', MIN: 0, MAX: 100, DEFAULT: 0 }] };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'rot3.fs'), header2);
+    await page.waitForTimeout(100);
+    await page.evaluate(() => {
+      const cbs = document.querySelectorAll('#isfDialog tbody tr input[type=checkbox]');
+      cbs[0].click(); cbs[1].click(); // Import + PB, channel defaults to 1 — already taken by RotManualZ's real lane
+    });
+    await page.waitForTimeout(80);
+    const conflictVsRealLane = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody tr span')).find(s => s.textContent.includes('conflict')).style.display !== 'none');
+    check('A new PB row also conflicts against an ALREADY-IMPORTED PB lane on that channel, not just sibling rows in the same dialog',
+      conflictVsRealLane === true, conflictVsRealLane);
+  });
+
+  await withPage(browser, async (page) => {
+    // Full Migrate-to-MMV flow with a PB-linked parameter: automation
+    // classification must use the lane's real -8192..8191 range (not CC's
+    // 0..127), the playhead-native value must come out correctly, and the
+    // wiring sheet must describe it as "Pitch Bend" with no CC number.
+    const header = { INPUTS: [
+      { NAME: 'RotManualZ', TYPE: 'float', MIN: 0, MAX: 360, DEFAULT: 0 },
+      { NAME: 'GirdleRadius', TYPE: 'float', MIN: 0.1, MAX: 10, DEFAULT: 3.0 },
+    ]};
+    const source = '/*\n' + JSON.stringify(header, null, 2) + '\n*/\nvoid main(){}\n';
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'pbmigrate.fs', s), { h: header, s: source });
+    await page.waitForTimeout(100);
+    await page.evaluate(() => {
+      const rows = document.querySelectorAll('#isfDialog tbody tr');
+      rows[0].querySelectorAll('input[type=checkbox]')[0].click(); // RotManualZ: Import
+      rows[0].querySelectorAll('input[type=checkbox]')[1].click(); // RotManualZ: PB
+      rows[1].querySelectorAll('input[type=checkbox]')[0].click(); // GirdleRadius: Import (plain CC)
+    });
+    await page.waitForTimeout(80);
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(100);
+
+    const rotId = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.isf && l.isf.name === 'RotManualZ').id);
+    // A tiny value change well within PB's much finer 14-bit grid — this
+    // would ROUND AWAY to nothing on a 7-bit CC lane, proving the automation
+    // check is really using PB's wider range and not silently falling back
+    // to 0-127 rounding.
+    await page.evaluate((id) => {
+      const l = window._TEST_state.ccLanes.find(x => x.id === id);
+      l.points = [{ t: 0, v: -8192 }, { t: 10000, v: -8000 }];
+    }, rotId);
+
+    const entry = await page.evaluate(() => { const h = window._TEST_state.isfHistory; return h[h.length - 1]; });
+    await page.evaluate((e) => window._TEST_openMigrateSheet(e), entry);
+    await page.waitForTimeout(150);
+
+    const rowsInfo = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => {
+      const tds = tr.querySelectorAll('td');
+      return { name: tds[0].textContent, hasPbTag: !!tds[0].querySelector('span'), automated: tds[3].textContent.trim(), playheadVal: tds[2].textContent };
+    }));
+    const rotRow = rowsInfo.find(r => r.name.startsWith('RotManualZ'));
+    check('Migrate sheet tags a PB-linked row with a "PB" badge next to its name', rotRow && rotRow.hasPbTag === true, rotRow);
+    check('A fine-grained change that would round away on a 7-bit CC lane still registers as automated on a PB lane (proves the real 14-bit range is used, not a 0-127 fallback)',
+      rotRow && rotRow.automated === 'automated', rotRow);
+    // -8192 (PB min) with MIN=0/MAX=360 -> native 0 exactly
+    check('Migrate sheet computes the PB lane\'s playhead value through the real -8192..8191 range', rotRow && rotRow.playheadVal === '0', rotRow);
+
+    await page.evaluate((id) => { window._TEST_state.ccLanes.find(l => l.id === id).points = [{ t: 0, v: -8192 }, { t: 10000, v: -8000 }]; }, rotId);
+    // tick RotManualZ's Wiring Sheet checkbox (row 0, column index 5)
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog tbody tr')[0].querySelectorAll('td')[5].querySelector('input').checked = true; });
+
+    const downloads = [];
+    page.on('download', (d) => downloads.push(d));
+    await page.click('#isfMigrateDialog button:has-text("Export")');
+    await page.waitForTimeout(400);
+    const sheetDl = downloads.find(d => d.suggestedFilename().endsWith('-wiring-sheet.txt'));
+    const sheetText = sheetDl && fs.readFileSync(await sheetDl.path(), 'utf8');
+    check('Wiring sheet describes the PB row as "Pitch Bend" with a channel, no CC number',
+      sheetText && /RotManualZ\s+Ch\d+ Pitch Bend/.test(sheetText), sheetText && sheetText.slice(0, 300));
+    check('Wiring sheet does NOT show a numeric CC# for the Pitch Bend row', sheetText && !/RotManualZ.*CC\d/.test(sheetText), sheetText && sheetText.slice(0, 300));
   });
 
   // ---------------- GENERATE strip: 6 shapes + direction toggle (item 6) ----------------

@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.17
+  MMV MIDI & CC Curve Editor v0.9.18
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -459,6 +459,22 @@
   can now be clicked to toggle between MME's own 1-indexed display and
   MMV's 0-indexed one for the same Step modifier value — a global
   preference, not per-lane.
+  v0.9.18 ISF import can now assign a parameter to a Pitch Bend lane instead
+  of a CC lane — a "PB" checkbox next to Import, shown alongside the MIDI
+  Default it would start at. This is the real fix for a parameter that
+  looks stepped/jerky at plain CC's 7-bit (128-step) resolution: MMV's own
+  guide documents Pitch Bend as its one genuinely 14-bit MIDI feature (CC is
+  7-bit only), and MME already had a working PB lane type for it — it just
+  wasn't reachable from ISF import until now. Since Pitch Bend is one whole
+  channel's stream rather than a numbered CC, a PB row conflicts with any
+  other PB row on the same channel — checked both within the same import
+  batch and against already-imported PB lanes — the same conflict styling
+  CC# already used. Migrate to MMV now fully understands PB-linked
+  parameters too: automation detection, playhead-value baking, and Scale/
+  Offset math all read the lane's real range (CC's 0-127 or PB's
+  -8192..8191) instead of assuming CC, a "PB" badge marks these rows in the
+  review table, and the wiring sheet / embedded notes describe them as
+  "Pitch Bend" with a channel, not a CC number.
 -->
 
 <style>
@@ -5257,6 +5273,19 @@
       return Math.max(0,Math.min(127,Math.round((row.defaultVal-row.min)/range*127)));
     }
 
+    // Same idea as defaultCCVal, scaled to Pitch Bend's real 14-bit range
+    // (-8192..8191) instead of CC's 7-bit 0..127 — see the PB column in the
+    // import dialog and the "higher resolution" strategy-notes discussion:
+    // MMV documents Pitch Bend as its one genuinely 14-bit MIDI feature,
+    // while Control Change is 7-bit only, so this is the real fix for a
+    // parameter that reads visibly stepped/jerky at plain CC resolution.
+    function defaultPbVal(row){
+      if(row.type==='bool') return row.defaultVal?8191:-8192;
+      const range=row.max-row.min;
+      if(range===0) return 0;
+      return Math.max(-8192,Math.min(8191,Math.round((row.defaultVal-row.min)/range*16383)-8192));
+    }
+
     // Next free CC starting from CC14 (general-purpose CCs)
     function nextFreeCC(ch, used){
       for(let cc=14;cc<=127;cc++){ if(!used.has(ch+'_'+cc)) return cc; }
@@ -5272,6 +5301,13 @@
 
     function hasConflict(ch, cc){
       return state.ccLanes.some(l=>l.ch===ch&&l.cc===cc);
+    }
+
+    // Pitch Bend is one 14-bit stream per MIDI channel, not per-CC-number —
+    // so unlike regular CC lanes, two PB lanes can never coexist on the same
+    // channel at all.
+    function hasPbConflict(ch){
+      return state.ccLanes.some(l=>l.ch===ch&&l.type==='pb');
     }
 
     // The copy MME keeps of an imported shader is a working copy, distinct
@@ -5351,7 +5387,7 @@
         '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x2B21; Import ISF</div>'
         +'<div style="font-size:12px;color:#4fa3ff;margin-top:3px;">'+escHtml(shaderTitle)+'</div>'
         +'<div style="font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;">'+escHtml(filename)+'</div>'
-        +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Tick the parameters you want to import, assign CC numbers and MIDI channels, then click Import Lanes.</div>';
+        +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Tick the parameters you want to import, assign CC numbers and MIDI channels, then click Import Lanes. Tick PB for a parameter that needs real 14-bit resolution instead of CC\'s 7-bit — one per MIDI channel.</div>';
       dlg.appendChild(hdr);
 
       // ── Tag row ─────────────────────────────────────────────────
@@ -5430,7 +5466,10 @@
       thr.appendChild(th('Max','right'));
       thr.appendChild(th('Default','right'));
       thr.appendChild(thEl(hdrImport,'center'));
-      thr.appendChild(th('CC Default','center'));
+      const thPb=th('PB','center');
+      thPb.title='Pitch Bend — real 14-bit resolution instead of CC\'s 7-bit, for a parameter that looks stepped/jerky at plain CC precision. One per MIDI channel (it\'s a whole channel\'s pitch-bend stream, not a numbered CC).';
+      thr.appendChild(thPb);
+      thr.appendChild(th('MIDI Default','center'));
       thr.appendChild(th('CC #','center'));
       thr.appendChild(thEl(hdrCh,'center'));
       thead.appendChild(thr);
@@ -5438,7 +5477,7 @@
 
       const tbody=document.createElement('tbody');
 
-      // rowRefs: {importCb, ccInput, chInput, defCCVal, row, setDimmed, checkConflict, tr}
+      // rowRefs: {importCb, pbCb, ccInput, chInput, defCCVal, defPbVal, row, setDimmed, checkConflict, tr}
       const rowRefs=[];
 
       // Pre-assign default CCs: start from 14, increment per row
@@ -5454,6 +5493,7 @@
           :row.type==='long'?'int/enum':'float';
 
         const defCV=defaultCCVal(row);
+        const defPV=defaultPbVal(row);
 
         // Assign initial CC: next free from 14
         while(initUsed.has('0_'+runningCC)&&runningCC<=127) runningCC++;
@@ -5462,6 +5502,9 @@
 
         // Import checkbox
         const importCb=document.createElement('input'); importCb.type='checkbox'; importCb.checked=false;
+
+        // Pitch Bend checkbox — real 14-bit resolution instead of CC's 7-bit
+        const pbCb=document.createElement('input'); pbCb.type='checkbox'; pbCb.checked=false;
 
         // CC input
         const ccInput=document.createElement('input');
@@ -5488,10 +5531,27 @@
           });
         }
 
+        const tdDefCC=document.createElement('td');
+        tdDefCC.style.cssText='padding:5px 6px;text-align:center;color:#c8cdd8;font-variant-numeric:tabular-nums;';
+
         function checkConflict(){
           const ch=(parseInt(chInput.value)||1)-1;
-          const cc=Math.max(0,Math.min(127,parseInt(ccInput.value)||0));
-          const conflict=importCb.checked&&hasConflict(ch,cc);
+          let conflict=false;
+          if(pbCb.checked){
+            ccInput.disabled=true; ccInput.style.opacity='0.35';
+            tdDefCC.textContent=String(defPV);
+            // Pitch Bend is one 14-bit stream per channel, not per-CC-number,
+            // so it conflicts with any OTHER row also ticked PB on the same
+            // channel (not just an already-existing lane) — a within-batch
+            // collision regular CC conflict-checking never has to consider.
+            const dupeInBatch=rowRefs.some(function(r){ return r!==thisRef&&r.importCb.checked&&r.pbCb.checked&&((parseInt(r.chInput.value)||1)-1)===ch; });
+            conflict=importCb.checked&&(hasPbConflict(ch)||dupeInBatch);
+          } else {
+            ccInput.disabled=false; ccInput.style.opacity='1';
+            tdDefCC.textContent=String(defCV);
+            const cc=Math.max(0,Math.min(127,parseInt(ccInput.value)||0));
+            conflict=importCb.checked&&hasConflict(ch,cc);
+          }
           ccInput.style.borderColor=conflict?'#ffb454':'#2c313b';
           chInput.style.borderColor=conflict?'#ffb454':'#2c313b';
           conflictLbl.style.display=conflict?'':'none';
@@ -5501,10 +5561,18 @@
           setDimmed(!importCb.checked);
           checkConflict();
         });
+        pbCb.addEventListener('change',function(){
+          checkConflict();
+          // A PB row's channel is exclusive to it — recheck every OTHER
+          // ticked row too, since this one just became a conflict (or
+          // stopped being one) for them.
+          rowRefs.forEach(function(r){ if(r!==thisRef) r.checkConflict(); });
+        });
         ccInput.addEventListener('change',checkConflict);
         ccInput.addEventListener('blur',checkConflict);
         chInput.addEventListener('change',function(){
           checkConflict();
+          rowRefs.forEach(function(r){ if(r!==thisRef) r.checkConflict(); });
           // If sync is on, propagate this channel to all rows
           if(syncChCb.checked){
             rowRefs.forEach(function(r){ r.chInput.value=chInput.value; r.checkConflict(); });
@@ -5536,8 +5604,11 @@
         tdImport.style.cssText='padding:5px 6px;text-align:center;';
         tdImport.appendChild(importCb);
 
-        const tdDefCC=document.createElement('td');
-        tdDefCC.style.cssText='padding:5px 6px;text-align:center;color:#c8cdd8;font-variant-numeric:tabular-nums;';
+        const tdPb=document.createElement('td');
+        tdPb.style.cssText='padding:5px 6px;text-align:center;';
+        tdPb.appendChild(pbCb);
+        dimmableCells.push(tdPb);
+
         tdDefCC.textContent=String(defCV);
         dimmableCells.push(tdDefCC);
 
@@ -5554,11 +5625,12 @@
 
         tr.appendChild(tdName); tr.appendChild(tdType);
         tr.appendChild(tdMin); tr.appendChild(tdMax); tr.appendChild(tdDef);
-        tr.appendChild(tdImport); tr.appendChild(tdDefCC);
+        tr.appendChild(tdImport); tr.appendChild(tdPb); tr.appendChild(tdDefCC);
         tr.appendChild(tdCC); tr.appendChild(tdCh);
         tbody.appendChild(tr);
 
-        rowRefs.push({importCb, ccInput, chInput, defCCVal:defCV, row, setDimmed, checkConflict, tr});
+        const thisRef={importCb, pbCb, ccInput, chInput, defCCVal:defCV, defPbVal:defPV, row, setDimmed, checkConflict, tr};
+        rowRefs.push(thisRef);
       });
 
       tbl.appendChild(tbody);
@@ -5665,17 +5737,19 @@
           source:sourceText||'', lanes:[]};
         toImport.forEach(function(ref){
           const ch=(parseInt(ref.chInput.value)||1)-1;
-          const cc=Math.max(0,Math.min(127,parseInt(ref.ccInput.value)||0));
+          const isPb=!!ref.pbCb.checked;
+          const cc=isPb?null:Math.max(0,Math.min(127,parseInt(ref.ccInput.value)||0));
           const id=state.nextId++;
           const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
           const isf={batchId, name:ref.row.name, type:ref.row.type, min:ref.row.min, max:ref.row.max,
             steps:ref.row.steps||0, values:ref.row.values||null,
             isColor:!!ref.row.isColor, colorCh:ref.row.colorCh!=null?ref.row.colorCh:null};
-          const lane={id, type:'cc', cc, ch, color, name:ref.row.name, visible:true, tags:[...importTags],
-            steps:ref.row.steps||0, points:[{t:0, v:ref.defCCVal}], _preview:null, isf};
+          const startVal=isPb?ref.defPbVal:ref.defCCVal;
+          const lane={id, type:isPb?'pb':'cc', cc, ch, color, name:ref.row.name, visible:true, tags:[...importTags],
+            steps:ref.row.steps||0, points:[{t:0, v:startVal}], _preview:null, isf};
           state.ccLanes.push(lane);
           buildLaneDom(lane);
-          historyEntry.lanes.push({name:ref.row.name, cc, ch:ch+1, defVal:ref.defCCVal,
+          historyEntry.lanes.push({name:ref.row.name, cc, ch:ch+1, defVal:startVal, pb:isPb,
             min:ref.row.min, max:ref.row.max});
         });
         if(!state.isfHistory) state.isfHistory=[];
@@ -5687,7 +5761,9 @@
         requestDraw();
         dlg.close();
         dlg.remove();
-        flash('Imported '+toImport.length+' CC lane'+(toImport.length!==1?'s':'')+' from '+filename+'.');
+        const pbCount=toImport.filter(function(r){ return r.pbCb.checked; }).length;
+        flash('Imported '+toImport.length+' lane'+(toImport.length!==1?'s':'')+
+          (pbCount?' ('+pbCount+' as Pitch Bend)':'')+' from '+filename+'.');
       });
 
       // Initial state — all unticked, dimmable cells dimmed
@@ -5724,25 +5800,32 @@
     // for MMV's Source/Feature/CC + Modifiers (Scale/Offset/Step).
     // ═══════════════════════════════════════════════════════════════
 
-    // CC (0–127) -> native ISF units for a given row's MIN/MAX.
-    function ccToNative(row,cc){
-      if(row.type==='bool') return cc>=64?1:0;
-      const range=row.max-row.min;
-      return row.min+(clamp(cc,0,127)/127)*range;
+    // Raw lane value (CC 0–127, or Pitch Bend -8192..8191 — see laneRange)
+    // -> native ISF units for a given row's MIN/MAX. Reads the lane's own
+    // range so the exact same formula works for either transport: MMV
+    // normalizes both CC and Pitch Bend to 0-1 before applying Scale/Offset
+    // (confirmed in its own guide), so computeModifiers' Scale/Offset math
+    // is identical either way — only the raw-value-to-0-1 step differs here.
+    function midiToNative(row,lane,rawVal){
+      const r=laneRange(lane);
+      const frac=(clamp(rawVal,r.min,r.max)-r.min)/(r.max-r.min);
+      if(row.type==='bool') return frac>=0.5?1:0;
+      return row.min+frac*(row.max-row.min);
     }
 
     // Does this lane's value ever change across the whole timeline, sampled
     // at the same tick spacing and rounding the playback scheduler itself
     // uses (see schedulerTick/buildPassEvents)? "Automated" means "would
-    // ever actually send a second distinct CC value" — not just "has more
+    // ever actually send a second distinct raw value" — not just "has more
     // than one point drawn".
     function isLaneAutomated(lane){
       if(!lane.points||lane.points.length<2) return false;
       const step=Math.max(1,Math.round(state.ppq/state.ccRes));
       const end=totalTicks();
-      const first=Math.round(clamp(laneValueAt(lane,0),0,127));
+      const r=laneRange(lane);
+      const first=Math.round(clamp(laneValueAt(lane,0),r.min,r.max));
       for(let t=0;t<=end;t+=step){
-        if(Math.round(clamp(laneValueAt(lane,t),0,127))!==first) return true;
+        if(Math.round(clamp(laneValueAt(lane,t),r.min,r.max))!==first) return true;
       }
       return false;
     }
@@ -5776,6 +5859,14 @@
 
     function findRowLane(batchId,row){
       return state.ccLanes.find(function(l){ return l.isf&&l.isf.batchId===batchId&&l.isf.name===row.name; });
+    }
+
+    // How to describe a wired row's MMV connection: "Ch1 CC20" for an
+    // ordinary CC lane, or "Ch3 Pitch Bend" for a PB lane — Pitch Bend has
+    // no CC number of its own (it's a whole channel's stream), so a numeric
+    // CC# column would be misleading for those rows.
+    function wireFeatureLabel(r){
+      return laneIsPb(r.lane)?('Ch'+(r.lane.ch+1)+' Pitch Bend'):('Ch'+(r.lane.ch+1)+' CC'+r.lane.cc);
     }
 
     // Rebuild {name,type,min,max,defaultVal,...} rows fresh from the entry's
@@ -5818,11 +5909,11 @@
       }
       if(wireRefs.length){
         lines.push('');
-        lines.push('MMV wiring — connect each parameter\'s Source/Feature to this CC, then add');
+        lines.push('MMV wiring — connect each parameter\'s Source/Feature as shown, then add');
         lines.push('a Scale modifier ABOVE an Offset modifier (Scale first, then Offset — the');
         lines.push('stacking order changes the result):');
         wireRefs.forEach(function(r){
-          let line='  '+r.row.name+': Ch'+(r.lane.ch+1)+' CC'+r.lane.cc+', Scale='+fmtNum(r.mods.scale)+', Offset='+fmtNum(r.mods.offset);
+          let line='  '+r.row.name+': '+wireFeatureLabel(r)+', Scale='+fmtNum(r.mods.scale)+', Offset='+fmtNum(r.mods.offset);
           if(r.mods.step!=null) line+=', Step='+fmtNum(r.mods.step);
           if(r.mods.warning) line+='  ['+r.mods.warning+']';
           lines.push(line);
@@ -5895,9 +5986,9 @@
       lines.push('Source: '+entry.filename);
       lines.push('Generated: '+new Date().toLocaleString());
       lines.push('');
-      const cols=['Parameter','Channel','CC#','Scale','Offset','Step'];
+      const cols=['Parameter','Feature','Scale','Offset','Step'];
       const rowsOut=wireRefs.map(function(r){
-        return [r.row.name, String(r.lane.ch+1), String(r.lane.cc), fmtNum(r.mods.scale), fmtNum(r.mods.offset), r.mods.step==null?'—':fmtNum(r.mods.step)];
+        return [r.row.name, wireFeatureLabel(r), fmtNum(r.mods.scale), fmtNum(r.mods.offset), r.mods.step==null?'—':fmtNum(r.mods.step)];
       });
       const widths=cols.map(function(c,i){ return Math.max(c.length,...rowsOut.map(function(r){ return r[i].length; }))+2; });
       function padRow(cells){ return cells.map(function(c,i){ return c.padEnd(widths[i]); }).join(''); }
@@ -5927,8 +6018,9 @@
       rows.forEach(function(row){
         const lane=findRowLane(entry.id,row);
         if(!lane) return; // param wasn't imported, or its lane was later deleted — nothing to migrate
-        const ccAtPlayhead=Math.round(clamp(laneValueAt(lane,state.playhead),0,127));
-        const playheadNative=ccToNative(row,ccAtPlayhead);
+        const r=laneRange(lane);
+        const rawAtPlayhead=Math.round(clamp(laneValueAt(lane,state.playhead),r.min,r.max));
+        const playheadNative=midiToNative(row,lane,rawAtPlayhead);
         refs.push({row:row, lane:lane, automated:isLaneAutomated(lane),
           playheadNative:playheadNative, mods:computeModifiers(row)});
       });
@@ -5998,6 +6090,13 @@
         const tdName=document.createElement('td');
         tdName.style.cssText='padding:5px 6px 5px 14px;color:#e0e4ef;';
         tdName.textContent=ref.row.name;
+        if(laneIsPb(ref.lane)){
+          const pbTag=document.createElement('span');
+          pbTag.textContent='PB';
+          pbTag.title='This parameter is on a Pitch Bend lane — real 14-bit resolution, wired to MMV\'s Pitch Bend feature (no CC#).';
+          pbTag.style.cssText='font-family:monospace;font-size:9px;letter-spacing:.04em;color:#4fa3ff;background:rgba(79,163,255,.14);padding:1px 5px;border-radius:3px;margin-left:6px;';
+          tdName.appendChild(pbTag);
+        }
 
         const tdDef=document.createElement('td');
         tdDef.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
