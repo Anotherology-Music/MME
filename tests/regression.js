@@ -47,8 +47,11 @@ function buildTestHtml() {
       '  window._TEST_snapshot = snapshot;',
       '  window._TEST_applyState = applyState;',
       '  window._TEST_buildMidi = (opts) => Array.from(buildMidi(opts));',
-      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents }; };',
+      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, pbMap: r.pbMap, cpMap: r.cpMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents }; };',
       '  window._TEST_addLane = (cc, ch) => { const l = addLane(cc, ch); return l.id; };',
+      '  window._TEST_addPbLane = (ch) => { const l = addPbLane(ch); return l.id; };',
+      '  window._TEST_addCpLane = (ch) => { const l = addCpLane(ch); return l.id; };',
+      '  window._TEST_applyMidiImport = (r, mode, remapChannels) => applyMidiImport(r, mode, remapChannels);',
       '  window._TEST_upsertPoint = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); upsertPoint(l, t, v); };',
       '  window._TEST_tickToBBT = (t) => tickToBBT(t);',
       '  window._TEST_bbtToTick = (s) => bbtToTick(s);',
@@ -731,6 +734,58 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
+    // Follow MMV auto-stop: with MME's own transport actually playing, a
+    // Ch16 beat note arms a 1.5s watchdog; if MMV goes silent (its own
+    // transport stopped, without necessarily sending an explicit MIDI Stop)
+    // and no further beats arrive, MME must stop on its own.
+    await page.evaluate(() => { window._TEST_state.syncFollow = true; });
+    await page.evaluate((t0) => window._TEST_play(t0), await page.evaluate(() => performance.now() + 50));
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x9F, 0, 1], timeStamp: performance.now() })); // Ch16 beat 0
+    const playingRightAfterBeat = await page.evaluate(() => window._TEST_state.playing);
+    check('Follow MMV: still playing immediately after a beat note arrives', playingRightAfterBeat === true, playingRightAfterBeat);
+    await page.waitForTimeout(2000); // past the 1.5s heartbeat window, no further beats sent
+    const playingAfterSilence = await page.evaluate(() => window._TEST_state.playing);
+    check('Follow MMV: auto-stops on its own ~1.5s after MMV\'s beat feed goes silent (no explicit MIDI Stop required)',
+      playingAfterSilence === false, playingAfterSilence);
+  });
+
+  await withPage(browser, async (page) => {
+    // The bug as reported: Follow MMV was only watched for staleness while
+    // MME's OWN transport was playing. If the user never pressed Play in
+    // MME — just watching MMV's position via Follow — a beat note starts
+    // syncFrame's playhead-extrapolation loop, and previously nothing ever
+    // stopped it: it would keep advancing the playhead forever off a stale
+    // anchor even after MMV's feed went silent. This is exactly why the
+    // user had to manually deselect Follow MMV to make it stop "carrying
+    // on". The watchdog must now cover this case too.
+    await page.evaluate(() => { window._TEST_state.syncFollow = true; window._TEST_state.playing = false; });
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x9F, 0, 1], timeStamp: performance.now() })); // Ch16 beat 0, not playing
+    await page.waitForTimeout(300);
+    const phMoving1 = await page.evaluate(() => window._TEST_state.playhead);
+    await page.waitForTimeout(300);
+    const phMoving2 = await page.evaluate(() => window._TEST_state.playhead);
+    check('Follow MMV (not playing): the playhead is actively extrapolating forward while beats are (recently) arriving',
+      phMoving2 > phMoving1, { phMoving1, phMoving2 });
+    await page.waitForTimeout(1600); // past the 1.5s heartbeat window, no further beats — should freeze
+    const phFrozen1 = await page.evaluate(() => window._TEST_state.playhead);
+    await page.waitForTimeout(500); // if extrapolation were still running (the bug), this would have moved further
+    const phFrozen2 = await page.evaluate(() => window._TEST_state.playhead);
+    check('Follow MMV (not playing): once the beat feed goes stale, the playhead stops advancing instead of extrapolating forever (the reported bug)',
+      phFrozen1 === phFrozen2, { phFrozen1, phFrozen2 });
+
+    // Self-healing: a fresh beat arriving after the freeze must resume
+    // following normally, with no manual re-toggle of Follow MMV needed —
+    // syncFeedStale() cancelled the extrapolation rAF chain, so this checks
+    // handleFollowIn genuinely restarts it rather than leaving it dead.
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0x9F, 0, 1], timeStamp: performance.now() })); // beat 0 again -> snaps playhead back near tick 0
+    const phRightAfterNewBeat = await page.evaluate(() => window._TEST_state.playhead);
+    await page.waitForTimeout(300);
+    const phAfterResume = await page.evaluate(() => window._TEST_state.playhead);
+    check('Follow MMV (not playing): a new beat after the freeze resumes extrapolating on its own (self-healing, no manual re-enable needed)',
+      phAfterResume > phRightAfterNewBeat, { phRightAfterNewBeat, phAfterResume });
+  });
+
+  await withPage(browser, async (page) => {
     // Scroll Lock: now icon-only but the same #scrollLockBtn id/semantics.
     const before = await page.evaluate(() => ({ state: window._TEST_state.scrollLock, on: document.getElementById('scrollLockBtn').classList.contains('on') }));
     await page.click('#scrollLockBtn');
@@ -1071,13 +1126,14 @@ async function run() {
 
   await withPage(browser, async (page) => {
     // Note Info is a true single row (v0.9.13, replacing the old header-row
-    // + 4-column-grid layout): toggle, title (width-permitting), note
-    // details, V label+value, Position, Channel button — all direct
+    // + 4-column-grid layout; the "Note Info" title itself was removed in
+    // v0.9.19 to make room for the Len field): toggle, note details, V
+    // label+value, Len label+value, Position, Channel button — all direct
     // children of #noteInfoLeft .ni-row, in that left-to-right order.
     const order = await page.evaluate(() =>
       [...document.querySelectorAll('#noteInfoLeft .ni-row > *')].map(el => el.id || el.className));
-    check('Note Info renders as one row: toggle, title, note, V-label, V, Pos, Ch — in order',
-      JSON.stringify(order) === JSON.stringify(['niToggleBtn', 'ni-title', 'noteInfoNote', 'mini-lbl', 'velValInput', 'noteInfoPos', 'noteInfoCh']),
+    check('Note Info renders as one row: toggle, note, V-label, V, Len-label, Len, Pos, Ch — in order',
+      JSON.stringify(order) === JSON.stringify(['niToggleBtn', 'noteInfoNote', 'mini-lbl', 'velValInput', 'mini-lbl', 'noteInfoLen', 'noteInfoPos', 'noteInfoCh']),
       order);
   });
 
@@ -4407,53 +4463,6 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // "NOTE INFO" only renders when the leftcol is wide enough not to
-    // crowd the row's other fields — a real layout collapse (the title
-    // contributes zero width when hidden, via a CSS container query keyed
-    // off this element's own inline size, which tracks var(--keys-w)
-    // exactly like the CC lanes' leftcol) — tested at a few different
-    // widths, not just one boundary guess. A note must be selected (i.e.
-    // Note Info is EXPANDED, not auto-collapsed) to isolate this width-only
-    // behavior from the separate .ni-collapsed rule, which always hides the
-    // title regardless of width — that's covered by its own test elsewhere.
-    await page.evaluate(() => {
-      const n = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 };
-      window._TEST_state.notes.push(n);
-      window._TEST_state.selection.clear();
-      window._TEST_state.selection.add(n.id);
-      window._TEST_updateNoteInfo();
-    });
-    async function setKeysW(w) {
-      await page.evaluate((w) => {
-        window._TEST_state.keysW = w;
-        document.documentElement.style.setProperty('--keys-w', w + 'px');
-      }, w);
-      await page.waitForTimeout(30);
-    }
-    async function titleInfo() {
-      return page.evaluate(() => {
-        const el = document.querySelector('#noteInfoLeft .ni-title');
-        const cs = getComputedStyle(el);
-        return { display: cs.display, width: el.getBoundingClientRect().width };
-      });
-    }
-    await setKeysW(300);
-    const wide = await titleInfo();
-    check('at the default 300px --keys-w, the "Note Info" title shows and takes real width',
-      wide.display !== 'none' && wide.width > 0, wide);
-
-    await setKeysW(220);
-    const mid = await titleInfo();
-    check('at 220px --keys-w (still above the crowding threshold), the title still shows',
-      mid.display !== 'none' && mid.width > 0, mid);
-
-    await setKeysW(150);
-    const narrow = await titleInfo();
-    check('at 150px --keys-w (below the crowding threshold), the title hides entirely (display:none, zero width)',
-      narrow.display === 'none' && narrow.width === 0, narrow);
-  });
-
-  await withPage(browser, async (page) => {
     // Note details format: "<name>  <pitch>" — a couple of spaces, no
     // colon (changed from the old "A#4:82").
     const pitch = 70;
@@ -4501,11 +4510,46 @@ async function run() {
     const placeholders = await page.evaluate(() => ({
       note: document.getElementById('noteInfoNote').textContent,
       vel: document.getElementById('velValInput').value,
+      len: document.getElementById('noteInfoLen').value,
       pos: document.getElementById('noteInfoPos').value,
       ch: document.getElementById('noteInfoCh').textContent,
     }));
-    check('with nothing selected, Note Info shows "—" placeholders (note/vel/pos) and "Ch—"',
-      placeholders.note === '—' && placeholders.vel === '' && placeholders.pos === '' && placeholders.ch === 'Ch—', placeholders);
+    check('with nothing selected, Note Info shows "—" placeholders (note/vel/len/pos) and "Ch—"',
+      placeholders.note === '—' && placeholders.vel === '' && placeholders.len === '' && placeholders.pos === '' && placeholders.ch === 'Ch—', placeholders);
+  });
+
+  await withPage(browser, async (page) => {
+    // Note Duration (ticks): same "shared value or blank on mixed" display
+    // convention as Velocity, and the same absolute-set-on-every-selected-
+    // note behavior on change (not a delta/nudge like Position) — typing
+    // one value expands/sets every selected note to exactly that length.
+    // The motivating case: a batch of very short imported notes (e.g. drum
+    // hits) that are hard to see/grab individually.
+    const ids = await page.evaluate(() => {
+      const a = { id: window._TEST_state.nextId++, pitch: 60, start: 0, length: 20, vel: 100, ch: 0 };
+      const b = { id: window._TEST_state.nextId++, pitch: 64, start: 240, length: 20, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(a, b);
+      window._TEST_state.selection.clear();
+      window._TEST_state.selection.add(a.id); window._TEST_state.selection.add(b.id);
+      window._TEST_updateNoteInfo();
+      return [a.id, b.id];
+    });
+    const sharedLen = await page.evaluate(() => document.getElementById('noteInfoLen').value);
+    check('Len field shows the shared value when every selected note has the same length', sharedLen === '20', sharedLen);
+
+    await page.evaluate((id) => { window._TEST_state.notes.find(n => n.id === id).length = 40; window._TEST_updateNoteInfo(); }, ids[1]);
+    const mixedLen = await page.evaluate(() => document.getElementById('noteInfoLen').value);
+    check('Len field goes blank when selected notes have differing lengths (same convention as Velocity/Position)', mixedLen === '', mixedLen);
+
+    await page.fill('#noteInfoLen', '96');
+    await page.dispatchEvent('#noteInfoLen', 'change');
+    await page.waitForTimeout(30);
+    const lengthsAfter = await page.evaluate((ids) => ids.map(id => window._TEST_state.notes.find(n => n.id === id).length), ids);
+    check('Typing a new Len value sets EVERY selected note to that exact length (absolute set, not a delta) — the actual ask: expand a batch of short notes together',
+      lengthsAfter.every(l => l === 96), lengthsAfter);
+
+    const afterVal = await page.evaluate(() => document.getElementById('noteInfoLen').value);
+    check('Len field reflects the new shared value after the edit', afterVal === '96', afterVal);
   });
 
   await withPage(browser, async (page) => {
@@ -4544,20 +4588,13 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // Manual minimize/maximize toggle (#niToggleBtn) — independent of the
-    // existing auto-collapse-on-no-selection behavior (.ni-collapsed, driven
-    // purely by selection state). Bug fix: the manual toggle used to ALSO
-    // force .ni-collapsed (hiding the literal "Note Info" title) even while
-    // a note was selected — that's gone. The manual toggle no longer touches
-    // the title at all; its only effect now is on #velRow's real height
-    // (covered by the dedicated tests below). The note/vel/pos/ch fields
-    // keep showing their real values throughout, unchanged.
-    const noSel = await page.evaluate(() => ({
-      collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
-      manual: window._TEST_state.noteInfoManuallyCollapsed,
-    }));
-    check('with nothing selected and the manual toggle untouched (off), Note Info still auto-collapses as before',
-      noSel.collapsed === true && noSel.manual === false, noSel);
+    // Manual minimize/maximize toggle (#niToggleBtn) — sets
+    // state.noteInfoManuallyCollapsed / .ni-min, whose only effect is on
+    // #velRow's real height (covered by the dedicated tests below). The
+    // note/vel/len/pos/ch fields keep showing their real values throughout,
+    // unchanged — minimizing compresses the row, it doesn't blank data.
+    const noSel = await page.evaluate(() => window._TEST_state.noteInfoManuallyCollapsed);
+    check('the manual toggle starts off', noSel === false, noSel);
 
     await page.evaluate(() => {
       const n = { id: window._TEST_state.nextId++, pitch: 67, start: 0, length: 240, vel: 90, ch: 0 };
@@ -4566,50 +4603,32 @@ async function run() {
       window._TEST_state.selection.add(n.id);
       window._TEST_updateNoteInfo();
     });
-    const withSel = await page.evaluate(() => document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'));
-    check('selecting a note auto-expands Note Info (manual toggle still off, unchanged legacy behavior)',
-      withSel === false, withSel);
 
-    // Manually minimize WHILE a note is selected — this must NOT force
-    // .ni-collapsed or hide the title anymore; it only sets the manual flag
+    // Manually minimize WHILE a note is selected — sets the manual flag
     // (state.noteInfoManuallyCollapsed / .ni-min) and shrinks #velRow (see
-    // the dedicated height tests below).
+    // the dedicated height tests below), without blanking the note's data.
     await page.click('#niToggleBtn');
     const manualWithSel = await page.evaluate(() => ({
-      collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
       manual: window._TEST_state.noteInfoManuallyCollapsed,
       niMinClass: document.getElementById('noteInfoLeft').classList.contains('ni-min'),
       selSize: window._TEST_state.selection.size,
       glyph: document.getElementById('niToggleBtn').textContent,
-      titleHidden: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display === 'none',
       noteText: document.getElementById('noteInfoNote').textContent,
     }));
-    check('the manual toggle sets the manual-minimized flag/glyph/.ni-min while a note IS selected, but does NOT set .ni-collapsed',
-      manualWithSel.collapsed === false && manualWithSel.manual === true && manualWithSel.niMinClass === true
+    check('the manual toggle sets the manual-minimized flag/glyph/.ni-min while a note IS selected',
+      manualWithSel.manual === true && manualWithSel.niMinClass === true
       && manualWithSel.selSize === 1 && manualWithSel.glyph === '▸', manualWithSel);
-    check('manually minimizing no longer hides the "Note Info" title text at all (only the width-based rule can do that)',
-      manualWithSel.titleHidden === false, manualWithSel);
     check('manually minimizing does NOT blank the still-selected note\'s own info',
       manualWithSel.noteText !== '—' && manualWithSel.noteText.length > 0, manualWithSel.noteText);
 
-    // Toggling back off — still selected, so .ni-collapsed was never
-    // involved and stays false throughout; the manual flag/.ni-min clear.
+    // Toggling back off clears the manual flag/.ni-min.
     await page.click('#niToggleBtn');
-    const backToAuto = await page.evaluate(() => ({
-      collapsed: document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'),
+    const backOff = await page.evaluate(() => ({
       manual: window._TEST_state.noteInfoManuallyCollapsed,
       niMinClass: document.getElementById('noteInfoLeft').classList.contains('ni-min'),
-      titleShown: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display !== 'none',
     }));
-    check('un-toggling the manual override clears the manual flag/.ni-min (still expanded, title still shows)',
-      backToAuto.collapsed === false && backToAuto.manual === false && backToAuto.niMinClass === false && backToAuto.titleShown === true, backToAuto);
-
-    // Clearing the selection while the manual toggle is off returns to
-    // auto-collapsed — proving the manual flag didn't get stuck "on" and
-    // isn't fighting the auto behavior in the other direction either.
-    await page.evaluate(() => { window._TEST_state.selection.clear(); window._TEST_updateNoteInfo(); });
-    const clearedSel = await page.evaluate(() => document.getElementById('noteInfoLeft').classList.contains('ni-collapsed'));
-    check('clearing the selection with the manual toggle off re-collapses via auto-collapse alone', clearedSel === true, clearedSel);
+    check('un-toggling the manual override clears the manual flag/.ni-min',
+      backOff.manual === false && backOff.niMinClass === false, backOff);
   });
 
   // ---------------- Item 3: Note Info minimize actually shrinks #velRow ----------------
@@ -4622,11 +4641,6 @@ async function run() {
     // .lane.lane-hidden{min-height:30px}) and restore whatever height it
     // had before on maximize, all WITHOUT hiding #velCanvas — it must keep
     // rendering at the compressed height, same as an ordinary #gripVel drag.
-    // A note must be selected here — with nothing selected, the title
-    // legitimately hides via the separate, unrelated "nothing selected"
-    // auto-collapse rule, which would make the title-stays-visible check
-    // below pass for the wrong reason (or fail here for a reason that has
-    // nothing to do with the manual-minimize behavior under test).
     await page.evaluate(() => {
       const n = { id: window._TEST_state.nextId++, pitch: 67, start: 0, length: 240, vel: 100, ch: 0 };
       window._TEST_state.notes.push(n);
@@ -4646,15 +4660,12 @@ async function run() {
         rowH: row.getBoundingClientRect().height,
         cvDisplay: getComputedStyle(cv).display,
         cvW: cv.width, cvH: cv.height,
-        titleDisplay: getComputedStyle(document.querySelector('#noteInfoLeft .ni-title')).display,
       };
     });
     check('minimizing Note Info shrinks #velRow\'s REAL (measured) height down to the ~30px CC-lane-minimized floor',
       Math.round(afterMin.rowH) === 30, afterMin.rowH);
     check('the velocity canvas is NOT hidden while Note Info is minimized, and is resized (not just clipped) to the compressed row',
       afterMin.cvDisplay !== 'none' && afterMin.cvW > 0 && afterMin.cvH > 0 && afterMin.cvH < 60, afterMin);
-    check('the "Note Info" title text stays visible while manually minimized (compression, not hiding)',
-      afterMin.titleDisplay !== 'none', afterMin);
 
     await page.click('#niToggleBtn');
     await page.waitForTimeout(80);
@@ -5092,6 +5103,150 @@ async function run() {
     }, note.pitch);
     check('the tick-1920 note (piano roll) and the ruler\'s bar line at the same tick land within 2px of each other',
       xs.noteX >= 0 && xs.barX >= 0 && Math.abs(xs.noteX - xs.barX) <= 2, xs);
+  });
+
+  // ---------------- Channel Pressure lanes (v0.9.19) ----------------
+
+  await withPage(browser, async (page) => {
+    // Channel Pressure lanes show "CP" instead of a CC#, mirroring the PB
+    // lane's row-1 treatment — no CC picker button, since CP (like PB) is
+    // one 7-bit stream per MIDI channel, not a numbered CC.
+    await page.click('#addCpLane');
+    await page.waitForTimeout(50);
+    const info = await page.evaluate(() => {
+      const row = [...document.querySelectorAll('.lane')].find(r => r.textContent.includes('CP'));
+      return {
+        found: !!row,
+        hasCpTag: row ? !!row.querySelector('.pb-tag') : false,
+        cpTagText: row ? row.querySelector('.pb-tag').textContent : null,
+        hasCcBtn: row ? !!row.querySelector('.lane-row1 .ccn') : true,
+      };
+    });
+    check('a CP lane shows the "CP" tag and has no CC# picker button in row 1',
+      info.found && info.hasCpTag && info.cpTagText === 'CP' && !info.hasCcBtn, info);
+  });
+
+  await withPage(browser, async (page) => {
+    // Round trip: draw a CP curve, export to a .mid, re-parse it, and confirm
+    // the Channel Pressure (0xD0) bytes came back out as a cpMap entry —
+    // proves laneMsgBytes/laneValueKey wire 0xD0 correctly end to end.
+    const laneId = await page.evaluate(() => window._TEST_addCpLane(2));
+    await page.evaluate((id) => {
+      const l = window._TEST_state.ccLanes.find(x => x.id === id);
+      l.points = [{ t: 0, v: 10 }, { t: 480, v: 100 }];
+    }, laneId);
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    const parsed = await page.evaluate((b) => window._TEST_parseMidi(b), bytes);
+    const cp = Object.values(parsed.cpMap || {});
+    check('exporting a CP lane produces a cpMap entry on re-parse, on the right channel',
+      cp.length === 1 && cp[0].ch === 2 && cp[0].points.length >= 2, cp);
+    check('the CP round-trip preserves the 0-127 value range (start ~10, end ~100)',
+      cp.length === 1 && cp[0].points[0].v === 10 && cp[0].points[cp[0].points.length - 1].v === 100, cp);
+  });
+
+  await withPage(browser, async (page) => {
+    // applyMidiImport 'replace' must create a type:'cp' lane from r.cpMap,
+    // mirroring the existing pbMap handling exactly.
+    const r = await page.evaluate(() => ({
+      fmt: 1, div: 480, bpm: 120, tsN: 4, tsD: 4, tsEvents: [],
+      notes: [], ccMap: {}, pbMap: {},
+      cpMap: { cp_3: { ch: 3, points: [{ t: 0, v: 20 }, { t: 960, v: 90 }] } },
+    }));
+    await page.evaluate((r) => window._TEST_applyMidiImport(r, 'replace'), r);
+    const lane = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.type === 'cp'));
+    check('applyMidiImport "replace" creates a type:"cp" lane from r.cpMap on the right channel',
+      lane && lane.ch === 3 && lane.points.length === 2, lane);
+    check('the imported CP lane keeps its original point values', lane && lane.points[0].v === 20 && lane.points[1].v === 90, lane);
+  });
+
+  await withPage(browser, async (page) => {
+    // applyMidiImport 'merge' with a channel conflict must remap the
+    // imported CP lane's channel the same way it already does for CC/PB.
+    await page.evaluate(() => { window._TEST_addLane(1, 5); }); // occupy channel 5
+    const r = await page.evaluate(() => ({
+      fmt: 1, div: 480, bpm: 120, tsN: 4, tsD: 4, tsEvents: [],
+      notes: [], ccMap: {}, pbMap: {},
+      cpMap: { cp_5: { ch: 5, points: [{ t: 0, v: 30 }] } },
+    }));
+    await page.evaluate((r) => window._TEST_applyMidiImport(r, 'merge', true), r);
+    const cpLanes = await page.evaluate(() => window._TEST_state.ccLanes.filter(l => l.type === 'cp'));
+    check('applyMidiImport "merge" with remap moves the imported CP lane off the conflicting channel',
+      cpLanes.length === 1 && cpLanes[0].ch !== 5, cpLanes);
+  });
+
+  // ---------------- Live PB/Channel Pressure recording (v0.9.19) ----------------
+
+  await withPage(browser, async (page) => {
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCountIn', '0');
+    await page.selectOption('#recCh', { value: '0' });
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    // Pitch Bend: 0xE0, ch0, lsb=0, msb=96 -> (0|(96<<7))-8192 = 4096
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xE0, 0, 96] }));
+    // Channel Pressure: 0xD0, ch0, value=77
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xD0, 77] }));
+    await page.waitForTimeout(100);
+    const lanes = await page.evaluate(() => window._TEST_state.ccLanes.map(l => ({ type: l.type, ch: l.ch, points: l.points })));
+    await page.click('#recordBtn');
+    const pbLane = lanes.find(l => l.type === 'pb');
+    const cpLane = lanes.find(l => l.type === 'cp');
+    check('recording live Pitch Bend (0xE0) creates a pb lane on the resolved channel with the decoded 14-bit value',
+      pbLane && pbLane.ch === 0 && pbLane.points.some(p => p.v === 4096), { pbLane });
+    check('recording live Channel Pressure (0xD0) creates a cp lane on the resolved channel with the raw 7-bit value',
+      cpLane && cpLane.ch === 0 && cpLane.points.some(p => p.v === 77), { cpLane });
+  });
+
+  await withPage(browser, async (page) => {
+    // Rec Ch "All" keeps PB/CP recording on whatever channel the message
+    // actually arrived on, same resolution rule notes already use.
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCountIn', '0');
+    await page.selectOption('#recCh', '');
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xE2, 0, 64] })); // PB status 0xE2 -> ch index 2
+    await page.waitForTimeout(100);
+    const pbLane = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.type === 'pb'));
+    await page.click('#recordBtn');
+    check('Rec Ch "All" records incoming Pitch Bend onto the channel it actually arrived on',
+      pbLane && pbLane.ch === 2, pbLane);
+  });
+
+  await withPage(browser, async (page) => {
+    // Channel 16 is reserved for the Follow MMV sync-track protocol — PB/CP
+    // arriving on ch16 must be silently dropped, same as notes already are.
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCountIn', '0');
+    await page.selectOption('#recCh', '');
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xEF, 0, 96] })); // PB on ch16 -> dropped
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xDF, 77] }));    // CP on ch16 -> dropped
+    await page.waitForTimeout(100);
+    const lanes = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.type));
+    await page.click('#recordBtn');
+    check('Pitch Bend / Channel Pressure arriving on channel 16 are dropped, not recorded into a lane',
+      !lanes.includes('pb') && !lanes.includes('cp'), lanes);
+  });
+
+  await withPage(browser, async (page) => {
+    // A second incoming PB/CP message on the same already-recording channel
+    // must update the SAME lane (upsertPoint's windowed dedup), not spawn a
+    // second one.
+    await page.click('#recordBtn', { button: 'right' });
+    await page.selectOption('#recCountIn', '0');
+    await page.selectOption('#recCh', { value: '0' });
+    await page.click('#recordBtn');
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xD0, 10] }));
+    await page.waitForTimeout(300);
+    await page.evaluate(() => window._TEST_onMidiIn({ data: [0xD0, 50] }));
+    await page.waitForTimeout(100);
+    const cpLanes = await page.evaluate(() => window._TEST_state.ccLanes.filter(l => l.type === 'cp'));
+    await page.click('#recordBtn');
+    check('repeated Channel Pressure recording on the same channel reuses one lane, not one-per-message',
+      cpLanes.length === 1, cpLanes);
   });
 
   await browser.close();

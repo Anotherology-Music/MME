@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.18
+  MMV MIDI & CC Curve Editor v0.9.19
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -475,6 +475,28 @@
   -8192..8191) instead of assuming CC, a "PB" badge marks these rows in the
   review table, and the wiring sheet / embedded notes describe them as
   "Pitch Bend" with a channel, not a CC number.
+  v0.9.19 Follow MMV auto-stop fix: if MME is just tracking MMV's playhead
+  (Follow MMV on, MME's own transport never started) and MMV's Ch16 sync-
+  track feed goes silent for 1.5s, MME now freezes and cleans up on its own
+  — same all-notes-off/output-clear cleanup the manual "turn Follow MMV off"
+  toggle already did — instead of extrapolating the last known position
+  forever. It self-heals the moment beats resume, so Follow MMV never needs
+  re-enabling by hand. (The already-playing case, MME's own transport
+  running off the sync track, already auto-stopped correctly — this closes
+  the one path that didn't.)
+  Note Info: removed the redundant "Note Info" title text, and added an
+  editable Len (note duration, in ticks) field next to Velocity — select a
+  batch of notes and type a new length to resize them all at once, useful
+  for very short imported notes (e.g. drum-beat MIDI) that are hard to see
+  or click.
+  Added a Channel Pressure (aftertouch, 0xD0) lane type — a "+ Add CP lane"
+  button next to CC/PB, full curve editing/drawing/generators, a "CP" row-1
+  tag like Pitch Bend's (also one 7-bit stream per MIDI channel rather than
+  a numbered CC), and full .mid export/import (including merge-mode channel
+  remapping) round-tripping Channel Pressure data. Recording (R) now also
+  captures live Pitch Bend and Channel Pressure into pb/cp lanes on the
+  resolved Rec Ch channel, same "All" vs specific-channel resolution and
+  channel-16 exclusion notes already use.
 -->
 
 <style>
@@ -536,18 +558,12 @@
      times — minimized, expanded-with-nothing-selected, and expanded-with-a-
      selection all render the same simple row, just with "—" placeholders
      when nothing is selected (mirroring how the CC lane's own V/P/S fields
-     already behave with no active point). Minimize/expand no longer swaps
-     in a separate DOM branch; the only thing it changes is the "Note Info"
-     title's visibility (see the container-query + .ni-collapsed rules
-     below) — a deliberately minimal difference, since collapsing the old
-     SECOND row (the 4-column grid) is what actually mattered, and that row
-     no longer exists to collapse. state.noteInfoManuallyCollapsed and
-     "is anything selected" (autoCollapse in updateNoteInfo()) remain two
-     independent flags feeding the same .ni-collapsed class — they just
-     produce near-identical visuals now that there's only one layout. */
+     already behave with no active point). The "Note Info" title itself was
+     removed entirely (v0.9.19) to make room for the Len field; minimize
+     (state.noteInfoManuallyCollapsed / .ni-min) now only affects #velRow's
+     real height, applied in JS near the #niToggleBtn click handler. */
   .note-info-left{padding:4px 5px!important;justify-content:center!important;container-type:inline-size;}
   .ni-row{display:flex;align-items:center;gap:4px;width:100%;min-width:0;}
-  .ni-title{flex:0 0 auto;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);white-space:nowrap;}
   .note-info-left .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
   /* Note details ("A#4  82") — no label above it (self-evident from its own
      content, per explicit instruction), unlike V/Pos/Ch which either have a
@@ -574,6 +590,10 @@
      forces the compact sizing .ni-input always intended. */
   #velValInput{flex:0 0 36px;width:36px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
   #velValInput::-webkit-outer-spin-button,#velValInput::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+  /* Same ID-selector-beats-attribute-selector override velocity needs above
+     (ticks can run to 5 digits, so a bit wider). */
+  #noteInfoLen{flex:0 0 44px;width:44px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
+  #noteInfoLen::-webkit-outer-spin-button,#noteInfoLen::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* No mini-label (per explicit instruction) — the mono font + BBT dots
      already read unambiguously as a position. */
   #noteInfoPos{flex:1 1 50px;min-width:34px;}
@@ -582,33 +602,11 @@
   .ni-input{color:var(--accent2);}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
   .ni-disp,.ni-note{color:var(--txt);display:flex;align-items:center;justify-content:center;}
-  /* "NOTE INFO" only renders when the leftcol is wide enough not to crowd
-     the rest of the row (tested at several --keys-w values; below ~190px
-     the title started visibly pushing the Position/Channel fields into
-     truncation, so that's the cutoff) — a real layout collapse via
-     container query (this element's own inline size tracks var(--keys-w)
-     exactly, the same width the CC lanes' leftcol already uses), not just
-     hidden text still reserving its row. When hidden, it takes zero space:
-     it's one flex child among the others in .ni-row, not a separate row. */
-  @container (max-width: 190px){ .ni-title{display:none;} }
-  /* Nothing selected (autoCollapse in updateNoteInfo()) hides the title
-     outright, regardless of width — the whole point of that state is
-     maximum compactness, so it shouldn't wait on a width threshold that
-     expanded mode uses. This is driven purely by selection state via
-     .ni-collapsed. It is deliberately NOT tied to the manual minimize
-     toggle below (state.noteInfoManuallyCollapsed / .ni-min) — the manual
-     toggle only shrinks the row's height (see #velRow height JS, near the
-     #niToggleBtn click handler); the "Note Info" text itself stays put
-     either way, only ever disappearing at the width threshold above or
-     when there's genuinely no selection. */
-  .note-info-left.ni-collapsed .ni-title{display:none;}
   /* Manual minimize/maximize toggle for the whole Note Info box — same
      .move-btn/.toggle-btn visual language as the CC lane row-1 toggle
      (▾ expanded / ▸ minimized, same .on convention), just scoped to
-     .note-info-left instead of .lane. Independent of the auto-collapse
-     above: it does NOT touch .ni-title (see comment above) — its whole
-     effect is on #velRow's real height, applied in JS next to the
-     #niToggleBtn click handler. */
+     .note-info-left instead of .lane. Its whole effect is on #velRow's
+     real height, applied in JS next to the #niToggleBtn click handler. */
   .note-info-left .move-btn{
     width:16px;height:16px;min-width:16px;min-height:16px;box-sizing:border-box;
     display:inline-flex;align-items:center;justify-content:center;
@@ -1305,10 +1303,11 @@
       <div class="leftcol note-info-left" id="noteInfoLeft">
         <div class="ni-row">
           <button type="button" class="move-btn toggle-btn" id="niToggleBtn" title="Minimize Note Info">▾</button>
-          <span class="ni-title">Note Info</span>
           <span id="noteInfoNote" class="ni-note" title="Pitch of selected note(s)">—</span>
           <span class="mini-lbl">V</span>
           <input type="number" id="velValInput" class="ni-input" min="1" max="127" placeholder="—" title="Velocity — applies to all selected notes">
+          <span class="mini-lbl">Len</span>
+          <input type="number" id="noteInfoLen" class="ni-input" min="1" placeholder="—" title="Note length in ticks — applies to all selected notes">
           <input type="text" id="noteInfoPos" class="ni-input mono" placeholder="—" title="Position (Bar.Beat.16th.Tick) — shown when selected notes share the same start. Editing shifts all selected notes together.&#10;Scroll or ↑↓ = ±1 tick, Shift = ±1/16th, Ctrl = ±1 beat, Alt = ±1 bar">
           <button type="button" id="noteInfoCh" class="chn-btn" title="Channel — applies to all selected notes">Ch—</button>
         </div>
@@ -1324,6 +1323,7 @@
       <div class="leftcol">
         <button id="addLane">+ Add CC lane</button>
         <button id="addPbLane">+ Add PB lane</button>
+        <button id="addCpLane">+ Add CP lane</button>
       </div>
       <div class="main" style="position:relative;">
         <div class="gen-grp">
@@ -2106,6 +2106,9 @@
     return p[p.length-1].v; }
   const LANE_PAD=6; // px margin at top & bottom so min/max are reachable without pixel-perfect aim
   function laneIsPb(lane){ return lane.type==='pb'; }
+  // Channel Pressure (aftertouch, 0xD0) — like Pitch Bend, one 7-bit stream
+  // per MIDI channel rather than a numbered CC.
+  function laneIsCp(lane){ return lane.type==='cp'; }
   function laneRange(lane){ return laneIsPb(lane)?{min:-8192,max:8191,center:0}:{min:0,max:127,center:64}; }
   // Whether a lane actually plays right now: while any lane in the project
   // is soloed, only soloed lanes are audible (everyone else is suppressed
@@ -2117,10 +2120,25 @@
   function laneAudible(lane){ return anyLaneSoloed()?!!lane.soloed:!lane.muted; }
   function val2yForLane(h,v,lane){ const r=laneRange(lane); return LANE_PAD+(1-(v-r.min)/(r.max-r.min))*(h-2*LANE_PAD); }
   function y2valForLane(y,h,lane){ const r=laneRange(lane); return r.min+clamp((1-(y-LANE_PAD)/(h-2*LANE_PAD)),0,1)*(r.max-r.min); }
+  // Raw MIDI bytes for sending/writing a lane's value at v — one place for
+  // the cc/pb/cp 3-way branch instead of repeating it at every call site
+  // (live send, MIDI file export, Follow MMV chase output, playback
+  // scheduling, playback chase-on-start).
+  function laneMsgBytes(lane,v){
+    const ch=lane.ch&15;
+    if(laneIsPb(lane)){ const pv=clamp(Math.round(v),-8192,8191)+8192; return [0xE0|ch,pv&0x7F,(pv>>7)&0x7F]; }
+    if(laneIsCp(lane)){ return [0xD0|ch,clamp(Math.round(v),0,127)]; }
+    return [0xB0|ch,lane.cc&127,clamp(Math.round(v),0,127)];
+  }
+  // Dedup key for "did the value actually change" checks — an int for PB's
+  // 14-bit encoding, the plain rounded 0-127 value for cc/cp.
+  function laneValueKey(lane,v){
+    if(laneIsPb(lane)){ const pv=clamp(Math.round(v),-8192,8191)+8192; return (pv&0x7F)|((pv>>7)<<8); }
+    return clamp(Math.round(v),0,127);
+  }
   function sendLaneVal(lane,v,t){
     if(!state.midiOut) return;
-    if(laneIsPb(lane)){ const pv=clamp(Math.round(v),-8192,8191)+8192; try{state.midiOut.send([0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F],t);}catch(e){} }
-    else{ try{state.midiOut.send([0xB0|(lane.ch&15),lane.cc&127,clamp(Math.round(v),0,127)],t);}catch(e){} }
+    try{ state.midiOut.send(laneMsgBytes(lane,v),t); }catch(e){}
   }
   function drawLane(lane){ const cv=lane._canvas,ctx=cv.getContext('2d'),vw=cv.width,h=cv.height; beginPane(ctx,cv); const sx=state.scrollLeft;
     const chMuted=state.viewCh!==null&&lane.ch!==state.viewCh; if(chMuted) ctx.globalAlpha=0.25;
@@ -2311,6 +2329,13 @@
     // Velocity
     const vi=$('velValInput');
     if(vi){ vi.value=(!sel.length)?'':sel.every(n=>n.vel===sel[0].vel)?sel[0].vel:''; }
+    // Length (ticks) — same "shared value or blank" convention as Velocity.
+    // The motivating case: a batch of very short imported notes (e.g. drum
+    // hits) that are hard to see/grab individually — select them all and
+    // type one new length to expand them together, same gesture as setting
+    // velocity for a group.
+    const nl=$('noteInfoLen');
+    if(nl){ nl.value=(!sel.length)?'':sel.every(n=>n.length===sel[0].length)?sel[0].length:''; }
     // Note pitch display — "A#4  82" (name, a couple of spaces, MIDI
     // number; no colon) when every selected note shares a pitch, "—"
     // otherwise (including nothing selected) — same placeholder convention
@@ -2329,26 +2354,16 @@
       nc.textContent=allSame?('Ch'+(sel[0].ch+1)):'Ch—';
       nc.classList.toggle('ch16',allSame&&sel[0].ch===15);
     }
-    // Note Info is now a single row at ALL times (true one-row minimized
-    // view, v0.9.13) — minimized, expanded-with-nothing-selected, and
-    // expanded-with-a-selection all render the exact same row structure,
-    // just with "—" placeholders when nothing is selected (set above).
-    // .ni-collapsed hides the "Note Info" title text and is driven purely
-    // by selection state (autoCollapse below) — see the CSS comment by
-    // .note-info-left.ni-collapsed .ni-title. state.noteInfoManuallyCollapsed
-    // (set by the ▾/▸ toggle button) is a SEPARATE concern entirely: it
-    // shrinks #velRow's real height (applied where the button is wired, near
-    // #niToggleBtn) rather than hiding the title — minimizing keeps the
-    // data readable, just compressed, matching how a minimized CC lane still
-    // shows its row 1 rather than disappearing. .ni-min reflects that flag
-    // on the element for anything that wants to key off it, but no CSS rule
-    // currently hides content because of it.
+    // Note Info is a single row at ALL times (true one-row minimized view,
+    // v0.9.13) — minimized, nothing-selected, and a real selection all
+    // render the exact same row structure, just with "—" placeholders when
+    // nothing is selected (set above). .ni-min reflects the manual ▾/▸
+    // toggle (state.noteInfoManuallyCollapsed) — it shrinks #velRow's real
+    // height (applied where the button is wired, near #niToggleBtn), not
+    // just hiding text, matching how a minimized CC lane still shows its
+    // row 1 rather than disappearing.
     const nil=$('noteInfoLeft');
-    const autoCollapse=sel.length===0 && (typeof ccSel==='undefined'||ccSel.size===0);
-    if(nil){
-      nil.classList.toggle('ni-collapsed', autoCollapse);
-      nil.classList.toggle('ni-min', !!state.noteInfoManuallyCollapsed);
-    }
+    if(nil) nil.classList.toggle('ni-min', !!state.noteInfoManuallyCollapsed);
   }
   // keep old name as alias so velocity drag calls still work
   const updateVelValInput=updateNoteInfo;
@@ -2378,6 +2393,18 @@
       updateNoteInfo(); requestDraw();
     });
     vi.addEventListener('keydown',e=>{ if(e.key==='Enter') vi.blur(); });
+    // Length (ticks) — same absolute-set-on-every-selected-note pattern as
+    // Velocity (not a delta/nudge like Position): typing one value sets
+    // every selected note to exactly that length, so a batch of short,
+    // hard-to-grab notes can be expanded together in one edit.
+    const nlEl=$('noteInfoLen');
+    nlEl.addEventListener('change',()=>{
+      if(!state.selection.size) return;
+      const len=Math.max(1,Math.round(+nlEl.value||1));
+      pushUndo(); state.notes.forEach(n=>{ if(state.selection.has(n.id)) n.length=len; });
+      updateNoteInfo(); requestDraw();
+    });
+    nlEl.addEventListener('keydown',e=>{ if(e.key==='Enter') nlEl.blur(); });
     // Channel — a button that opens the shared openChPopover() (the exact
     // same channel-picker UI/UX the CC lane's row-1 Channel button uses).
     // Selecting a channel applies it to every currently-selected note,
@@ -2769,6 +2796,7 @@
   // ---------- Lanes management ----------
   function addLane(cc, ch){ return _addLane('cc', cc, ch); }
   function addPbLane(ch){ return _addLane('pb', null, ch); }
+  function addCpLane(ch){ return _addLane('cp', null, ch); }
   function _addLane(type, cc, ch){ const id=state.nextId++; const color=LANE_COLORS[state.ccLanes.length%LANE_COLORS.length];
     const ctr=0;
     // New lanes inherit whatever tag(s) are currently active as a filter
@@ -2883,6 +2911,10 @@
       const pbTag=document.createElement('span'); pbTag.className='pb-tag'; pbTag.textContent='PB';
       pbTag.title='Pitch Bend (±8192, 14-bit)';
       row1.appendChild(toggleBtn); row1.appendChild(pbTag);
+    } else if(laneIsCp(lane)){
+      const cpTag=document.createElement('span'); cpTag.className='pb-tag'; cpTag.textContent='CP';
+      cpTag.title='Channel Pressure (aftertouch, 0-127)';
+      row1.appendChild(toggleBtn); row1.appendChild(cpTag);
     } else {
       const ccLbl=document.createElement('span'); ccLbl.className='mini-lbl'; ccLbl.textContent='CC';
       // CC# — a button (not a free-typing number field) that opens the
@@ -2894,8 +2926,8 @@
       row1.appendChild(toggleBtn); row1.appendChild(ccLbl); row1.appendChild(ccn);
     }
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
-    lname.placeholder=laneIsPb(lane)?'Pitch Bend':(ccName(lane.cc)||'Lane name…');
-    lname.value=lane.name; lname.title=laneIsPb(lane)?'Pitch Bend (±8192, 14-bit)':ccName(lane.cc);
+    lname.placeholder=laneIsPb(lane)?'Pitch Bend':laneIsCp(lane)?'Channel Pressure':(ccName(lane.cc)||'Lane name…');
+    lname.value=lane.name; lname.title=laneIsPb(lane)?'Pitch Bend (±8192, 14-bit)':laneIsCp(lane)?'Channel Pressure (aftertouch, 0-127)':ccName(lane.cc);
     // Free-text field a password manager (1Password/LastPass/Bitwarden) can
     // mistake for a login field, dropping an autofill icon on top of the
     // typed text — opt out with every ignore attribute each one respects.
@@ -2945,7 +2977,7 @@
     // is a real >=16px hit target with visible spacing between them.
     const row2=document.createElement('div'); row2.className='lr row2';
     const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
-    const valLbl=document.createElement('span'); valLbl.className='mini-lbl'; valLbl.textContent=laneIsPb(lane)?'PB':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':'Value';
+    const valLbl=document.createElement('span'); valLbl.className='mini-lbl'; valLbl.textContent=laneIsPb(lane)?'PB':laneIsCp(lane)?'CP':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':laneIsCp(lane)?'Channel pressure value':'Value';
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input';
     const rng=laneRange(lane); valInput.min=rng.min; valInput.max=rng.max; valInput.placeholder='—';
     valInput.title='Value of selected point\nScroll/↑↓=±1  Shift=±5  Ctrl=±10\nAlt+scroll=snap to % steps';
@@ -3069,7 +3101,7 @@
     // above); selecting an entry there applies the exact same side effects
     // the old free-typing input's 'input' handler used to (button label,
     // title tooltip, Name field's title + its placeholder when unnamed).
-    if(!laneIsPb(lane)){
+    if(ccn){
       function applyCcSideEffects(){
         ccn.textContent=lane.cc;
         const name=ccName(lane.cc);
@@ -3622,12 +3654,8 @@
     for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue;
       if(anySolo&&!lane.soloed) continue;
       if(opts.excludeMuted&&lane.muted) continue;
-      const ch=lane.ch&15; let last=null;
-      if(laneIsPb(lane)){
-        for(let t=0;t<=end;t+=step){ const pv=clamp(Math.round(laneValueAt(lane,t)),-8192,8191)+8192; const enc=(pv&0x7F)|((pv>>7)<<8); if(enc!==last){ ev.push({tick:t,o:3,d:[0xE0|ch,pv&0x7F,(pv>>7)&0x7F]}); last=enc; } }
-      } else {
-        for(let t=0;t<=end;t+=step){ const v=clamp(Math.round(laneValueAt(lane,t)),0,127); if(v!==last){ ev.push({tick:t,o:3,d:[0xB0|ch,lane.cc&127,v]}); last=v; } }
-      }
+      let last=null;
+      for(let t=0;t<=end;t+=step){ const v=laneValueAt(lane,t); const key=laneValueKey(lane,v); if(key!==last){ ev.push({tick:t,o:3,d:laneMsgBytes(lane,v)}); last=key; } }
     }
     ev.sort((a,b)=>a.tick-b.tick||a.o-b.o); const trk=[]; let prev=0;
     for(const e of ev){ trk.push(...writeVarLen(e.tick-prev)); prev=e.tick; trk.push(...e.d); }
@@ -3887,7 +3915,7 @@
 
   function parseMidi(buf){ const dv=new DataView(buf); let p=0; const rd=n=>{let v=0;for(let i=0;i<n;i++){v=(v<<8)|dv.getUint8(p++);}return v;};
     if(rd(4)!==0x4D546864) throw new Error('Not a MIDI file'); rd(4); const fmt=rd(2), ntrk=rd(2), div=rd(2);
-    const notes=[], ccMap={}, pbMap={}, tsEvents=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
+    const notes=[], ccMap={}, pbMap={}, cpMap={}, tsEvents=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
     for(let ti=0;ti<ntrk;ti++){ if(rd(4)!==0x4D54726B) break; const len=rd(4); const end=p+len; let abs=0, status=0; const open={};
       while(p<end){ let delta=0,b; do{ b=dv.getUint8(p++); delta=(delta<<7)|(b&0x7F);}while(b&0x80); abs+=delta;
         let s=dv.getUint8(p); if(s&0x80){ status=s; p++; } else { s=status; } const type=s&0xF0, ch=s&0x0F;
@@ -3903,8 +3931,9 @@
         else if(type===0xB0){ const cc=dv.getUint8(p++),v=dv.getUint8(p++); const k=ch+'_'+cc; (ccMap[k]=ccMap[k]||{cc,ch,points:[]}).points.push({t:abs,v}); }
         else if(type===0xA0){ p+=2; }
         else if(type===0xE0){ const lsb=dv.getUint8(p++),msb=dv.getUint8(p++); const pv=(lsb|(msb<<7))-8192; const k='pb_'+ch; (pbMap[k]=pbMap[k]||{ch,points:[]}).points.push({t:abs,v:pv}); }
-        else if(type===0xC0||type===0xD0){ p+=1; } else { p++; } } p=end; }
-    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,mmvMeta,tsEvents}; }
+        else if(type===0xD0){ const v=dv.getUint8(p++); const k='cp_'+ch; (cpMap[k]=cpMap[k]||{ch,points:[]}).points.push({t:abs,v}); }
+        else if(type===0xC0){ p+=1; } else { p++; } } p=end; }
+    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,cpMap,mmvMeta,tsEvents}; }
   function closeNote(open,ch,pitch,abs,notes){ const arr=open[ch+'_'+pitch]; if(arr&&arr.length){ const o=arr.shift(); notes.push({start:o.start,length:Math.max(1,abs-o.start),pitch,vel:o.vel,ch}); } }
   function importMidi(buf, filename){ let r; try{ r=parseMidi(buf); }catch(err){ alert('Could not read file: '+err.message); return; }
     if(!projectHasContent()){ applyMidiImport(r,'replace'); return; }
@@ -3934,6 +3963,7 @@
     r.notes.forEach(n=>chs.add(n.ch));
     Object.values(r.ccMap).forEach(l=>chs.add(l.ch));
     Object.values(r.pbMap||{}).forEach(l=>chs.add(l.ch));
+    Object.values(r.cpMap||{}).forEach(l=>chs.add(l.ch));
     return chs;
   }
 
@@ -4024,6 +4054,7 @@
       state.ccLanes.forEach(l=>l._row&&l._row.remove()); state.ccLanes=[];
       Object.values(r.ccMap).forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:64},{t:totalTicks(),v:64}]; });
       Object.values(r.pbMap||{}).forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; });
+      Object.values(r.cpMap||{}).forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; });
       if(!state.ccLanes.length) addLane(1,0);
       if(r.mmvMeta){
         state.pitchNames=r.mmvMeta.pitchNames||{};
@@ -4038,6 +4069,7 @@
     let notes=r.notes.map(n=>({pitch:n.pitch,start:Math.round(n.start*scale),length:Math.max(1,Math.round(n.length*scale)),vel:n.vel,ch:n.ch}));
     let ccList=Object.values(r.ccMap).map(l=>({cc:l.cc,ch:l.ch,points:l.points}));
     let pbList=Object.values(r.pbMap||{}).map(l=>({ch:l.ch,points:l.points}));
+    let cpList=Object.values(r.cpMap||{}).map(l=>({ch:l.ch,points:l.points}));
     if(remapChannels){
       const used=usedChannels();
       const incoming=[...importedChannels(r)].sort((a,b)=>a-b);
@@ -4048,15 +4080,18 @@
       notes=notes.map(n=>({...n,ch:mapping[n.ch]}));
       ccList=ccList.map(l=>({...l,ch:mapping[l.ch]}));
       pbList=pbList.map(l=>({...l,ch:mapping[l.ch]}));
+      cpList=cpList.map(l=>({...l,ch:mapping[l.ch]}));
     }
     notes.forEach(n=>state.notes.push({id:state.nextId++,...n}));
     let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+n.length));
     ccList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,Math.round(pt.t*scale))));
     pbList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,Math.round(pt.t*scale))));
+    cpList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,Math.round(pt.t*scale))));
     state.bars=Math.max(state.bars,Math.ceil(maxT/ticksPerBar())+1);
     const newLanes=[];
     ccList.forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(pt=>({t:Math.round(pt.t*scale),v:pt.v})):[{t:0,v:64},{t:totalTicks(),v:64}]; newLanes.push(lane); });
     pbList.forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:Math.round(pt.t*scale),v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
+    cpList.forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:Math.round(pt.t*scale),v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
     if(r.mmvMeta){
       Object.assign(state.pitchNames, r.mmvMeta.pitchNames||{});
       const ln=r.mmvMeta.laneNames||{};
@@ -4163,11 +4198,7 @@
     }
     const step=Math.max(1,Math.round(state.ppq/state.ccRes));
     for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false||!laneAudible(lane)) continue; let last=null;
-      if(laneIsPb(lane)){
-        for(let t=lo;t<hi;t+=step){ const pv=clamp(Math.round(laneValueAt(lane,t)),-8192,8191)+8192; const enc=(pv&0x7F)|((pv>>7)<<8); if(enc!==last){ try{state.midiOut.send([0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F],base+(t-lo)*mspt);}catch(e){} last=enc; } }
-      } else {
-        for(let t=lo;t<hi;t+=step){ const v=clamp(Math.round(laneValueAt(lane,t)),0,127); if(v!==last){ try{state.midiOut.send([0xB0|(lane.ch&15),lane.cc&127,v],base+(t-lo)*mspt);}catch(e){} last=v; } }
-      }
+      for(let t=lo;t<hi;t+=step){ const v=laneValueAt(lane,t); const key=laneValueKey(lane,v); if(key!==last){ try{state.midiOut.send(laneMsgBytes(lane,v),base+(t-lo)*mspt);}catch(e){} last=key; } }
     }
   }
   function followScheduleBeat(beatTick, wallMs){
@@ -4179,9 +4210,33 @@
 
   let syncAnchor=null; // {wallMs, tick} — updated on each incoming Ch16 beat note
   let syncRaf=null, syncHeartbeat=null;
-  function armSyncHeartbeat(){ // auto-stop if no beats arrive within 1.5s
+  // Same cleanup the manual Follow-MMV-off toggle does, minus turning Follow
+  // itself off — used when the Ch16 beat feed goes stale while MME was only
+  // tracking MMV's position (never pressed its own Play), so it self-heals
+  // the moment beats resume instead of needing the toggle re-enabled by
+  // hand. stop() (the state.playing branch below) already does the
+  // equivalent cleanup via stopTransport(), so this only needs to cover the
+  // path stop() doesn't reach.
+  function syncFeedStale(){
+    syncAnchor=null; followReset();
+    if(syncRaf){ cancelAnimationFrame(syncRaf); syncRaf=null; }
+    allNotesOff();
+    if(state.midiOut){ try{ state.midiOut.clear&&state.midiOut.clear(); }catch(e){} }
+  }
+  // Auto-stop (or, if MME was only following without its own transport
+  // running, auto-clean-up) if no Ch16 beats arrive within 1.5s — covers
+  // both "MMV's transport stopped" and "the sync-track feed just dropped
+  // out" without requiring an explicit MIDI Stop message from MMV, which it
+  // may not send. Previously only armed while state.playing, which left the
+  // "just watching MMV's position" mode with no staleness detection at all:
+  // syncFrame's extrapolation would run forever off a stale anchor.
+  function armSyncHeartbeat(){
     if(syncHeartbeat) clearTimeout(syncHeartbeat);
-    syncHeartbeat=setTimeout(()=>{ syncHeartbeat=null; if(state.syncFollow&&state.playing) stop(); },1500);
+    syncHeartbeat=setTimeout(()=>{
+      syncHeartbeat=null;
+      if(!state.syncFollow) return;
+      if(state.playing) stop(); else syncFeedStale();
+    },1500);
   }
   function clearSyncHeartbeat(){ if(syncHeartbeat){ clearTimeout(syncHeartbeat); syncHeartbeat=null; } }
   function syncFrame(now){
@@ -4216,7 +4271,7 @@
     syncAnchor={wallMs, tick};
     if(!state.playing){ state.playhead=tick; updatePlayheadEl(); updatePlayPos(); }
     if(!syncRaf&&state.syncFollow&&!state.playing) syncRaf=requestAnimationFrame(syncFrame);
-    if(state.playing) armSyncHeartbeat();
+    armSyncHeartbeat();
     followScheduleBeat(tick, wallMs);
   }
 
@@ -4252,7 +4307,7 @@
     const status=data[0], d1=data[1], d2=data.length>2?data[2]:0;
     const type=status&0xF0, ch=status&0x0F;
     if(ch===15) return; // reserved for the Follow MMV sync-track protocol
-    if(type!==0x90 && type!==0x80) return;
+    if(type!==0x90 && type!==0x80 && type!==0xE0 && type!==0xD0) return;
     // Deliberately ignore e.timeStamp: some browser/OS/driver combinations
     // coalesce rapid successive MIDI messages and report timestamps that don't
     // reflect when each one actually arrived (fast runs collapse toward the
@@ -4261,6 +4316,16 @@
     // input latency the Rec Offset control can compensate for.
     const wallMs=performance.now()+state.recOffsetMs;
     const tick=clamp(Math.round(wallTimeToTick(wallMs)),0,totalTicks());
+    if(type===0xE0 || type===0xD0){
+      const outCh=state.recCh===null?ch:state.recCh;
+      const laneType=type===0xE0?'pb':'cp';
+      let lane=state.ccLanes.find(l=>l.type===laneType&&l.ch===outCh);
+      if(!lane) lane=laneType==='pb'?addPbLane(outCh):addCpLane(outCh);
+      const v=type===0xE0?(d1|(d2<<7))-8192:d1;
+      upsertPoint(lane,tick,v);
+      requestDraw();
+      return;
+    }
     // Keyed by pitch+incoming-channel (not pitch alone): in "All" mode two
     // controllers/splits sending the same pitch on different channels must not
     // let one's note-off close the other's note-on. The output channel is
@@ -4366,11 +4431,7 @@
       const off=Math.min(b, n.start+Math.max(1,n.length)); evs.push({tick:off, o:1, msg:[0x80|(n.ch&15), n.pitch&127, 0]}); } }
     const step=Math.max(1, Math.round(state.ppq/state.ccRes));
     for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false||!laneAudible(lane)) continue; let last=null;
-      if(laneIsPb(lane)){
-        for(let t=a;t<b;t+=step){ const pv=clamp(Math.round(laneValueAt(lane,t)),-8192,8191)+8192; const enc=(pv&0x7F)|((pv>>7)<<8); if(enc!==last){ evs.push({tick:t,o:3,msg:[0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F]}); last=enc; } }
-      } else {
-        for(let t=a;t<b;t+=step){ const v=clamp(Math.round(laneValueAt(lane,t)),0,127); if(v!==last){ evs.push({tick:t,o:3,msg:[0xB0|(lane.ch&15),lane.cc&127,v]}); last=v; } }
-      }
+      for(let t=a;t<b;t+=step){ const v=laneValueAt(lane,t); const key=laneValueKey(lane,v); if(key!==last){ evs.push({tick:t,o:3,msg:laneMsgBytes(lane,v)}); last=key; } }
     }
     if(state.metronomeOn){
       barsInView(a,b).forEach(bar=>{
@@ -4404,7 +4465,7 @@
           mSend([0x90|(n.ch&15),n.pitch&127,clamp(n.vel,1,127)], t0);
       }
       // Chase CC: send current value of each lane at startTick
-      for(const lane of state.ccLanes){ if(lane.points.length&&lane.visible!==false&&laneAudible(lane)){ const v=laneValueAt(lane,startTick); if(laneIsPb(lane)){ const pv=clamp(Math.round(v),-8192,8191)+8192; mSend([0xE0|(lane.ch&15),pv&0x7F,(pv>>7)&0x7F],t0); } else { mSend([0xB0|(lane.ch&15),lane.cc&127,clamp(Math.round(v),0,127)],t0); } } }
+      for(const lane of state.ccLanes){ if(lane.points.length&&lane.visible!==false&&laneAudible(lane)){ const v=laneValueAt(lane,startTick); mSend(laneMsgBytes(lane,v),t0); } }
     }
     startClock(); schedulerTick(); rafVisual=requestAnimationFrame(visualFrame);
     // Audio playback — start at the same wall-clock instant as MIDI (t0)
@@ -4701,6 +4762,7 @@
 
   $('addLane').onclick=()=>{ pushUndo(); addLane(); };
   $('addPbLane').addEventListener('click',()=>{ pushUndo(); addPbLane(); });
+  $('addCpLane').addEventListener('click',()=>{ pushUndo(); addCpLane(); });
   document.querySelectorAll('[data-gen]').forEach(b=>b.onclick=()=>generate(b.dataset.gen));
 
   // GENERATE strip: 6 shape buttons + one ↗/↘ direction toggle that applies
@@ -4742,9 +4804,7 @@
   $('midiIn').addEventListener('change',e=>setMidiInById(e.target.value));
   $('mmvSmooth').addEventListener('click',()=>{ state.mmvSmooth=!state.mmvSmooth; $('mmvSmooth').classList.toggle('on',state.mmvSmooth); });
   $('syncFollow').addEventListener('click',()=>{ state.syncFollow=!state.syncFollow; $('syncFollow').classList.toggle('on',state.syncFollow);
-    if(!state.syncFollow){ syncAnchor=null; followReset(); lastSyncBeatIdx=-1;
-      if(syncRaf){ cancelAnimationFrame(syncRaf); syncRaf=null; }
-      allNotesOff(); if(state.midiOut) try{ state.midiOut.clear&&state.midiOut.clear(); }catch(e){} } });
+    if(!state.syncFollow){ syncFeedStale(); clearSyncHeartbeat(); lastSyncBeatIdx=-1; } });
   $('scrollLockBtn').addEventListener('click',()=>{ state.scrollLock=!state.scrollLock; $('scrollLockBtn').classList.toggle('on',state.scrollLock);
     if(state.scrollLock) applyScrollLock(); });
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
