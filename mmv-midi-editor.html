@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.19
+  MMV MIDI & CC Curve Editor v0.9.20
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -497,6 +497,23 @@
   captures live Pitch Bend and Channel Pressure into pb/cp lanes on the
   resolved Rec Ch channel, same "All" vs specific-channel resolution and
   channel-16 exclusion notes already use.
+  v0.9.20 Show bar becomes two composable filter facets instead of a single
+  OR'd tag pool. A "match Any/All" toggle now governs how multiple selected
+  TAG chips combine — Any = the union (widen: lanes matching any selected
+  tag), All = the intersection (narrow: only lanes carrying every selected
+  tag) — so "the lanes shared by two ISFs" and "the union of two ISFs" are
+  both expressible from the same chips. Added colour-filter chips (a swatch +
+  count per distinct lane colour in use) as a second facet for isolating an
+  ad-hoc set you've grouped by eye, with no typed tag needed; colours OR
+  within themselves (a lane has one colour) and AND against the tag facet, so
+  "the blue lanes within these two ISFs" composes cleanly. Colour chips only
+  appear once at least two distinct colours exist, and the "All" chip clears
+  both facets at once. Cosmetic: the lane name in row 1 is now the bold
+  headline (heavier weight, slightly larger), and the tag pill below it is
+  muted at rest (grey text + a dimmed colour dot, since the lane's colour is
+  already shown by row 1's swatch) — it brightens back to full colour on
+  hover/focus. Both filter facets are view-only and never saved with the
+  project.
 -->
 
 <style>
@@ -811,7 +828,7 @@
     flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
   .lane .lane-row1 .ccn:hover{border-color:var(--accent);color:var(--accent);}
   .lane .lane-row1 .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
-  .lane .lane-row1 input.lname{flex:1 1 60px;min-width:0;max-width:140px;padding:2px 4px;font-size:11px;background:#3a3f4a;color:#fff;border-color:#505868;}
+  .lane .lane-row1 input.lname{flex:1 1 60px;min-width:0;max-width:140px;padding:2px 4px;font-size:12px;font-weight:600;background:#3a3f4a;color:#fff;border-color:#505868;}
   /* Channel — a button (not a free-typing number field) labeled "Ch N" that
      opens the shared #chPopover listing all 16 MIDI channels by number and
      configured name; see #chPopover below. Lives in row 1 (CC lanes) and in
@@ -909,6 +926,20 @@
   .lane.lane-dimmed{opacity:.4;}
   .tag-bar{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:4px 8px;background:var(--panel3);border-bottom:1px solid var(--line);}
   .tag-bar .tag-bar-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
+  /* Match Any/All — a two-segment toggle governing how selected tag chips
+     combine (union vs intersection). Reads as a mode selector, not a filter
+     chip, so it doesn't get mistaken for the "All" show-everything chip. */
+  .tag-bar .match-lbl{margin-right:1px;margin-left:2px;}
+  .tag-bar .match-toggle{display:inline-flex;border:1px solid #3a404e;border-radius:8px;overflow:hidden;margin-right:2px;}
+  .tag-bar .match-seg{font-size:10px;padding:2px 7px;background:#23272f;color:#9aa3b5;border:none;cursor:pointer;}
+  .tag-bar .match-seg:hover{color:#cfe4ff;}
+  .tag-bar .match-seg.on{background:#1f3a5c;color:#cfe4ff;}
+  /* Thin divider between the tag chips and the colour chips. */
+  .tag-bar .tag-bar-sep{width:1px;align-self:stretch;background:var(--line);margin:1px 3px;}
+  /* Colour-filter chip — a swatch + count, no group M/S controls (colour is a
+     visual grouping, not a semantic one). */
+  .tag-bar .color-chip{gap:5px;padding:2px 7px;}
+  .tag-bar .color-chip-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
   .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
   .tag-chip:hover{border-color:#4fa3ff;}
   .tag-chip.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
@@ -978,13 +1009,20 @@
   /* Tag pill — compact colored stand-in for the tag text field, shown until
      clicked (or Enter/Space when focused via keyboard), which swaps it for
      the real input (committed the same as always on blur/Enter). */
+  /* Tag pill sits BELOW the lane name (row 3) and is deliberately muted at
+     rest — grey text + a dimmed colour dot — so the name in row 1 stays the
+     clear headline when scanning the lane list. The lane's colour is already
+     shown by row 1's swatch, so the dot here is a secondary cue and doesn't
+     need to be at full strength unless you're actually reaching for it. It
+     brightens back to full colour on hover/focus (i.e. when editing). */
   .lane .leftcol .tag-pill{flex:1 1 50px;min-width:0;display:inline-flex;align-items:center;gap:4px;
-    font-size:10px;color:#cfe4ff;background:#2c313b;border:1px solid #3a404e;border-radius:9px;
+    font-size:10px;color:#8892a4;background:#2c313b;border:1px solid #343a45;border-radius:9px;
     padding:2px 7px;cursor:pointer;}
-  .lane .leftcol .tag-pill:hover,.lane .leftcol .tag-pill:focus{border-color:var(--accent);outline:none;}
+  .lane .leftcol .tag-pill:hover,.lane .leftcol .tag-pill:focus{border-color:var(--accent);color:#cfe4ff;outline:none;}
+  .lane .leftcol .tag-pill:hover .tag-pill-dot,.lane .leftcol .tag-pill:focus .tag-pill-dot{opacity:1;}
   .lane .leftcol .tag-pill.empty{color:var(--txt2);font-style:italic;}
   .lane .leftcol .tag-pill.empty .tag-pill-dot{opacity:.35;}
-  .lane .leftcol .tag-pill-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+  .lane .leftcol .tag-pill-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;opacity:.4;}
   .lane .leftcol .tag-pill-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .lane .leftcol .row3 input.ltags{flex:1 1 50px;min-width:0;padding:2px 4px;font-size:10px;color:#9fb4d8;background:#2c313b;border-color:#3a404e;}
   .add-row{flex:0 0 auto;border-top:1px solid var(--line);display:flex;min-height:0;}
@@ -2627,9 +2665,31 @@
     document.body.style.cursor=''; lane._preview=null; ccDrag=null; commitUndo(); requestDraw(); });
 
   // ---------- Lane tags / filter bar ----------
-  const tagFilter=new Set(); // empty = show all lanes
+  // The Show bar is two independent filter facets, both view-only (never
+  // saved with the project):
+  //   • tagFilter  — a set of selected tag strings, combined by tagFilterMode
+  //                  ('any' = union/widen, 'all' = intersection/narrow).
+  //   • colorFilter — a set of selected lane colours, always OR'd internally
+  //                  (a lane has exactly one colour, so intersection would be
+  //                  empty by definition).
+  // A lane is shown only if it passes BOTH facets (AND across facets); an
+  // empty facet is ignored. Both empty = show everything. This keeps "the
+  // union of two ISFs" (tags, Any) and "just the blue ones" (colour)
+  // expressible, and composable — "blue lanes within these two ISFs" — without
+  // ever inventing per-ISF marker tags.
+  const tagFilter=new Set();   // empty = tag facet inactive
+  const colorFilter=new Set(); // empty = colour facet inactive
+  let tagFilterMode='any';     // 'any' (union) | 'all' (intersection)
   function laneTagList(l){ return Array.isArray(l.tags)?l.tags:[]; }
-  function laneMatchesFilter(l){ if(tagFilter.size===0) return true; return laneTagList(l).some(t=>tagFilter.has(t)); }
+  function laneMatchesTagFacet(l){
+    if(tagFilter.size===0) return true;
+    const tags=laneTagList(l);
+    return tagFilterMode==='all'
+      ? [...tagFilter].every(t=>tags.includes(t))
+      : tags.some(t=>tagFilter.has(t));
+  }
+  function laneMatchesColorFacet(l){ return colorFilter.size===0 || colorFilter.has(l.color); }
+  function laneMatchesFilter(l){ return laneMatchesTagFacet(l)&&laneMatchesColorFacet(l); }
   // Right-click a tag chip's label to rename that tag everywhere it's used.
   // Rewrites the exact string on every lane's tags array (deduping if the
   // new name collides with a tag already on that lane), keeps an active
@@ -2744,11 +2804,38 @@
   function refreshTagBar(){
     const bar=$('tagFilterBar'); if(!bar) return;
     const all=new Set(); state.ccLanes.forEach(l=>laneTagList(l).forEach(t=>all.add(t)));
+    // Colours present across every lane, in lane order (so the chips don't
+    // reshuffle as you toggle them). A lane always has a colour, so filtering
+    // by colour only earns its keep once there are at least two distinct ones.
+    const colorOrder=[]; const colorCount=new Map();
+    state.ccLanes.forEach(l=>{ if(!colorCount.has(l.color)) colorOrder.push(l.color); colorCount.set(l.color,(colorCount.get(l.color)||0)+1); });
+    const colorsUseful=colorOrder.length>=2;
+    // Drop any selected tag/colour that no longer exists so a stale filter
+    // can't silently hide everything.
     [...tagFilter].forEach(t=>{ if(!all.has(t)) tagFilter.delete(t); });
+    [...colorFilter].forEach(c=>{ if(!colorCount.has(c)) colorFilter.delete(c); });
+    if(!colorsUseful) colorFilter.clear();
     bar.innerHTML='';
-    if(all.size===0){ bar.style.display='none'; applyTagFilter(); return; }
+    if(all.size===0 && !colorsUseful){ bar.style.display='none'; applyTagFilter(); return; }
     bar.style.display='flex';
     const lbl=document.createElement('span'); lbl.className='tag-bar-lbl'; lbl.textContent='Show:'; bar.appendChild(lbl);
+    // Match Any/All — only shown when there are tags to combine. It governs
+    // the TAG facet only (colours are always OR'd): Any = a lane matching any
+    // selected tag (widen), All = only lanes carrying every selected tag
+    // (narrow). Inert with a single tag selected, but always visible then so
+    // its meaning is discoverable before you need it.
+    if(all.size>0){
+      const mLbl=document.createElement('span'); mLbl.className='tag-bar-lbl match-lbl'; mLbl.textContent='match'; bar.appendChild(mLbl);
+      const mt=document.createElement('span'); mt.className='match-toggle';
+      mt.title='How multiple selected tags combine:\nAny = lanes matching ANY selected tag (widen)\nAll = only lanes with EVERY selected tag (narrow)';
+      [['any','Any'],['all','All']].forEach(([mode,txt])=>{
+        const seg=document.createElement('button'); seg.type='button';
+        seg.className='match-seg'+(tagFilterMode===mode?' on':''); seg.textContent=txt;
+        seg.addEventListener('click',()=>{ if(tagFilterMode!==mode){ tagFilterMode=mode; refreshTagBar(); } });
+        mt.appendChild(seg);
+      });
+      bar.appendChild(mt);
+    }
     // Each chip is a small pill: a minimize/maximize mini-toggle (same
     // ▾/▸ + .on visual language as a CC lane's own row-1 toggle-btn),
     // then the label button (the existing show/hide filter toggle), then
@@ -2784,12 +2871,34 @@
       wrap.appendChild(mBtn); wrap.appendChild(sBtn);
       bar.appendChild(wrap);
     }
-    chip('All',tagFilter.size===0,()=>{ tagFilter.clear(); refreshTagBar(); },'Show every lane',state.ccLanes.slice());
-    [...all].sort((a,b)=>a.localeCompare(b)).forEach(t=>{
-      const lanesForTag=state.ccLanes.filter(l=>laneTagList(l).includes(t));
-      chip(t+' ('+lanesForTag.length+')',tagFilter.has(t),()=>{ tagFilter.has(t)?tagFilter.delete(t):tagFilter.add(t); refreshTagBar(); },
-        'Toggle lanes tagged "'+t+'" — multiple tags show the union (right-click to rename)',lanesForTag,t);
-    });
+    // "All" = clear both facets = show everything; lit only when nothing is
+    // filtered at all.
+    chip('All',tagFilter.size===0&&colorFilter.size===0,()=>{ tagFilter.clear(); colorFilter.clear(); refreshTagBar(); },'Show every lane',state.ccLanes.slice());
+    if(all.size>0){
+      const combineHint=tagFilterMode==='all'?' — with others: only lanes carrying every selected tag':' — with others: the union of all selected tags';
+      [...all].sort((a,b)=>a.localeCompare(b)).forEach(t=>{
+        const lanesForTag=state.ccLanes.filter(l=>laneTagList(l).includes(t));
+        chip(t+' ('+lanesForTag.length+')',tagFilter.has(t),()=>{ tagFilter.has(t)?tagFilter.delete(t):tagFilter.add(t); refreshTagBar(); },
+          'Toggle lanes tagged "'+t+'"'+combineHint+' (right-click to rename)',lanesForTag,t);
+      });
+    }
+    // Colour chips — an ad-hoc "isolate the lanes I've grouped by eye" filter
+    // that needs no typed tag. A swatch + count, OR'd within colours and AND'd
+    // against the tag facet above (a colour selection narrows whatever the
+    // tags already picked). Filter-only by design: colour is a visual grouping,
+    // not a semantic group, so these carry no minimize/Mute/Solo controls.
+    if(colorsUseful){
+      const sep=document.createElement('span'); sep.className='tag-bar-sep'; bar.appendChild(sep);
+      colorOrder.forEach(color=>{
+        const count=colorCount.get(color), on=colorFilter.has(color);
+        const wrap=document.createElement('span'); wrap.className='tag-chip color-chip'+(on?' on':'');
+        const dot=document.createElement('span'); dot.className='color-chip-dot'; dot.style.background=color;
+        const b=document.createElement('button'); b.className='tag-chip-label'; b.textContent=count;
+        b.title='Show only lanes coloured like this ('+count+' lane'+(count>1?'s':'')+') — combines with other colours as OR, and narrows the tag selection';
+        b.addEventListener('click',()=>{ colorFilter.has(color)?colorFilter.delete(color):colorFilter.add(color); refreshTagBar(); });
+        wrap.appendChild(dot); wrap.appendChild(b); bar.appendChild(wrap);
+      });
+    }
     applyTagFilter();
   }
 

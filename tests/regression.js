@@ -95,6 +95,11 @@ function buildTestHtml() {
       '  window._TEST_autosaveMarkClean = () => autosaveMarkClean();',
       '  window._TEST_checkAutosaveRestore = () => checkAutosaveRestore();',
       '  window._TEST_noteName = (p) => noteName(p);',
+      '  window._TEST_setLaneTags = (id, tags) => { const l = state.ccLanes.find(x => x.id === id); if (l) l.tags = tags; refreshTagBar(); };',
+      '  window._TEST_setLaneColor = (id, color) => { const l = state.ccLanes.find(x => x.id === id); if (l) l.color = color; refreshTagBar(); };',
+      '  window._TEST_tagFilterMode = () => tagFilterMode;',
+      '  window._TEST_colorFilter = () => [...colorFilter];',
+      '  window._TEST_tagFilter = () => [...tagFilter];',
       '  init();',
     ].join('\n')
   );
@@ -5247,6 +5252,153 @@ async function run() {
     await page.click('#recordBtn');
     check('repeated Channel Pressure recording on the same channel reuses one lane, not one-per-message',
       cpLanes.length === 1, cpLanes);
+  });
+
+  // ---------- Show bar: Any/All match toggle + colour-filter facets (v0.9.20) ----------
+
+  const filtered = (page, id) => page.evaluate((id) => document.querySelector(`.lane[data-id="${id}"]`).classList.contains('lane-filtered'), id);
+
+  await withPage(browser, async (page) => {
+    // Three lanes: A has tag x, B has tag y, C has both. Select x and y.
+    const a = await page.evaluate(() => window._TEST_addLane(40, 0));
+    const b = await page.evaluate(() => window._TEST_addLane(41, 0));
+    const c = await page.evaluate(() => window._TEST_addLane(42, 0));
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), a);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['y']), b);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x', 'y']), c);
+    // The withPage baseline lane also exists with tag "New"; select just x and y.
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll('#tagFilterBar .tag-chip-label')];
+      labels.find(l => l.textContent.startsWith('x')).click();
+      labels.find(l => l.textContent.startsWith('y')).click();
+    });
+    await page.waitForTimeout(50);
+
+    const modeDefault = await page.evaluate(() => window._TEST_tagFilterMode());
+    const anyState = { a: await filtered(page, a), b: await filtered(page, b), c: await filtered(page, c) };
+    check('Match defaults to "Any": selecting tags x and y shows lanes matching EITHER (A, B, C all visible)',
+      modeDefault === 'any' && !anyState.a && !anyState.b && !anyState.c, { modeDefault, anyState });
+
+    // Flip to All via the match toggle's "All" segment.
+    await page.evaluate(() => {
+      const seg = [...document.querySelectorAll('#tagFilterBar .match-seg')].find(s => s.textContent === 'All');
+      seg.click();
+    });
+    await page.waitForTimeout(50);
+    const modeAll = await page.evaluate(() => window._TEST_tagFilterMode());
+    const allState = { a: await filtered(page, a), b: await filtered(page, b), c: await filtered(page, c) };
+    check('Switching Match to "All": only the lane carrying BOTH x and y stays visible (A and B filtered out, C shown)',
+      modeAll === 'all' && allState.a && allState.b && !allState.c, { modeAll, allState });
+  });
+
+  await withPage(browser, async (page) => {
+    // The match toggle only renders when tags exist, and has exactly two segments.
+    const segs = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .match-seg')].map(s => s.textContent));
+    check('the Match toggle shows exactly two segments, Any and All, with Any lit by default',
+      segs.length === 2 && segs[0] === 'Any' && segs[1] === 'All', segs);
+    const anyOn = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .match-seg')].find(s => s.textContent === 'Any').classList.contains('on'));
+    check('the "Any" segment is lit by default', anyOn === true, anyOn);
+  });
+
+  await withPage(browser, async (page) => {
+    // Colour chips only appear once there are >=2 distinct lane colours.
+    // (_addLane auto-assigns a different colour per lane, so force them all to
+    // one colour first to exercise the single-colour case.)
+    const a = await page.evaluate(() => window._TEST_addLane(43, 0));
+    await page.evaluate(() => window._TEST_state.ccLanes.forEach(l => window._TEST_setLaneColor(l.id, '#4fa3ff')));
+    const oneColorChips = await page.evaluate(() => document.querySelectorAll('#tagFilterBar .color-chip').length);
+    check('with only one distinct lane colour, no colour chips are shown', oneColorChips === 0, oneColorChips);
+
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#ff6b6b'), a);
+    const twoColorChips = await page.evaluate(() => document.querySelectorAll('#tagFilterBar .color-chip').length);
+    check('introducing a second distinct colour makes exactly two colour chips appear', twoColorChips === 2, twoColorChips);
+  });
+
+  await withPage(browser, async (page) => {
+    // Colour filter isolates by colour, OR within colours.
+    const a = await page.evaluate(() => window._TEST_addLane(44, 0));
+    const b = await page.evaluate(() => window._TEST_addLane(45, 0));
+    const c = await page.evaluate(() => window._TEST_addLane(46, 0));
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#4fa3ff'), a);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#7ed957'), b);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#4fa3ff'), c);
+    // baseline lane has its own default colour; select the blue chip.
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .color-chip')].find(ch => ch.querySelector('.color-chip-dot').style.background.includes('79, 163, 255'));
+      chip.querySelector('.tag-chip-label').click();
+    });
+    await page.waitForTimeout(50);
+    const blueOnly = { a: await filtered(page, a), b: await filtered(page, b), c: await filtered(page, c) };
+    check('selecting the blue colour chip shows only blue lanes (A, C), filtering out the green one (B)',
+      !blueOnly.a && blueOnly.b && !blueOnly.c, blueOnly);
+
+    await page.evaluate(() => {
+      const chip = [...document.querySelectorAll('#tagFilterBar .color-chip')].find(ch => ch.querySelector('.color-chip-dot').style.background.includes('126, 217, 87'));
+      chip.querySelector('.tag-chip-label').click();
+    });
+    await page.waitForTimeout(50);
+    const bluePlusGreen = { a: await filtered(page, a), b: await filtered(page, b), c: await filtered(page, c) };
+    check('adding the green chip widens the colour facet (blue OR green): A, B, C all visible again',
+      !bluePlusGreen.a && !bluePlusGreen.b && !bluePlusGreen.c, bluePlusGreen);
+  });
+
+  await withPage(browser, async (page) => {
+    // Colour facet AND tag facet: "blue lanes tagged x".
+    const a = await page.evaluate(() => window._TEST_addLane(47, 0));
+    const b = await page.evaluate(() => window._TEST_addLane(48, 0));
+    const c = await page.evaluate(() => window._TEST_addLane(49, 0));
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), a);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#4fa3ff'), a);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), b);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#7ed957'), b);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['y']), c);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#4fa3ff'), c);
+    await page.evaluate(() => {
+      [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(l => l.textContent.startsWith('x')).click();
+      const chip = [...document.querySelectorAll('#tagFilterBar .color-chip')].find(ch => ch.querySelector('.color-chip-dot').style.background.includes('79, 163, 255'));
+      chip.querySelector('.tag-chip-label').click();
+    });
+    await page.waitForTimeout(50);
+    const st = { a: await filtered(page, a), b: await filtered(page, b), c: await filtered(page, c) };
+    check('tag facet AND colour facet: tag "x" + blue shows only the blue x-lane (A); green-x (B) and blue-y (C) are filtered out',
+      !st.a && st.b && st.c, st);
+  });
+
+  await withPage(browser, async (page) => {
+    // The "All" chip clears BOTH facets.
+    const a = await page.evaluate(() => window._TEST_addLane(50, 0));
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), a);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#ff6b6b'), a);
+    await page.evaluate(() => {
+      [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(l => l.textContent.startsWith('x')).click();
+      const chip = [...document.querySelectorAll('#tagFilterBar .color-chip')].find(ch => ch.querySelector('.color-chip-dot').style.background.includes('255, 107, 107'));
+      chip.querySelector('.tag-chip-label').click();
+    });
+    await page.waitForTimeout(50);
+    const before = { tags: await page.evaluate(() => window._TEST_tagFilter()), colors: await page.evaluate(() => window._TEST_colorFilter()) };
+    await page.evaluate(() => {
+      const allChip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.querySelector('.tag-chip-label') && c.querySelector('.tag-chip-label').textContent.trim() === 'All');
+      allChip.querySelector('.tag-chip-label').click();
+    });
+    await page.waitForTimeout(50);
+    const after = { tags: await page.evaluate(() => window._TEST_tagFilter()), colors: await page.evaluate(() => window._TEST_colorFilter()) };
+    check('the "All" chip clears both the tag facet and the colour facet in one click',
+      before.tags.length > 0 && before.colors.length > 0 && after.tags.length === 0 && after.colors.length === 0, { before, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // Cosmetic: the lane name is the bold headline; the tag pill recedes.
+    const id = await page.evaluate(() => window._TEST_state.ccLanes[0].id);
+    const style = await page.evaluate((id) => {
+      const row = document.querySelector(`.lane[data-id="${id}"]`);
+      const name = getComputedStyle(row.querySelector('input.lname'));
+      const dot = getComputedStyle(row.querySelector('.tag-pill-dot'));
+      return { nameWeight: name.fontWeight, nameSize: name.fontSize, dotOpacity: dot.opacity };
+    }, id);
+    check('the lane name is bold (600) and 12px so it reads as the row headline',
+      (style.nameWeight === '600' || style.nameWeight === 'bold') && style.nameSize === '12px', style);
+    check('the tag-pill colour dot is muted (~40% opacity) at rest, so it stops out-shouting the name',
+      Math.abs(parseFloat(style.dotOpacity) - 0.4) < 0.001, style);
   });
 
   await browser.close();
