@@ -5509,6 +5509,79 @@ async function run() {
       before === 'dynamic' && after === 'all', { before, after });
   });
 
+  // ---------- Colour chip: whole pill is clickable (v0.9.22) ----------
+
+  await withPage(browser, async (page) => {
+    // Two distinct colours so colour chips render. Clicking the chip's colour
+    // DOT (not the count label) must still toggle the filter — the whole pill
+    // is the hit target now, not just the number.
+    const a = await page.evaluate(() => window._TEST_addLane(70, 0));
+    const b = await page.evaluate(() => window._TEST_addLane(71, 0));
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#4fa3ff'), a);
+    await page.evaluate((id) => window._TEST_setLaneColor(id, '#7ed957'), b);
+    const before = await page.evaluate(() => window._TEST_colorFilter().length);
+    // Click the pill at its far-left (over the swatch dot, well away from the
+    // count label) — proves the whole pill is the hit target, not just the
+    // number. (The dot itself is pointer-events:none, so Playwright reports the
+    // wrapper as the element that receives the click — exactly the fix.)
+    await page.click('#tagFilterBar .color-chip', { position: { x: 6, y: 8 } });
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_colorFilter().length);
+    check('clicking a colour chip on its swatch dot (not the number) still toggles the colour filter — the whole pill is clickable',
+      before === 0 && after === 1, { before, after });
+  });
+
+  // ---------- Section-visibility toggles in the corner cell (v0.9.22) ----------
+
+  await withPage(browser, async (page) => {
+    const ids = ['viewPiano', 'viewNotes', 'viewCC'];
+    const startLit = await page.evaluate((ids) => ids.every(id => document.getElementById(id).classList.contains('on')), ids);
+    check('the three view toggles (Piano / Notes / CC) all start lit (sections visible)', startLit === true, startLit);
+
+    // Hide CC: body gets .hide-cc, the lanes/#tagFilterBar/.add-row hide, the button un-lights.
+    await page.click('#viewCC');
+    await page.waitForTimeout(50);
+    const ccHidden = await page.evaluate(() => ({
+      bodyClass: document.body.classList.contains('hide-cc'),
+      lanesHidden: getComputedStyle(document.getElementById('lanes')).display === 'none',
+      btnLit: document.getElementById('viewCC').classList.contains('on'),
+    }));
+    check('clicking "CC" hides the CC lanes (body.hide-cc, #lanes display:none) and un-lights the toggle',
+      ccHidden.bodyClass && ccHidden.lanesHidden && !ccHidden.btnLit, ccHidden);
+
+    // The piano roll grows to reclaim the freed space while CC is hidden.
+    const pianoGrew = await page.evaluate(() => document.querySelector('.piano-row').offsetHeight > 260);
+    check('with CC hidden, the piano roll expands past its default 200px to fill the freed space', pianoGrew === true, pianoGrew);
+
+    // Toggle CC back: everything restores.
+    await page.click('#viewCC');
+    await page.waitForTimeout(50);
+    const ccBack = await page.evaluate(() => ({
+      bodyClass: document.body.classList.contains('hide-cc'),
+      lanesShown: getComputedStyle(document.getElementById('lanes')).display !== 'none',
+      btnLit: document.getElementById('viewCC').classList.contains('on'),
+    }));
+    check('clicking "CC" again restores the CC lanes and re-lights the toggle',
+      !ccBack.bodyClass && ccBack.lanesShown && ccBack.btnLit, ccBack);
+  });
+
+  await withPage(browser, async (page) => {
+    // Piano and Notes toggles hide their own sections independently.
+    await page.click('#viewPiano');
+    await page.click('#viewNotes');
+    await page.waitForTimeout(50);
+    const st = await page.evaluate(() => ({
+      pianoHidden: getComputedStyle(document.querySelector('.piano-row')).display === 'none',
+      splitterHidden: getComputedStyle(document.getElementById('prSplitter')).display === 'none',
+      velHidden: getComputedStyle(document.getElementById('velRow')).display === 'none',
+      pianoLit: document.getElementById('viewPiano').classList.contains('on'),
+      notesLit: document.getElementById('viewNotes').classList.contains('on'),
+      ccStillShown: getComputedStyle(document.getElementById('lanes')).display !== 'none',
+    }));
+    check('the "Piano" and "Notes" toggles hide the piano roll (+ its splitter) and the note-data lane independently, leaving CC lanes shown',
+      st.pianoHidden && st.splitterHidden && st.velHidden && !st.pianoLit && !st.notesLit && st.ccStillShown, st);
+  });
+
   await browser.close();
   server.close();
 

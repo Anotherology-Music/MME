@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.21
+  MMV MIDI & CC Curve Editor v0.9.22
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -526,6 +526,15 @@
   scope and de-duplicated so "dynamic" is defined once and used everywhere.
   Like the other two facets, the state filter is view-only and never saved
   with the project.
+  v0.9.22 Two small workflow wins. The top-left corner cell (previously a
+  static "bar" label) now holds three section-visibility toggles — Piano /
+  Notes / CC — so the Piano Roll, the Note Data (velocity) lane, and the
+  CC/PB/CP lane stack can each be hidden to reclaim vertical space when
+  focused on one or the other. Hiding CC expands the Piano Roll to fill the
+  freed area (rather than leaving a dead gap), giving near-full-screen note
+  editing; the toggles are view-only and not saved with the project. Also,
+  the colour-filter chips in the Show bar are now clickable across the whole
+  pill (the swatch dot and padding, not just the number).
 -->
 
 <style>
@@ -714,6 +723,21 @@
   .ruler-row{height:26px;border-bottom:1px solid var(--line);}
   .ruler-row .leftcol{display:flex;align-items:center;justify-content:center;color:var(--txt2);font-size:10px;}
   .ruler-row .scroll{overflow-x:hidden;overflow-y:hidden;}
+  /* The top-left corner cell (was a static "bar" label) now holds three
+     section-visibility toggles — hide the Piano Roll / Note Data / CC lanes to
+     reclaim vertical space when focused on one or the other. Lit = shown. */
+  .view-toggles{gap:4px!important;padding:0 6px!important;}
+  .view-tog{font-size:10px;padding:2px 6px;border-radius:5px;border:1px solid #3a404e;background:#23272f;color:#7a8296;cursor:pointer;line-height:1;}
+  .view-tog:hover{border-color:var(--accent);}
+  .view-tog.on{background:#1f3a5c;border-color:#4fa3ff;color:#cfe4ff;}
+  body.hide-piano .piano-row,body.hide-piano #prSplitter{display:none!important;}
+  body.hide-notes #velRow,body.hide-notes #gripVel{display:none!important;}
+  body.hide-cc #tagFilterBar,body.hide-cc #lanes,body.hide-cc .add-row{display:none!important;}
+  /* With the CC lanes hidden, the piano roll (normally a fixed height with the
+     CC lanes taking the flex-grow space) expands to fill the freed area —
+     overriding any inline height the splitter set — so hiding CC actually
+     reclaims the real estate rather than leaving a dead gap. */
+  body.hide-cc .piano-row{flex:1 1 0!important;height:auto!important;}
   #rulerCanvas{cursor:text;}
 
   .audio-row{flex:0 0 auto;height:84px;border-bottom:1px solid var(--line);min-height:32px;}
@@ -950,7 +974,8 @@
   .tag-bar .tag-bar-sep{width:1px;align-self:stretch;background:var(--line);margin:1px 3px;}
   /* Colour-filter chip — a swatch + count, no group M/S controls (colour is a
      visual grouping, not a semantic one). */
-  .tag-bar .color-chip{gap:5px;padding:2px 7px;}
+  .tag-bar .color-chip{gap:5px;padding:2px 7px;cursor:pointer;}
+  .tag-bar .color-chip>*{pointer-events:none;}
   .tag-bar .color-chip-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
   .tag-chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 4px;border-radius:10px;border:1px solid #3a404e;background:#23272f;color:#9aa3b5;}
   .tag-chip:hover{border-color:#4fa3ff;}
@@ -1318,7 +1343,11 @@
 
   <div class="editor">
     <div class="row ruler-row">
-      <div class="leftcol">bar</div>
+      <div class="leftcol view-toggles">
+        <button type="button" class="view-tog on" id="viewPiano" title="Show / hide the Piano Roll — hide it to give the CC lanes the full height">Piano</button>
+        <button type="button" class="view-tog on" id="viewNotes" title="Show / hide the Note Data (velocity) lane">Notes</button>
+        <button type="button" class="view-tog on" id="viewCC" title="Show / hide the CC / PB / CP lanes — hide them to work on notes full-screen">CC</button>
+      </div>
       <div class="scroll" id="rulerScroll"><canvas id="rulerCanvas"></canvas></div>
     </div>
 
@@ -2942,11 +2971,15 @@
       const sep=document.createElement('span'); sep.className='tag-bar-sep'; bar.appendChild(sep);
       colorOrder.forEach(color=>{
         const count=colorCount.get(color), on=colorFilter.has(color);
+        // The whole chip is the click target (not just the count text): the
+        // click handler + title live on the wrapper, and its children are
+        // pointer-events:none (see CSS) so a click anywhere on the pill — dot,
+        // number, or padding — toggles the filter.
         const wrap=document.createElement('span'); wrap.className='tag-chip color-chip'+(on?' on':'');
+        wrap.title='Show only lanes coloured like this ('+count+' lane'+(count>1?'s':'')+') — combines with other colours as OR, and narrows the tag selection';
         const dot=document.createElement('span'); dot.className='color-chip-dot'; dot.style.background=color;
-        const b=document.createElement('button'); b.className='tag-chip-label'; b.textContent=count;
-        b.title='Show only lanes coloured like this ('+count+' lane'+(count>1?'s':'')+') — combines with other colours as OR, and narrows the tag selection';
-        b.addEventListener('click',()=>{ colorFilter.has(color)?colorFilter.delete(color):colorFilter.add(color); refreshTagBar(); });
+        const b=document.createElement('span'); b.className='tag-chip-label'; b.textContent=count;
+        wrap.addEventListener('click',()=>{ colorFilter.has(color)?colorFilter.delete(color):colorFilter.add(color); refreshTagBar(); });
         wrap.appendChild(dot); wrap.appendChild(b); bar.appendChild(wrap);
       });
     }
@@ -4923,6 +4956,17 @@
   $('addLane').onclick=()=>{ pushUndo(); addLane(); };
   $('addPbLane').addEventListener('click',()=>{ pushUndo(); addPbLane(); });
   $('addCpLane').addEventListener('click',()=>{ pushUndo(); addCpLane(); });
+  // Section-visibility toggles in the top-left corner cell — flip a body
+  // class that hides the Piano Roll / Note Data / CC lanes, then re-layout the
+  // surviving canvases so the freed space is actually reclaimed. View-only
+  // (not part of the saved project) — like the Show-bar filters.
+  [['viewPiano','hide-piano'],['viewNotes','hide-notes'],['viewCC','hide-cc']].forEach(([btnId,cls])=>{
+    $(btnId).addEventListener('click',()=>{
+      const hidden=document.body.classList.toggle(cls);
+      $(btnId).classList.toggle('on',!hidden);
+      resizeCanvases(); requestDraw();
+    });
+  });
   document.querySelectorAll('[data-gen]').forEach(b=>b.onclick=()=>generate(b.dataset.gen));
 
   // GENERATE strip: 6 shape buttons + one ↗/↘ direction toggle that applies
