@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.20
+  MMV MIDI & CC Curve Editor v0.9.21
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -514,6 +514,18 @@
   already shown by row 1's swatch) — it brightens back to full colour on
   hover/focus. Both filter facets are view-only and never saved with the
   project.
+
+  v0.9.21 Show bar gains a third composable filter facet: a "state" toggle
+  reading All | Dynamic | Static. Dynamic shows only lanes whose automation
+  actually changes over time (the value is not flat), Static shows only lanes
+  whose value never changes, and All (the default) doesn't filter by state.
+  This facet ANDs with the existing tag and colour facets, so "the dynamic
+  lanes tagged ISF-A" or "the static blue lanes" compose cleanly. The
+  dynamic/flat test reuses the very same automation check the Migrate-to-MMV
+  dialog uses — that helper (isLaneAutomated) has been hoisted to shared
+  scope and de-duplicated so "dynamic" is defined once and used everywhere.
+  Like the other two facets, the state filter is view-only and never saved
+  with the project.
 -->
 
 <style>
@@ -2142,6 +2154,23 @@
     if(t<=p[0].t) return p[0].v; if(t>=p[p.length-1].t) return p[p.length-1].v;
     for(let i=0;i<p.length-1;i++){ if(t>=p[i].t && t<=p[i+1].t){ const f=(t-p[i].t)/((p[i+1].t-p[i].t)||1); return p[i].v+(p[i+1].v-p[i].v)*f; } }
     return p[p.length-1].v; }
+  // Does this lane's value ever change across the whole timeline, sampled
+  // at the same tick spacing and rounding the playback scheduler itself
+  // uses (see schedulerTick/buildPassEvents)? "Automated" means "would
+  // ever actually send a second distinct raw value" — not just "has more
+  // than one point drawn". Shared: the Migrate-to-MMV dialog and the Show
+  // bar's state facet both use this single "dynamic vs flat" test.
+  function isLaneAutomated(lane){
+    if(!lane.points||lane.points.length<2) return false;
+    const step=Math.max(1,Math.round(state.ppq/state.ccRes));
+    const end=totalTicks();
+    const r=laneRange(lane);
+    const first=Math.round(clamp(laneValueAt(lane,0),r.min,r.max));
+    for(let t=0;t<=end;t+=step){
+      if(Math.round(clamp(laneValueAt(lane,t),r.min,r.max))!==first) return true;
+    }
+    return false;
+  }
   const LANE_PAD=6; // px margin at top & bottom so min/max are reachable without pixel-perfect aim
   function laneIsPb(lane){ return lane.type==='pb'; }
   // Channel Pressure (aftertouch, 0xD0) — like Pitch Bend, one 7-bit stream
@@ -2680,6 +2709,7 @@
   const tagFilter=new Set();   // empty = tag facet inactive
   const colorFilter=new Set(); // empty = colour facet inactive
   let tagFilterMode='any';     // 'any' (union) | 'all' (intersection)
+  let laneStateFilter='all';   // 'all' | 'dynamic' | 'static' — view-only, not saved
   function laneTagList(l){ return Array.isArray(l.tags)?l.tags:[]; }
   function laneMatchesTagFacet(l){
     if(tagFilter.size===0) return true;
@@ -2689,7 +2719,11 @@
       : tags.some(t=>tagFilter.has(t));
   }
   function laneMatchesColorFacet(l){ return colorFilter.size===0 || colorFilter.has(l.color); }
-  function laneMatchesFilter(l){ return laneMatchesTagFacet(l)&&laneMatchesColorFacet(l); }
+  // State facet — filters by whether a lane's automation actually changes
+  // over time. Reuses isLaneAutomated (the same "dynamic vs flat" test the
+  // Migrate-to-MMV dialog uses). ANDs against the tag & colour facets.
+  function laneMatchesStateFacet(l){ return laneStateFilter==='all' ? true : (laneStateFilter==='dynamic' ? isLaneAutomated(l) : !isLaneAutomated(l)); }
+  function laneMatchesFilter(l){ return laneMatchesTagFacet(l)&&laneMatchesColorFacet(l)&&laneMatchesStateFacet(l); }
   // Right-click a tag chip's label to rename that tag everywhere it's used.
   // Rewrites the exact string on every lane's tags array (deduping if the
   // new name collides with a tag already on that lane), keeps an active
@@ -2826,7 +2860,7 @@
     // its meaning is discoverable before you need it.
     if(all.size>0){
       const mLbl=document.createElement('span'); mLbl.className='tag-bar-lbl match-lbl'; mLbl.textContent='match'; bar.appendChild(mLbl);
-      const mt=document.createElement('span'); mt.className='match-toggle';
+      const mt=document.createElement('span'); mt.className='match-toggle match-toggle-tag';
       mt.title='How multiple selected tags combine:\nAny = lanes matching ANY selected tag (widen)\nAll = only lanes with EVERY selected tag (narrow)';
       [['any','Any'],['all','All']].forEach(([mode,txt])=>{
         const seg=document.createElement('button'); seg.type='button';
@@ -2835,6 +2869,23 @@
         mt.appendChild(seg);
       });
       bar.appendChild(mt);
+    }
+    // State facet — All | Dynamic | Static. A third view-only filter that
+    // narrows to lanes whose automation actually changes over time
+    // (Dynamic) or never does (Static), ANDed against the tag & colour
+    // facets. Always shown while the bar is visible so it composes with
+    // whatever else is selected.
+    {
+      const sLbl=document.createElement('span'); sLbl.className='tag-bar-lbl match-lbl'; sLbl.textContent='state'; bar.appendChild(sLbl);
+      const st=document.createElement('span'); st.className='match-toggle match-toggle-state';
+      st.title='Filter lanes by whether their automation changes over time:\nAll = don\'t filter by state\nDynamic = only lanes whose value changes\nStatic = only lanes whose value never changes\n(combines with the tag & colour filters)';
+      [['all','All'],['dynamic','Dynamic'],['static','Static']].forEach(([mode,txt])=>{
+        const seg=document.createElement('button'); seg.type='button';
+        seg.className='match-seg'+(laneStateFilter===mode?' on':''); seg.textContent=txt;
+        seg.addEventListener('click',()=>{ if(laneStateFilter!==mode){ laneStateFilter=mode; refreshTagBar(); } });
+        st.appendChild(seg);
+      });
+      bar.appendChild(st);
     }
     // Each chip is a small pill: a minimize/maximize mini-toggle (same
     // ▾/▸ + .on visual language as a CC lane's own row-1 toggle-btn),
@@ -2873,7 +2924,7 @@
     }
     // "All" = clear both facets = show everything; lit only when nothing is
     // filtered at all.
-    chip('All',tagFilter.size===0&&colorFilter.size===0,()=>{ tagFilter.clear(); colorFilter.clear(); refreshTagBar(); },'Show every lane',state.ccLanes.slice());
+    chip('All',tagFilter.size===0&&colorFilter.size===0&&laneStateFilter==='all',()=>{ tagFilter.clear(); colorFilter.clear(); laneStateFilter='all'; refreshTagBar(); },'Show every lane',state.ccLanes.slice());
     if(all.size>0){
       const combineHint=tagFilterMode==='all'?' — with others: only lanes carrying every selected tag':' — with others: the union of all selected tags';
       [...all].sort((a,b)=>a.localeCompare(b)).forEach(t=>{
@@ -5980,23 +6031,6 @@
       const frac=(clamp(rawVal,r.min,r.max)-r.min)/(r.max-r.min);
       if(row.type==='bool') return frac>=0.5?1:0;
       return row.min+frac*(row.max-row.min);
-    }
-
-    // Does this lane's value ever change across the whole timeline, sampled
-    // at the same tick spacing and rounding the playback scheduler itself
-    // uses (see schedulerTick/buildPassEvents)? "Automated" means "would
-    // ever actually send a second distinct raw value" — not just "has more
-    // than one point drawn".
-    function isLaneAutomated(lane){
-      if(!lane.points||lane.points.length<2) return false;
-      const step=Math.max(1,Math.round(state.ppq/state.ccRes));
-      const end=totalTicks();
-      const r=laneRange(lane);
-      const first=Math.round(clamp(laneValueAt(lane,0),r.min,r.max));
-      for(let t=0;t<=end;t+=step){
-        if(Math.round(clamp(laneValueAt(lane,t),r.min,r.max))!==first) return true;
-      }
-      return false;
     }
 
     // MMV Scale/Offset/Step for a row's native MIN/MAX. Scale=MAX-MIN,

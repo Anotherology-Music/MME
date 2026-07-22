@@ -100,6 +100,9 @@ function buildTestHtml() {
       '  window._TEST_tagFilterMode = () => tagFilterMode;',
       '  window._TEST_colorFilter = () => [...colorFilter];',
       '  window._TEST_tagFilter = () => [...tagFilter];',
+      '  window._TEST_laneStateFilter = () => laneStateFilter;',
+      '  window._TEST_setLaneStateFilter = (mode) => { laneStateFilter = mode; refreshTagBar(); };',
+      '  window._TEST_setLanePoints = (id, points) => { const l = state.ccLanes.find(x => x.id === id); if (l) l.points = points; refreshTagBar(); };',
       '  init();',
     ].join('\n')
   );
@@ -5281,7 +5284,7 @@ async function run() {
 
     // Flip to All via the match toggle's "All" segment.
     await page.evaluate(() => {
-      const seg = [...document.querySelectorAll('#tagFilterBar .match-seg')].find(s => s.textContent === 'All');
+      const seg = [...document.querySelectorAll('#tagFilterBar .match-toggle-tag .match-seg')].find(s => s.textContent === 'All');
       seg.click();
     });
     await page.waitForTimeout(50);
@@ -5292,11 +5295,11 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // The match toggle only renders when tags exist, and has exactly two segments.
-    const segs = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .match-seg')].map(s => s.textContent));
+    // The tag match toggle only renders when tags exist, and has exactly two segments.
+    const segs = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .match-toggle-tag .match-seg')].map(s => s.textContent));
     check('the Match toggle shows exactly two segments, Any and All, with Any lit by default',
       segs.length === 2 && segs[0] === 'Any' && segs[1] === 'All', segs);
-    const anyOn = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .match-seg')].find(s => s.textContent === 'Any').classList.contains('on'));
+    const anyOn = await page.evaluate(() => [...document.querySelectorAll('#tagFilterBar .match-toggle-tag .match-seg')].find(s => s.textContent === 'Any').classList.contains('on'));
     check('the "Any" segment is lit by default', anyOn === true, anyOn);
   });
 
@@ -5399,6 +5402,111 @@ async function run() {
       (style.nameWeight === '600' || style.nameWeight === 'bold') && style.nameSize === '12px', style);
     check('the tag-pill colour dot is muted (~40% opacity) at rest, so it stops out-shouting the name',
       Math.abs(parseFloat(style.dotOpacity) - 0.4) < 0.001, style);
+  });
+
+  // ---------- Show bar: state (All/Dynamic/Static) facet (v0.9.21) ----------
+
+  await withPage(browser, async (page) => {
+    // The state toggle renders whenever the bar is visible, with exactly
+    // three segments (All/Dynamic/Static), All lit by default.
+    const segs = await page.evaluate(() => {
+      const st = document.querySelector('#tagFilterBar .match-toggle-state');
+      return [...st.querySelectorAll('.match-seg')].map(s => s.textContent);
+    });
+    check('the state toggle shows exactly three segments: All, Dynamic, Static',
+      segs.length === 3 && segs[0] === 'All' && segs[1] === 'Dynamic' && segs[2] === 'Static', segs);
+    const mode = await page.evaluate(() => window._TEST_laneStateFilter());
+    check('the state facet defaults to "all"', mode === 'all', mode);
+    const allOn = await page.evaluate(() => {
+      const st = document.querySelector('#tagFilterBar .match-toggle-state');
+      return [...st.querySelectorAll('.match-seg')].find(s => s.textContent === 'All').classList.contains('on');
+    });
+    check('the state facet "All" segment is lit by default', allOn === true, allOn);
+  });
+
+  await withPage(browser, async (page) => {
+    // A: dynamic (value changes over time), B: static (flat). New lanes are
+    // flat (single point v=0) → static; push a differing point to make dynamic.
+    const a = await page.evaluate(() => window._TEST_addLane(60, 0));
+    const b = await page.evaluate(() => window._TEST_addLane(61, 0));
+    await page.evaluate((id) => window._TEST_setLanePoints(id, [{ t: 0, v: 0 }, { t: 960, v: 127 }]), a);
+    // Give both lanes a shared tag so the bar is visible via tags too.
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['s']), a);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['s']), b);
+
+    // Sanity: the shared automation test agrees on which is dynamic.
+    const auto = { a: await page.evaluate((id) => window._TEST_isLaneAutomated(id), a), b: await page.evaluate((id) => window._TEST_isLaneAutomated(id), b) };
+    check('isLaneAutomated (now shared) reports A dynamic and B static', auto.a === true && auto.b === false, auto);
+
+    // Dynamic: only automated lanes shown.
+    await page.evaluate(() => {
+      const st = [...document.querySelectorAll('#tagFilterBar .match-toggle-state')][0];
+      [...st.querySelectorAll('.match-seg')].find(s => s.textContent === 'Dynamic').click();
+    });
+    await page.waitForTimeout(50);
+    const dyn = { a: await filtered(page, a), b: await filtered(page, b) };
+    check('state=Dynamic shows only lanes whose automation changes (A visible, B filtered)',
+      !dyn.a && dyn.b, dyn);
+
+    // Static: only flat lanes shown.
+    await page.evaluate(() => {
+      const st = [...document.querySelectorAll('#tagFilterBar .match-toggle-state')][0];
+      [...st.querySelectorAll('.match-seg')].find(s => s.textContent === 'Static').click();
+    });
+    await page.waitForTimeout(50);
+    const stat = { a: await filtered(page, a), b: await filtered(page, b) };
+    check('state=Static shows only flat lanes (B visible, A filtered)',
+      stat.a && !stat.b, stat);
+
+    // All: both shown again.
+    await page.evaluate(() => {
+      const st = [...document.querySelectorAll('#tagFilterBar .match-toggle-state')][0];
+      [...st.querySelectorAll('.match-seg')].find(s => s.textContent === 'All').click();
+    });
+    await page.waitForTimeout(50);
+    const both = { a: await filtered(page, a), b: await filtered(page, b) };
+    check('state=All shows both dynamic and static lanes', !both.a && !both.b, both);
+  });
+
+  await withPage(browser, async (page) => {
+    // State facet ANDs with the tag facet: "dynamic lanes tagged x".
+    // A: dynamic + tag x, B: static + tag x, C: dynamic + tag y.
+    const a = await page.evaluate(() => window._TEST_addLane(62, 0));
+    const b = await page.evaluate(() => window._TEST_addLane(63, 0));
+    const c = await page.evaluate(() => window._TEST_addLane(64, 0));
+    await page.evaluate((id) => window._TEST_setLanePoints(id, [{ t: 0, v: 0 }, { t: 960, v: 100 }]), a);
+    await page.evaluate((id) => window._TEST_setLanePoints(id, [{ t: 0, v: 0 }, { t: 960, v: 100 }]), c);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), a);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), b);
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['y']), c);
+    // Select tag x, then flip state to Dynamic.
+    await page.evaluate(() => {
+      [...document.querySelectorAll('#tagFilterBar .tag-chip-label')].find(l => l.textContent.startsWith('x')).click();
+    });
+    await page.evaluate(() => {
+      const st = [...document.querySelectorAll('#tagFilterBar .match-toggle-state')][0];
+      [...st.querySelectorAll('.match-seg')].find(s => s.textContent === 'Dynamic').click();
+    });
+    await page.waitForTimeout(50);
+    const st = { a: await filtered(page, a), b: await filtered(page, b), c: await filtered(page, c) };
+    check('state facet AND tag facet: Dynamic + tag "x" shows only the dynamic x-lane (A); static-x (B) and dynamic-y (C) filtered out',
+      !st.a && st.b && st.c, st);
+  });
+
+  await withPage(browser, async (page) => {
+    // The "All" chip also resets the state facet back to 'all'.
+    const a = await page.evaluate(() => window._TEST_addLane(65, 0));
+    await page.evaluate((id) => window._TEST_setLaneTags(id, ['x']), a);
+    await page.evaluate(() => window._TEST_setLaneStateFilter('dynamic'));
+    const before = await page.evaluate(() => window._TEST_laneStateFilter());
+    await page.evaluate(() => {
+      const allChip = [...document.querySelectorAll('#tagFilterBar .tag-chip')].find(c => c.querySelector('.tag-chip-label') && c.querySelector('.tag-chip-label').textContent.trim() === 'All');
+      allChip.querySelector('.tag-chip-label').click();
+    });
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_laneStateFilter());
+    check('the "All" chip resets the state facet to "all" (alongside clearing tags & colours)',
+      before === 'dynamic' && after === 'all', { before, after });
   });
 
   await browser.close();
