@@ -5582,6 +5582,57 @@ async function run() {
       st.pianoHidden && st.splitterHidden && st.velHidden && !st.pianoLit && !st.notesLit && st.ccStillShown, st);
   });
 
+  // ---------- Lane row alignment, active bar, click-select, arrow nav (v0.9.23) ----------
+
+  await withPage(browser, async (page) => {
+    const cc = await page.evaluate(() => window._TEST_addLane(23, 0));
+    const pb = await page.evaluate(() => window._TEST_addPbLane(0));
+    const cp = await page.evaluate(() => window._TEST_addCpLane(0));
+    await page.waitForTimeout(50);
+
+    // Alignment: the name box starts at the same x for CC / PB / CP (the
+    // fixed-width identifier slot means PB/CP no longer slide left).
+    const lefts = await page.evaluate((ids) => ids.map(id =>
+      Math.round(document.querySelector(`.lane[data-id="${id}"] input.lname`).getBoundingClientRect().left)
+    ), [cc, pb, cp]);
+    check('CC / PB / CP lane name boxes all start at the same x (identifier slot is fixed-width)',
+      lefts[0] === lefts[1] && lefts[1] === lefts[2], lefts);
+
+    // Clicking a lane's top row (here the PB tag, in row 1) selects that lane.
+    await page.click(`.lane[data-id="${pb}"] .pb-tag`);
+    const activeAfterRow1Click = await page.evaluate(() => window._TEST_state.activeLaneId);
+    check('clicking a lane\'s top row (the PB tag) selects that lane', activeAfterRow1Click === pb, { activeAfterRow1Click, pb });
+
+    // The active-lane amber bar is drawn on BOTH row 1 and the leftcol.
+    const shadows = await page.evaluate((id) => ({
+      row1: getComputedStyle(document.querySelector(`.lane[data-id="${id}"] .lane-row1`)).boxShadow,
+      leftcol: getComputedStyle(document.querySelector(`.lane[data-id="${id}"] .leftcol`)).boxShadow,
+    }), pb);
+    check('the active-lane amber bar spans all rows: box-shadow on BOTH row 1 and the leftcol',
+      shadows.row1 !== 'none' && shadows.leftcol !== 'none', shadows);
+    const inactiveShadow = await page.evaluate((id) =>
+      getComputedStyle(document.querySelector(`.lane[data-id="${id}"] .lane-row1`)).boxShadow, cc);
+    check('a non-active lane has no amber bar on its top row', inactiveShadow === 'none', inactiveShadow);
+
+    // Arrow Up/Down move the active-lane selection instead of scrolling.
+    const order = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.id));
+    await page.evaluate((id) => { window._TEST_state.activeLaneId = id; }, order[0]);
+    await page.evaluate(() => document.activeElement && document.activeElement.blur && document.activeElement.blur());
+    await page.keyboard.press('ArrowDown');
+    const afterDown = await page.evaluate(() => window._TEST_state.activeLaneId);
+    check('ArrowDown moves the active-lane selection to the next lane (not scroll)', afterDown === order[1], { afterDown, expected: order[1] });
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('ArrowUp');
+    const afterUp = await page.evaluate(() => window._TEST_state.activeLaneId);
+    check('ArrowUp moves the active-lane selection to the previous lane', afterUp === order[1], { afterUp, expected: order[1] });
+
+    // Arrow nav clamps at the ends (does not wrap or go out of range).
+    await page.evaluate((id) => { window._TEST_state.activeLaneId = id; }, order[0]);
+    await page.keyboard.press('ArrowUp');
+    const atTop = await page.evaluate(() => window._TEST_state.activeLaneId);
+    check('ArrowUp at the first lane stays on the first lane (clamps, no wrap)', atTop === order[0], { atTop, expected: order[0] });
+  });
+
   await browser.close();
   server.close();
 

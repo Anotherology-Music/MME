@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.22
+  MMV MIDI & CC Curve Editor v0.9.23
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -535,6 +535,20 @@
   editing; the toggles are view-only and not saved with the project. Also,
   the colour-filter chips in the Show bar are now clickable across the whole
   pill (the swatch dot and padding, not just the number).
+  v0.9.23 Lane list polish + keyboard nav. Up/Down arrow keys now move the
+  active-lane selection to the lane above/below (skipping lanes filtered out
+  of the Show view) and scroll it into view, instead of scrolling the pane —
+  the mouse wheel already does that. PB and CP lane rows now line up with CC
+  rows: the identifier area (the "CC" label + number on a CC lane) is a
+  fixed-width slot, so PB/CP — which have no number — no longer slide the name
+  box and the Channel/Colour/Move controls to the left. The amber active-lane
+  bar now spans all three rows (it was only on rows 2-3, missing the top row),
+  and clicking anywhere on a lane's top row selects that lane (previously only
+  the lower rows / curve did). Known limitation left for a follow-up: the
+  GENERATE curve tools still assume the 0-127 CC value range, so generating on
+  a Pitch Bend lane (range ±8192) only fills a thin sliver near centre — the
+  fix is to make the Lo/Hi controls range-relative, which is a value-scaling
+  change with no performance cost, not yet done here.
 -->
 
 <style>
@@ -777,7 +791,11 @@
      scrolls instead, as it already could. */
   .lane{height:92px;min-height:64px;flex-shrink:0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;position:relative;}
   .lanebody{flex:1;display:flex;min-height:0;}
-  .lane.active .leftcol{box-shadow:inset 3px 0 0 var(--accent2);}
+  /* Active-lane marker: a 3px amber bar down the left edge. Row 1 is a sibling
+     of .leftcol (not inside it), so the bar is drawn on BOTH — row 1 (the
+     name/CC/Channel row) and the leftcol (rows 2-3) — to span the whole lane
+     height rather than stopping below the top row. */
+  .lane.active .lane-row1,.lane.active .leftcol{box-shadow:inset 3px 0 0 var(--accent2);}
   /* Full-height curve canvas (v0.9.13): the curve used to only span rows
      2+3's height because .lane-canvas-scroll (the .scroll.hx wrapping the
      curve <canvas>) is a normal-flow child of .lanebody, which sits BELOW
@@ -856,6 +874,11 @@
      rather than `.lane .leftcol`). Order: Minimize/Maximize toggle — "CC"
      label + CC#/PB — Name — Channel — Colour. */
   .lane .lane-row1 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
+  /* Fixed-width identifier slot (toggle → [ident] → name): CC lanes fill it
+     with the "CC" label + number button; PB/CP lanes put their short tag at the
+     left and leave the rest blank, so the name box and everything after it
+     (Channel / Colour / Move) line up identically across all lane types. */
+  .lane .lane-row1 .lane-ident{flex:0 0 46px;display:flex;align-items:center;gap:4px;min-width:0;overflow:hidden;}
   /* CC# — a button (not a free-typing number field), same UX shift Channel
      already went through: opens the shared #ccPopover listing all 128 CC
      values by number + name; see #ccPopover below. */
@@ -3100,14 +3123,20 @@
     const row1=document.createElement('div'); row1.className='lr lane-row1';
     const toggleBtn=document.createElement('button'); toggleBtn.className='move-btn toggle-btn'; toggleBtn.type='button';
     let ccn=null;
+    // Fixed-width identifier slot so the name box + Channel/Colour/Move icons
+    // line up across every lane type: a CC lane fills it with "CC" + the number
+    // button, while PB/CP (which have no number) leave the rest of the slot
+    // blank rather than sliding everything to the left.
+    const ident=document.createElement('span'); ident.className='lane-ident';
+    row1.appendChild(toggleBtn); row1.appendChild(ident);
     if(laneIsPb(lane)){
       const pbTag=document.createElement('span'); pbTag.className='pb-tag'; pbTag.textContent='PB';
       pbTag.title='Pitch Bend (±8192, 14-bit)';
-      row1.appendChild(toggleBtn); row1.appendChild(pbTag);
+      ident.appendChild(pbTag);
     } else if(laneIsCp(lane)){
       const cpTag=document.createElement('span'); cpTag.className='pb-tag'; cpTag.textContent='CP';
       cpTag.title='Channel Pressure (aftertouch, 0-127)';
-      row1.appendChild(toggleBtn); row1.appendChild(cpTag);
+      ident.appendChild(cpTag);
     } else {
       const ccLbl=document.createElement('span'); ccLbl.className='mini-lbl'; ccLbl.textContent='CC';
       // CC# — a button (not a free-typing number field) that opens the
@@ -3116,7 +3145,7 @@
       // through. Lives in row 1, same as before.
       ccn=document.createElement('button'); ccn.type='button'; ccn.className='ccn'; ccn.textContent=lane.cc;
       ccn.title='CC '+lane.cc+(ccName(lane.cc)?' – '+ccName(lane.cc):'');
-      row1.appendChild(toggleBtn); row1.appendChild(ccLbl); row1.appendChild(ccn);
+      ident.appendChild(ccLbl); ident.appendChild(ccn);
     }
     const lname=document.createElement('input'); lname.type='text'; lname.className='lname';
     lname.placeholder=laneIsPb(lane)?'Pitch Bend':laneIsCp(lane)?'Channel Pressure':(ccName(lane.cc)||'Lane name…');
@@ -3435,6 +3464,11 @@
     },{passive:false});
 
     body.addEventListener('mousedown',()=>{ setActiveLane(lane.id); state.focus='cc'; });
+    // Row 1 (name/CC/Channel/Colour) is a sibling of .lanebody, so clicking it
+    // used to leave the lane unselected — make it select the lane too, so a
+    // click anywhere on the lane (top row included) focuses it. The row's own
+    // controls (name field, buttons) keep working; this only adds selection.
+    row1.addEventListener('mousedown',()=>{ setActiveLane(lane.id); state.focus='cc'; });
     sc.addEventListener('scroll',()=>onHScroll(sc));
     attachGrip(grip,row,()=>cv,()=>sc,'down',LANE_MIN_H); bindLane(lane);
     updateLaneCompactness(row);
@@ -5194,6 +5228,22 @@
         updateAudioOffsetBadge(); requestDraw();
         return;
       }
+    }
+    if(!ctrl && (e.key==='ArrowUp'||e.key==='ArrowDown')){
+      // Move the active-lane selection to the lane above/below (skipping any
+      // filtered out of the Show view) and scroll it into view — instead of
+      // scrolling the pane, which the mouse wheel already does.
+      const nav=state.ccLanes.filter(laneMatchesFilter);
+      if(nav.length){
+        e.preventDefault();
+        const dir=e.key==='ArrowDown'?1:-1;
+        const cur=nav.findIndex(l=>l.id===state.activeLaneId);
+        const lane=nav[cur<0?0:clamp(cur+dir,0,nav.length-1)];
+        setActiveLane(lane.id); state.focus='cc';
+        if(lane._row) lane._row.scrollIntoView({block:'nearest'});
+        requestDraw();
+      }
+      return;
     }
     if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
