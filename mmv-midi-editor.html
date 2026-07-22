@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.23
+  MMV MIDI & CC Curve Editor v0.9.24
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -549,6 +549,19 @@
   a Pitch Bend lane (range ±8192) only fills a thin sliver near centre — the
   fix is to make the Lo/Hi controls range-relative, which is a value-scaling
   change with no performance cost, not yet done here.
+  v0.9.24 Advanced GENERATE → Transform fixes. Preview B now actually updates
+  when you move the Smooth slider or pick Scale to Range / Quantise Timing /
+  Reshape — a scoping bug had trapped the transform-preview helpers inside the
+  panel's own closure where the preview renderer couldn't reach them, so its
+  try/catch silently fell back to showing the unchanged "A" curve every time.
+  The Scale to Range and Quantise Timing buttons now light up while their
+  transform is the active one, so there's a clear cue which transform "Generate
+  on Lane" will apply (they're mutually exclusive — choosing one, or moving
+  Smooth / changing Reshape, un-lights the others). And the CURVE SHAPING
+  controls (Tension / Phase / Duty / Steps) now dim correctly for the current
+  context: in Transform mode only the Reshape transform uses them (keyed to its
+  shape) — Smooth / Scale / Quantise use none, so those rows dim instead of
+  looking active but doing nothing.
 -->
 
 <style>
@@ -1107,6 +1120,9 @@
   .gen-grp button:disabled{opacity:.4;cursor:not-allowed;}
   #genDirToggle{font-weight:700;min-width:30px;}
   .adv-sec{font-size:10px;color:var(--accent);font-weight:700;letter-spacing:.06em;margin-bottom:6px;}
+  /* Scale to Range / Quantise Timing light up while their transform is the one
+     that "Generate on Lane" will apply (advTransKind). */
+  #advScaleBtn.trans-on,#advQuantBtn.trans-on{background:var(--accent);color:#0d0f14;border-color:var(--accent);font-weight:600;}
   .adv-lbl{font-size:11px;color:var(--txt2);white-space:nowrap;}
   .adv-num{width:52px;min-width:52px;font-size:11px;background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:3px;padding:1px 4px;text-align:center;}
   .adv-radio{font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:3px;cursor:pointer;}
@@ -6686,6 +6702,14 @@
       refresh();
     })();
     // ── Advanced Generate panel ──
+    // advTransKind (which transform B previews/commits) and computeTransformPreview
+    // live in THIS outer scope, not inside the panel IIFE below, because
+    // drawAbPreview() (also outer, further down) has to call them. When they were
+    // trapped inside the IIFE, drawAbPreview's reference threw a ReferenceError
+    // that its own try/catch silently swallowed, falling back to the unchanged A
+    // points — so Preview B never updated for smooth/scale/quantise/reshape.
+    let advTransKind='reshape';               // which transform is previewed/committed in B
+    let computeTransformPreview=()=>null;      // reassigned to the real impl inside the IIFE
     (()=>{
       const btn=$('genAdvBtn'), panel=$('genAdvPanel');
       function openAdv(){ panel.style.display='block'; btn.textContent='Advanced ▴'; updateAdvSelCount(); captureAbA(); drawAbPreview(); if(typeof window._updateShapeControls==='function') window._updateShapeControls($('advGenKind').value||'sine'); }
@@ -6732,7 +6756,7 @@
       updateDualTrack();
 
       // Output mode — wire radios + toggle Generate/Transform panels
-      let advTransKind='reshape'; // which transform is currently previewed in B
+      // (advTransKind now lives in the outer scope — see the top of this section)
       function applyOutputModeUI(mode){
         state.genOutputMode=mode;
         const isTransform=(mode==='transform');
@@ -6753,8 +6777,9 @@
       window._captureAbA=function(){ captureAbA(); };
       window._drawAbPreview=function(){ drawAbPreview(); };
 
-      // Compute a non-destructive preview of a transform — applies to copies, restores lane
-      function computeTransformPreview(kind, params){
+      // Compute a non-destructive preview of a transform — applies to copies, restores lane.
+      // Assigned to the outer-scope `computeTransformPreview` so drawAbPreview can call it.
+      computeTransformPreview=function(kind, params){
         const lane=activeLane(); if(!lane) return null;
         let srcPts;
         const selOnLane=ccSel.size>0?[...ccSel].filter(p=>lane.points.includes(p)):[];
@@ -6787,7 +6812,7 @@
         const copySet=new Set(copies); lane.points=lane.points.filter(p=>!copySet.has(p));
         ccSel.clear(); savedSel.forEach(p=>ccSel.add(p));
         return result.sort((a,b)=>a.t-b.t);
-      }
+      };
 
       // Helper: populate ccSel from locator range if empty (for commit)
       function ensureSel(lane){
@@ -6944,8 +6969,29 @@
         abAPoints=lane.points.filter(p=>p.t>=a2&&p.t<=b2).map(p=>({t:p.t,v:p.v}));
       }
     }
+    // Light up the Scale/Quantise buttons when their transform is the active one
+    // (advTransKind) — a visual cue for which transform "Generate on Lane" will
+    // apply. Smooth/Reshape are driven by their own controls, so neither button
+    // lights for those.
+    function updateTransUI(){
+      const sc=$('advScaleBtn'), q=$('advQuantBtn');
+      if(sc) sc.classList.toggle('trans-on',advTransKind==='scale');
+      if(q) q.classList.toggle('trans-on',advTransKind==='quantise');
+    }
+    // Dim the Tension/Phase/Duty/Steps rows that don't apply right now: in
+    // Generate mode that follows the generator shape; in Transform mode only the
+    // "reshape" transform uses them (keyed to its own shape) — smooth/scale/
+    // quantise use none, so every shaping row dims.
+    function refreshShapeDim(){
+      if(typeof window._updateShapeControls!=='function') return;
+      if(state.genOutputMode==='transform')
+        window._updateShapeControls(advTransKind==='reshape'?($('advReshape').value||'sine'):'__none__');
+      else
+        window._updateShapeControls($('advGenKind').value||'sine');
+    }
     function drawAbPreview(){
       if(!abCtx||!abCanvas) return;
+      updateTransUI(); refreshShapeDim();
       const W=abCanvas.offsetWidth||400, RULER=16, H=72+RULER;
       abCanvas.width=W; abCanvas.height=H;
       abCtx.fillStyle='#141820'; abCtx.fillRect(0,0,W,H);

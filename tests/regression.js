@@ -103,12 +103,25 @@ function buildTestHtml() {
       '  window._TEST_laneStateFilter = () => laneStateFilter;',
       '  window._TEST_setLaneStateFilter = (mode) => { laneStateFilter = mode; refreshTagBar(); };',
       '  window._TEST_setLanePoints = (id, points) => { const l = state.ccLanes.find(x => x.id === id); if (l) l.points = points; refreshTagBar(); };',
+      '  window._TEST_selectLanePoints = (id) => { const l = state.ccLanes.find(x => x.id === id); if (!l) return; ccSel.clear(); l.points.forEach(p => ccSel.add(p)); setActiveLane(id); };',
       '  init();',
     ].join('\n')
   );
   html = html.replace(
     'function showISFDialog(header, filename, sourceText){',
     'window._TEST_showISFDialog=(h,f,s)=>showISFDialog(h,f,s);\n    function showISFDialog(header, filename, sourceText){'
+  );
+  // Capture the value array of whatever the A/B preview last rendered in the B
+  // view, so tests can assert Preview B actually reflects the chosen transform.
+  html = html.replace(
+    "renderPts(bPts,'#7ed957');",
+    "window._TEST_lastB=(bPts&&bPts.length)?bPts.map(p=>Math.round(p.v)):null; renderPts(bPts,'#7ed957');"
+  );
+  // advTransKind lives in the Advanced-panel scope (not the top-level init
+  // scope), so expose it right where it's declared.
+  html = html.replace(
+    "let advTransKind='reshape';",
+    "let advTransKind='reshape'; window._TEST_advTransKind=()=>advTransKind;"
   );
   html = html.replace(
     'function openMigrateSheet(entry){',
@@ -5631,6 +5644,58 @@ async function run() {
     await page.keyboard.press('ArrowUp');
     const atTop = await page.evaluate(() => window._TEST_state.activeLaneId);
     check('ArrowUp at the first lane stays on the first lane (clamps, no wrap)', atTop === order[0], { atTop, expected: order[0] });
+  });
+
+  // ---------- Advanced Transform: live Preview B + button/shaping cues (v0.9.24) ----------
+
+  await withPage(browser, async (page) => {
+    const orig = [10, 120, 30, 100, 20, 90];
+    await page.evaluate((pts) => {
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(id, pts.map((v, i) => ({ t: i * 240, v })));
+      window._TEST_selectLanePoints(id);
+    }, orig);
+    await page.click('#genAdvBtn');
+    await page.waitForTimeout(100);
+    await page.check('input[name=genOut][value=transform]');
+    await page.waitForTimeout(100);
+
+    // Reshape (default) — Preview B is a transformed curve, NOT the untouched A.
+    const bReshape = await page.evaluate(() => window._TEST_lastB);
+    check('Transform Preview B renders the transformed curve, not the untouched A points (scope-bug fix)',
+      Array.isArray(bReshape) && JSON.stringify(bReshape) !== JSON.stringify(orig), bReshape);
+
+    // Smooth slider updates B and sets advTransKind=smooth.
+    await page.evaluate(() => { const el = document.getElementById('advSmooth'); el.value = 80; el.dispatchEvent(new Event('input', { bubbles: true })); });
+    await page.waitForTimeout(50);
+    const smooth = await page.evaluate(() => ({ kind: window._TEST_advTransKind(), b: window._TEST_lastB }));
+    check('moving the Smooth slider updates Preview B (kind=smooth, B differs from A)',
+      smooth.kind === 'smooth' && JSON.stringify(smooth.b) !== JSON.stringify(orig), smooth);
+
+    // Scale to Range — updates B, sets kind, highlights its button.
+    await page.click('#advScaleBtn');
+    await page.waitForTimeout(50);
+    const scale = await page.evaluate(() => ({ kind: window._TEST_advTransKind(), on: document.getElementById('advScaleBtn').classList.contains('trans-on'), b: window._TEST_lastB }));
+    check('Scale to Range updates Preview B, sets kind=scale, and highlights the button',
+      scale.kind === 'scale' && scale.on === true && JSON.stringify(scale.b) !== JSON.stringify(orig), scale);
+
+    // Quantise Timing — highlights Quantise, un-highlights Scale (mutually exclusive).
+    await page.click('#advQuantBtn');
+    await page.waitForTimeout(50);
+    const quant = await page.evaluate(() => ({ kind: window._TEST_advTransKind(), quantOn: document.getElementById('advQuantBtn').classList.contains('trans-on'), scaleOn: document.getElementById('advScaleBtn').classList.contains('trans-on') }));
+    check('Quantise Timing highlights itself and un-highlights Scale (only one transform active)',
+      quant.kind === 'quantise' && quant.quantOn === true && quant.scaleOn === false, quant);
+
+    // Curve-shaping (Tension) dims when the active transform doesn't use it...
+    const dimQuant = await page.evaluate(() => parseFloat(getComputedStyle(document.getElementById('csRowTension')).opacity));
+    check('Tension row dims in Transform mode when the active transform (quantise) does not use it', dimQuant < 0.9, dimQuant);
+
+    // ...and lights up for a reshape transform that does (sine).
+    await page.evaluate(() => { const el = document.getElementById('advReshape'); el.value = 'sine'; el.dispatchEvent(new Event('change', { bubbles: true })); });
+    await page.waitForTimeout(300); // csRowTension has a 150ms opacity transition — let it settle
+    const litReshape = await page.evaluate(() => ({ kind: window._TEST_advTransKind(), op: parseFloat(getComputedStyle(document.getElementById('csRowTension')).opacity) }));
+    check('Tension row lights up again for a reshape transform that uses it (sine)',
+      litReshape.kind === 'reshape' && litReshape.op > 0.9, litReshape);
   });
 
   await browser.close();
