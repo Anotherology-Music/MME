@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.25
+  MMV MIDI & CC Curve Editor v0.9.26
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -566,6 +566,13 @@
   read-only note-name field no longer grows to eat spare width, so the Position
   and Length fields get more room — a full Bar.Beat.16th.Tick position and long
   tick lengths no longer clip.
+  v0.9.26 Note Info colour consistency: the editable fields (Velocity, Length,
+  Position, Channel) are now all orange, and the read-only note name stays
+  white — "orange = you can change this". Previously the colour was accidental:
+  a global input[type=number] rule silently painted Velocity/Length white while
+  the text-based Position stayed orange and the Channel button was grey, so
+  there was no discernible logic to which fields were which colour. (Scoped to
+  the Note Info box; the rest of the app's field colours are unchanged.)
 -->
 
 <style>
@@ -661,16 +668,24 @@
      visible bug this caused: "100" clipped to an unreadable "10" + a sliver.
      An ID selector beats an attribute selector, so restating them here
      forces the compact sizing .ni-input always intended. */
-  #velValInput{flex:0 0 36px;width:36px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
+  /* Note Info colour convention: editable fields are orange (--accent2), the
+     read-only note name stays white (--txt). Velocity/Length are type=number,
+     so the global `input[type=number]{color:--txt}` rule would otherwise paint
+     them white — the ID selector here beats that and restores the orange the
+     .ni-input class intends (Position, being type=text, already gets it). */
+  #velValInput{flex:0 0 36px;width:36px;padding:2px 3px;font-size:10px;color:var(--accent2);-moz-appearance:textfield;}
   #velValInput::-webkit-outer-spin-button,#velValInput::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* Same ID-selector-beats-attribute-selector override velocity needs above
      (ticks can run to 5 digits, so a bit wider). */
-  #noteInfoLen{flex:0 0 50px;width:50px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
+  #noteInfoLen{flex:0 0 50px;width:50px;padding:2px 3px;font-size:10px;color:var(--accent2);-moz-appearance:textfield;}
   #noteInfoLen::-webkit-outer-spin-button,#noteInfoLen::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* No mini-label (per explicit instruction) — the mono font + BBT dots
      already read unambiguously as a position. */
   #noteInfoPos{flex:1 1 68px;min-width:60px;}
-  #noteInfoCh{flex:0 0 auto;}
+  /* Channel is editable (opens the channel picker) → orange, like the other
+     editable fields. Only the Note Info one; the lane row-1 channel button
+     keeps its own grey/ch16 treatment. Its :hover (blue) still applies. */
+  #noteInfoCh{flex:0 0 auto;color:var(--accent2);}
   .ni-input,.ni-disp,.ni-note{box-sizing:border-box;height:19px;padding:2px 3px;font-size:10px;line-height:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:4px;overflow:hidden;white-space:nowrap;}
   .ni-input{color:var(--accent2);}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}

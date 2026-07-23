@@ -5718,6 +5718,17 @@ async function run() {
     check('Note Info Position shows a full BBT value without clipping (widened field)', !info.posClip, info);
     check('Note Info note-name still shows F#8 126 without clipping after the shrink', !info.noteClip && info.noteVal.includes('126'), info);
     check('the Length label is the compact "L" (freeing room for the value fields)', info.lbls.includes('L') && !info.lbls.includes('Len'), info.lbls);
+
+    // Colour convention: editable fields orange (--accent2 = rgb(255,180,84)),
+    // read-only note name white (--txt = rgb(215,219,226)).
+    const colors = await page.evaluate(() => {
+      const c = id => getComputedStyle(document.getElementById(id)).color;
+      return { note: c('noteInfoNote'), vel: c('velValInput'), len: c('noteInfoLen'), pos: c('noteInfoPos'), ch: c('noteInfoCh') };
+    });
+    const ORANGE = 'rgb(255, 180, 84)';
+    check('editable Note Info fields (Velocity, Length, Position, Channel) are all orange',
+      colors.vel === ORANGE && colors.len === ORANGE && colors.pos === ORANGE && colors.ch === ORANGE, colors);
+    check('the read-only note-name field is NOT orange (stays white)', colors.note !== ORANGE, colors);
   });
 
   await browser.close();
