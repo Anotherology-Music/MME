@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.24
+  MMV MIDI & CC Curve Editor v0.9.25
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -562,6 +562,10 @@
   context: in Transform mode only the Reshape transform uses them (keyed to its
   shape) — Smooth / Scale / Quantise use none, so those rows dim instead of
   looking active but doing nothing.
+  v0.9.25 Note Info spacing: the length label shrank from "Len" to "L" and the
+  read-only note-name field no longer grows to eat spare width, so the Position
+  and Length fields get more room — a full Bar.Beat.16th.Tick position and long
+  tick lengths no longer clip.
 -->
 
 <style>
@@ -635,7 +639,11 @@
      mini-label (V) or are self-evident buttons/mono fields. Gets the most
      flex-shrink room since it's the least critical field to keep full-width
      under a squeezed leftcol. */
-  .ni-note{flex:1 1 50px;min-width:30px;}
+  /* Read-only note name ("F#8  126" is the widest it ever shows). It no longer
+     GROWS to eat spare width (flex-grow 0) — that spare now goes to the Position
+     field, which needs it — but keeps a basis wide enough to show F#8 126
+     without clipping. */
+  .ni-note{flex:0 1 53px;min-width:48px;}
   /* -moz-appearance/-webkit-appearance below hide the number-input spinner
      arrows (same treatment the CC lane's .stepsn field already uses) — at
      this field's narrow width the spinner otherwise ate most of the box,
@@ -657,11 +665,11 @@
   #velValInput::-webkit-outer-spin-button,#velValInput::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* Same ID-selector-beats-attribute-selector override velocity needs above
      (ticks can run to 5 digits, so a bit wider). */
-  #noteInfoLen{flex:0 0 44px;width:44px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
+  #noteInfoLen{flex:0 0 50px;width:50px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
   #noteInfoLen::-webkit-outer-spin-button,#noteInfoLen::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* No mini-label (per explicit instruction) — the mono font + BBT dots
      already read unambiguously as a position. */
-  #noteInfoPos{flex:1 1 50px;min-width:34px;}
+  #noteInfoPos{flex:1 1 68px;min-width:60px;}
   #noteInfoCh{flex:0 0 auto;}
   .ni-input,.ni-disp,.ni-note{box-sizing:border-box;height:19px;padding:2px 3px;font-size:10px;line-height:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:4px;overflow:hidden;white-space:nowrap;}
   .ni-input{color:var(--accent2);}
@@ -1424,7 +1432,7 @@
           <span id="noteInfoNote" class="ni-note" title="Pitch of selected note(s)">—</span>
           <span class="mini-lbl">V</span>
           <input type="number" id="velValInput" class="ni-input" min="1" max="127" placeholder="—" title="Velocity — applies to all selected notes">
-          <span class="mini-lbl">Len</span>
+          <span class="mini-lbl">L</span>
           <input type="number" id="noteInfoLen" class="ni-input" min="1" placeholder="—" title="Note length in ticks — applies to all selected notes">
           <input type="text" id="noteInfoPos" class="ni-input mono" placeholder="—" title="Position (Bar.Beat.16th.Tick) — shown when selected notes share the same start. Editing shifts all selected notes together.&#10;Scroll or ↑↓ = ±1 tick, Shift = ±1/16th, Ctrl = ±1 beat, Alt = ±1 bar">
           <button type="button" id="noteInfoCh" class="chn-btn" title="Channel — applies to all selected notes">Ch—</button>

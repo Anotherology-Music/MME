@@ -5698,6 +5698,28 @@ async function run() {
       litReshape.kind === 'reshape' && litReshape.op > 0.9, litReshape);
   });
 
+  // ---------- Note Info: widened Position/Length, "L" label (v0.9.25) ----------
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      const n = { id: s.nextId++, pitch: 126, start: 190000, length: 539926, vel: 100, ch: 0 };
+      s.notes.push(n); s.selection.clear(); s.selection.add(n.id); window._TEST_updateNoteInfo();
+    });
+    await page.waitForTimeout(50);
+    const info = await page.evaluate(() => {
+      const pos = document.getElementById('noteInfoPos'), note = document.getElementById('noteInfoNote');
+      return {
+        posClip: pos.scrollWidth > pos.clientWidth + 1, posVal: pos.value,
+        noteClip: note.scrollWidth > note.clientWidth + 1, noteVal: note.textContent,
+        lbls: [...document.querySelectorAll('#noteInfoLeft .mini-lbl')].map(s => s.textContent),
+      };
+    });
+    check('Note Info Position shows a full BBT value without clipping (widened field)', !info.posClip, info);
+    check('Note Info note-name still shows F#8 126 without clipping after the shrink', !info.noteClip && info.noteVal.includes('126'), info);
+    check('the Length label is the compact "L" (freeing room for the value fields)', info.lbls.includes('L') && !info.lbls.includes('Len'), info.lbls);
+  });
+
   await browser.close();
   server.close();
 
