@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.26
+  MMV MIDI & CC Curve Editor v0.9.27
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -573,6 +573,17 @@
   the text-based Position stayed orange and the Channel button was grey, so
   there was no discernible logic to which fields were which colour. (Scoped to
   the Note Info box; the rest of the app's field colours are unchanged.)
+  v0.9.27 Left-column colour convention (revised) + Move All. Every field in
+  the left column (Note Info AND CC/PB/CP lanes) now follows one rule: ORANGE
+  for picker fields (Channel, CC#), GREEN for Position (one deliberate splash
+  of colour), WHITE for other editable values (lane name, Velocity, Length, CC
+  Value, Steps), and GREY for read-only readouts (the note-name display, step
+  badge, PB/CP tags). New "Move All ◀ [Bar/Beat/Snap] ▶" control in the editing
+  toolbar shifts the WHOLE project in time — every note, every CC/PB/CP curve,
+  and the audio track — locked together in one undoable step; right by a bar is
+  the quick "insert a bar at the start" move, and left-shift clamps so nothing
+  crosses before bar 1. Ctrl+A now selects the focused CC/PB/CP lane's points
+  (it previously only ever selected notes, ignoring the lane you were on).
 -->
 
 <style>
@@ -581,7 +592,7 @@
     --bg:#15171c; --panel:#1d2027; --panel2:#23272f; --panel3:#191c22; --line:#2c313b;
     --grid:#272c35; --gridBar:#3a414f; --gridBeat:#323844;
     --txt:#d7dbe2; --txt2:#8c93a1; --accent:#4fa3ff; --accent2:#ffb454;
-    --sel:#ffe08a; --white:#e9edf3; --black:#1a1d23; --play:#ff5d6c;
+    --sel:#ffe08a; --white:#e9edf3; --black:#1a1d23; --play:#ff5d6c; --pos:#7ed957;
     --keys-w:300px;
   }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
@@ -604,8 +615,10 @@
   .toolbar-r2{background:var(--panel3);border-bottom:2px solid var(--line);padding:5px 10px;}
   .toolbar-r2 button{font-size:12px;padding:4px 8px;}
   .toolbar-r2 select,.toolbar-r2 input[type=number]{font-size:12px;padding:3px 5px;}
-  .newnote-grp,.project-grp,.tool-grp,.snap-grp,.transport-grp,.position-grp,.view-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
-  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl,.transport-grp .lbl,.position-grp .lbl,.view-grp .lbl{color:var(--accent);font-size:10px;}
+  .newnote-grp,.project-grp,.tool-grp,.snap-grp,.transport-grp,.position-grp,.view-grp,.move-grp{display:flex;align-items:center;gap:5px;background:rgba(79,163,255,.08);border:1px solid rgba(79,163,255,.22);border-radius:6px;padding:3px 8px;}
+  .newnote-grp .lbl,.project-grp .lbl,.tool-grp .lbl,.snap-grp .lbl,.transport-grp .lbl,.position-grp .lbl,.view-grp .lbl,.move-grp .lbl{color:var(--accent);font-size:10px;}
+  .move-grp button{font-weight:700;line-height:1;padding:3px 8px;}
+  .move-grp select{font-size:11px;}
   button.icon-btn{display:inline-flex;align-items:center;justify-content:center;padding:5px 7px;}
   .view-grp .lbl2{color:#888;font-size:10px;}
   .position-grp{gap:2px;}
@@ -668,28 +681,32 @@
      visible bug this caused: "100" clipped to an unreadable "10" + a sliver.
      An ID selector beats an attribute selector, so restating them here
      forces the compact sizing .ni-input always intended. */
-  /* Note Info colour convention: editable fields are orange (--accent2), the
-     read-only note name stays white (--txt). Velocity/Length are type=number,
-     so the global `input[type=number]{color:--txt}` rule would otherwise paint
-     them white — the ID selector here beats that and restores the orange the
-     .ni-input class intends (Position, being type=text, already gets it). */
-  #velValInput{flex:0 0 36px;width:36px;padding:2px 3px;font-size:10px;color:var(--accent2);-moz-appearance:textfield;}
+  /* ── Left-column colour convention (Note Info + CC/PB/CP lanes) ──
+     ORANGE (--accent2): fields that open a picker/dropdown — Channel, CC#.
+     GREEN  (--pos):     Position fields (the one deliberate splash of colour).
+     WHITE  (--txt):     other editable typed fields — names, Velocity, Length,
+                         CC Value, Steps.
+     GREY   (--txt2):    read-only / display fields — the note-name readout,
+                         step badge, PB/CP tags, mini-labels.
+     Velocity/Length are type=number and already inherit white from the global
+     input[type=number] rule, so they need no colour of their own here. */
+  #velValInput{flex:0 0 36px;width:36px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
   #velValInput::-webkit-outer-spin-button,#velValInput::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
-  /* Same ID-selector-beats-attribute-selector override velocity needs above
-     (ticks can run to 5 digits, so a bit wider). */
-  #noteInfoLen{flex:0 0 50px;width:50px;padding:2px 3px;font-size:10px;color:var(--accent2);-moz-appearance:textfield;}
+  #noteInfoLen{flex:0 0 50px;width:50px;padding:2px 3px;font-size:10px;-moz-appearance:textfield;}
   #noteInfoLen::-webkit-outer-spin-button,#noteInfoLen::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   /* No mini-label (per explicit instruction) — the mono font + BBT dots
-     already read unambiguously as a position. */
-  #noteInfoPos{flex:1 1 68px;min-width:60px;}
-  /* Channel is editable (opens the channel picker) → orange, like the other
-     editable fields. Only the Note Info one; the lane row-1 channel button
-     keeps its own grey/ch16 treatment. Its :hover (blue) still applies. */
-  #noteInfoCh{flex:0 0 auto;color:var(--accent2);}
+     already read unambiguously as a position. Green, matching the CC lane's
+     own Position field. */
+  #noteInfoPos{flex:1 1 68px;min-width:60px;color:var(--pos);}
+  /* Channel opens the channel picker → orange (from the shared .chn-btn rule
+     below; no per-id colour needed). */
+  #noteInfoCh{flex:0 0 auto;}
   .ni-input,.ni-disp,.ni-note{box-sizing:border-box;height:19px;padding:2px 3px;font-size:10px;line-height:1;text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:4px;overflow:hidden;white-space:nowrap;}
-  .ni-input{color:var(--accent2);}
+  .ni-input{color:var(--txt);}
   .ni-input.mono{font-family:ui-monospace,Consolas,monospace;}
-  .ni-disp,.ni-note{color:var(--txt);display:flex;align-items:center;justify-content:center;}
+  .ni-disp{color:var(--txt);display:flex;align-items:center;justify-content:center;}
+  /* Note-name readout ("F#8  126") is read-only → grey. */
+  .ni-note{color:var(--txt2);display:flex;align-items:center;justify-content:center;}
   /* Manual minimize/maximize toggle for the whole Note Info box — same
      .move-btn/.toggle-btn visual language as the CC lane row-1 toggle
      (▾ expanded / ▸ minimized, same .on convention), just scoped to
@@ -919,7 +936,7 @@
      already went through: opens the shared #ccPopover listing all 128 CC
      values by number + name; see #ccPopover below. */
   .lane .lane-row1 .ccn{height:16px;min-width:24px;box-sizing:border-box;padding:0 4px;font-size:10px;
-    border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
+    border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--accent2);cursor:pointer;
     flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
   .lane .lane-row1 .ccn:hover{border-color:var(--accent);color:var(--accent);}
   .lane .lane-row1 .pb-tag{font-size:9px;color:var(--txt2);font-style:italic;flex:0 0 auto;}
@@ -930,7 +947,7 @@
      Note Info's one-row layout — same shared popover, same visual language,
      styled identically via this same rule (not scoped to .lane only). */
   .lane .lane-row1 .chn-btn,.note-info-left .chn-btn{height:16px;min-width:30px;box-sizing:border-box;padding:0 5px;font-size:10px;
-    border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--txt2);cursor:pointer;
+    border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--accent2);cursor:pointer;
     flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;}
   .lane .lane-row1 .chn-btn:hover,.note-info-left .chn-btn:hover{border-color:var(--accent);color:var(--accent);}
   .lane .lane-row1 .chn-btn.ch16,.note-info-left .chn-btn.ch16{color:#ffb454;border-color:#ffb45488;}
@@ -1071,15 +1088,15 @@
   .lane .leftcol .row2-center{display:flex;align-items:center;gap:3px;min-width:0;}
   .lane .leftcol .row2-right{display:flex;align-items:center;gap:3px;min-width:0;flex-shrink:0;}
   .lane .leftcol .row2 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
-  .lane .leftcol .step-badge{color:var(--accent2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40px;}
-  .lane .leftcol .val-input{flex:0 1 40px;width:40px;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .step-badge{color:var(--txt2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40px;}
+  .lane .leftcol .val-input{flex:0 1 40px;width:40px;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:4px;}
   /* Widened to comfortably fit the largest realistic BBT string,
      "1234.12.12.123" (4-digit bar.beat.16th.tick) — measured at ~84px wide
      in this exact font/size (10px ui-monospace/Consolas/monospace); 100px
      leaves headroom for border/padding plus font-fallback variance without
      truncating. Previously 38px, which only fit "1.1.1." before clipping. */
-  .lane .leftcol .pos-input{flex:0 1 100px;width:100px;min-width:0;max-width:110px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:#7ed957;border:1px solid var(--line);border-radius:4px;}
-  .lane .leftcol .stepsn{flex:0 0 22px;width:22px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--accent2);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
+  .lane .leftcol .pos-input{flex:0 1 100px;width:100px;min-width:0;max-width:110px;padding:1px 4px;font-size:10px;font-family:ui-monospace,Consolas,monospace;background:var(--panel2);color:var(--pos);border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .stepsn{flex:0 0 22px;width:22px;min-width:0;padding:1px 2px;font-size:10px;background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:4px;-moz-appearance:textfield;}
   .lane .leftcol .stepsn::-webkit-outer-spin-button,
   .lane .leftcol .stepsn::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
   .lane .leftcol .x,.lane .leftcol .move-btn,.lane .leftcol .drag-handle,.lane .lane-row1 .move-btn,.lane .lane-row1 .drag-handle{
@@ -1400,6 +1417,17 @@
           <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
         </div>
       </div>
+    </div>
+    <div class="sep"></div>
+    <div class="move-grp">
+      <span class="lbl">Move All</span>
+      <button id="moveAllL" title="Shift EVERYTHING left by the step — all notes, every CC/PB/CP curve, and the audio track — locked together. Clamped so nothing crosses before bar 1.">◀</button>
+      <select id="moveAllStep" title="How far Move All shifts everything each click">
+        <option value="bar" selected>Bar</option>
+        <option value="beat">Beat</option>
+        <option value="snap">Snap</option>
+      </select>
+      <button id="moveAllR" title="Shift EVERYTHING right by the step — all notes, every CC/PB/CP curve, and the audio track — locked together. Right by a bar = insert a bar at the start.">▶</button>
     </div>
   </div><!-- /toolbar-r2 -->
 
@@ -5029,6 +5057,33 @@
   $('addLane').onclick=()=>{ pushUndo(); addLane(); };
   $('addPbLane').addEventListener('click',()=>{ pushUndo(); addPbLane(); });
   $('addCpLane').addEventListener('click',()=>{ pushUndo(); addCpLane(); });
+  // ── Move All — shift the WHOLE project in time (notes + every CC/PB/CP
+  // curve + the audio track), locked together. Right by a bar = insert a bar
+  // at the start (the common "I need room at the beginning" case). Left removes
+  // time, clamped so no note/point crosses before tick 0 (audio moves by the
+  // same clamped delta so nothing drifts out of sync). One undo step.
+  function shiftAll(delta){
+    delta=Math.round(delta); if(!delta) return;
+    let minT=Infinity;
+    state.notes.forEach(n=>{ if(n.start<minT) minT=n.start; });
+    state.ccLanes.forEach(l=>l.points.forEach(p=>{ if(p.t<minT) minT=p.t; }));
+    const hasMidi=minT!==Infinity;
+    if(delta<0 && hasMidi) delta=Math.max(delta,-minT); // don't push MIDI below bar 1
+    if(!delta) return;
+    if(!hasMidi && !audioBuf) return; // nothing to move
+    pushUndo();
+    state.notes.forEach(n=>{ n.start=Math.max(0,n.start+delta); });
+    state.ccLanes.forEach(l=>{ l.points.forEach(p=>{ p.t=Math.max(0,Math.round(p.t+delta)); }); l.points.sort((a,b)=>a.t-b.t); });
+    if(audioBuf){ state.audioOffset=(state.audioOffset||0)+delta; updateAudioOffsetBadge(); }
+    let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+Math.max(1,n.length)));
+    state.ccLanes.forEach(l=>l.points.forEach(p=>maxT=Math.max(maxT,p.t)));
+    state.bars=Math.max(state.bars,Math.ceil(maxT/ticksPerBar())+1);
+    syncInputs(); updateDuration(); resizeCanvases(); requestDraw();
+    flash('Moved everything '+(delta>0?'right':'left')+' by '+Math.abs(delta)+' ticks');
+  }
+  function moveAllStepTicks(){ const v=$('moveAllStep').value; return v==='bar'?ticksPerBar():v==='beat'?ticksPerBeat():snapTicks(); }
+  $('moveAllL').addEventListener('click',()=>shiftAll(-moveAllStepTicks()));
+  $('moveAllR').addEventListener('click',()=>shiftAll(+moveAllStepTicks()));
   // Section-visibility toggles in the top-left corner cell — flip a body
   // class that hides the Piano Roll / Note Data / CC lanes, then re-layout the
   // surviving canvases so the freed space is actually reclaimed. View-only
@@ -5219,7 +5274,11 @@
     if(ctrl && e.key.toLowerCase()==='y'){ e.preventDefault(); redo(); return; }
     if(ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); copySel(); return; }
     if(ctrl && e.key.toLowerCase()==='v'){ e.preventDefault(); paste(); return; }
-    if(ctrl && e.key.toLowerCase()==='a'){ e.preventDefault(); const {a,b}=getLoop(); state.selection.clear(); state.notes.forEach(n=>{ if(n.start>=a&&n.start<b) state.selection.add(n.id); }); state.focus='piano'; updateNoteInfo(); requestDraw(); return; }
+    if(ctrl && e.key.toLowerCase()==='a'){ e.preventDefault();
+      // On a CC/PB/CP lane, Ctrl+A selects that lane's points (previously it
+      // only ever selected notes, leaving the focused lane's data untouched).
+      if(state.focus==='cc'){ const lane=activeLane(); if(lane&&lane.points.length){ clearCcSel(lane); lane.points.forEach(p=>ccSel.add(p)); lane._activePt=lane.points[lane.points.length-1]; requestDraw(); } return; }
+      const {a,b}=getLoop(); state.selection.clear(); state.notes.forEach(n=>{ if(n.start>=a&&n.start<b) state.selection.add(n.id); }); state.focus='piano'; updateNoteInfo(); requestDraw(); return; }
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
     if(e.code==='Numpad0'){ e.preventDefault(); seekPlayhead(state.lastPlayStart||0); return; }
     if(e.key==='.'){ e.preventDefault(); seekPlayhead(0); return; }

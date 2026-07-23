@@ -104,6 +104,8 @@ function buildTestHtml() {
       '  window._TEST_setLaneStateFilter = (mode) => { laneStateFilter = mode; refreshTagBar(); };',
       '  window._TEST_setLanePoints = (id, points) => { const l = state.ccLanes.find(x => x.id === id); if (l) l.points = points; refreshTagBar(); };',
       '  window._TEST_selectLanePoints = (id) => { const l = state.ccLanes.find(x => x.id === id); if (!l) return; ccSel.clear(); l.points.forEach(p => ccSel.add(p)); setActiveLane(id); };',
+      '  window._TEST_ccSelSize = () => ccSel.size;',
+      '  window._TEST_clearCcSel = () => ccSel.clear();',
       '  init();',
     ].join('\n')
   );
@@ -5719,16 +5721,93 @@ async function run() {
     check('Note Info note-name still shows F#8 126 without clipping after the shrink', !info.noteClip && info.noteVal.includes('126'), info);
     check('the Length label is the compact "L" (freeing room for the value fields)', info.lbls.includes('L') && !info.lbls.includes('Len'), info.lbls);
 
-    // Colour convention: editable fields orange (--accent2 = rgb(255,180,84)),
-    // read-only note name white (--txt = rgb(215,219,226)).
+    // Colour convention (v0.9.27): orange = picker fields (Channel), green =
+    // Position, white = other editable (Velocity/Length), grey = read-only
+    // (note name).
     const colors = await page.evaluate(() => {
       const c = id => getComputedStyle(document.getElementById(id)).color;
       return { note: c('noteInfoNote'), vel: c('velValInput'), len: c('noteInfoLen'), pos: c('noteInfoPos'), ch: c('noteInfoCh') };
     });
-    const ORANGE = 'rgb(255, 180, 84)';
-    check('editable Note Info fields (Velocity, Length, Position, Channel) are all orange',
-      colors.vel === ORANGE && colors.len === ORANGE && colors.pos === ORANGE && colors.ch === ORANGE, colors);
-    check('the read-only note-name field is NOT orange (stays white)', colors.note !== ORANGE, colors);
+    const ORANGE = 'rgb(255, 180, 84)', GREEN = 'rgb(126, 217, 87)', WHITE = 'rgb(215, 219, 226)', GREY = 'rgb(140, 147, 161)';
+    check('Note Info Channel (a picker) is orange', colors.ch === ORANGE, colors);
+    check('Note Info Position is green', colors.pos === GREEN, colors);
+    check('Note Info Velocity and Length (plain editable values) are white', colors.vel === WHITE && colors.len === WHITE, colors);
+    check('Note Info note-name (read-only) is grey', colors.note === GREY, colors);
+  });
+
+  await withPage(browser, async (page) => {
+    // Same convention on a CC lane: CC# + Channel orange (pickers), Value + Steps
+    // white, Position green, step badge grey.
+    const id = await page.evaluate(() => {
+      const lid = window._TEST_addLane(20, 0);
+      const l = window._TEST_state.ccLanes.find(x => x.id === lid);
+      l.points = [{ t: 0, v: 64 }, { t: 480, v: 100 }]; l._activePt = l.points[1]; l.steps = 2;
+      window._TEST_setLanePoints(lid, l.points);
+      return lid;
+    });
+    await page.waitForTimeout(50);
+    const c = await page.evaluate((id) => {
+      const g = sel => { const el = document.querySelector(`.lane[data-id="${id}"] ${sel}`); return el ? getComputedStyle(el).color : null; };
+      return { ccn: g('.ccn'), chn: g('.chn-btn'), val: g('.val-input'), pos: g('.pos-input'), steps: g('.stepsn'), badge: g('.step-badge') };
+    }, id);
+    const ORANGE = 'rgb(255, 180, 84)', GREEN = 'rgb(126, 217, 87)', WHITE = 'rgb(215, 219, 226)', GREY = 'rgb(140, 147, 161)';
+    check('CC lane CC# and Channel buttons (pickers) are orange', c.ccn === ORANGE && c.chn === ORANGE, c);
+    check('CC lane Value and Steps (editable values) are white', c.val === WHITE && c.steps === WHITE, c);
+    check('CC lane Position is green and the step badge (read-only) is grey', c.pos === GREEN && c.badge === GREY, c);
+  });
+
+  // ---------- Move All + Ctrl+A on a CC lane (v0.9.27) ----------
+
+  await withPage(browser, async (page) => {
+    const setup = await page.evaluate(() => {
+      const s = window._TEST_state; s.tsNum = 4; s.tsDen = 4;
+      const lid = window._TEST_addLane(20, 0);
+      const l = s.ccLanes.find(x => x.id === lid);
+      window._TEST_setLanePoints(lid, [{ t: 480, v: 64 }, { t: 1440, v: 100 }]);
+      const nid = s.nextId++;
+      s.notes.push({ id: nid, pitch: 60, start: 960, length: 240, vel: 100, ch: 0 });
+      return { lid, ppq: s.ppq };
+    });
+    const bar = setup.ppq * 4;
+    const before = await page.evaluate((lid) => ({ note: window._TEST_state.notes[0].start, pt: window._TEST_state.ccLanes.find(l => l.id === lid).points[0].t }), setup.lid);
+    // Move All Right by a bar (default step)
+    await page.click('#moveAllR');
+    await page.waitForTimeout(50);
+    const afterR = await page.evaluate((lid) => ({ note: window._TEST_state.notes[0].start, pt: window._TEST_state.ccLanes.find(l => l.id === lid).points[0].t }), setup.lid);
+    check('Move All ▶ shifts notes AND CC points together by one bar (insert time at start)',
+      afterR.note === before.note + bar && afterR.pt === before.pt + bar, { before, afterR, bar });
+
+    // Move All Left far enough to try to cross bar 1 — clamps so no point goes negative.
+    await page.click('#moveAllL'); await page.click('#moveAllL'); await page.click('#moveAllL');
+    await page.waitForTimeout(50);
+    const afterL = await page.evaluate((lid) => {
+      const pts = window._TEST_state.ccLanes.find(l => l.id === lid).points;
+      const notes = window._TEST_state.notes;
+      return { minPt: Math.min(...pts.map(p => p.t)), minNote: Math.min(...notes.map(n => n.start)) };
+    }, setup.lid);
+    check('Move All ◀ clamps so nothing crosses before bar 1 (no negative ticks)',
+      afterL.minPt >= 0 && afterL.minNote >= 0, afterL);
+  });
+
+  await withPage(browser, async (page) => {
+    // Ctrl+A while a CC lane is focused selects that lane's points (previously
+    // it only ever selected notes).
+    const lid = await page.evaluate(() => {
+      const l = window._TEST_addLane(21, 0);
+      window._TEST_setLanePoints(l, [{ t: 0, v: 10 }, { t: 240, v: 60 }, { t: 480, v: 90 }]);
+      window._TEST_selectLanePoints(l); // make it the active lane
+      window._TEST_clearCcSel();         // start from an empty selection
+      window._TEST_state.focus = 'cc';
+      return l;
+    });
+    await page.evaluate(() => document.activeElement && document.activeElement.blur && document.activeElement.blur());
+    const before = await page.evaluate(() => window._TEST_ccSelSize());
+    await page.keyboard.press('Control+a');
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_ccSelSize());
+    const nPts = await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id).points.length, lid);
+    check('Ctrl+A on a focused CC lane selects all of that lane\'s points (was: only ever notes)',
+      before === 0 && after === nPts && nPts === 3, { before, after, nPts });
   });
 
   await browser.close();
