@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.27
+  MMV MIDI & CC Curve Editor v0.9.28
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -584,6 +584,17 @@
   the quick "insert a bar at the start" move, and left-shift clamps so nothing
   crosses before bar 1. Ctrl+A now selects the focused CC/PB/CP lane's points
   (it previously only ever selected notes, ignoring the lane you were on).
+  v0.9.28 Two audio-reload fixes. Auto-load (via a remembered Projects Folder)
+  now also checks an "Audio" subfolder if the file isn't sitting right next to
+  the .mmvp, so keeping takes tidied into their own subfolder still auto-locates
+  them. And manually (re)loading audio — via the Load button or drag-drop, the
+  path taken whenever auto-load can't find the file — no longer resets the
+  audio start offset to 0. That offset is saved in the project and restored the
+  moment the project loads (independent of whether the audio file itself was
+  found); silently zeroing it again the instant you manually pick the file was
+  discarding a value the user had painstakingly set by ear, right when they
+  needed it most. The explicit × (clear audio) button still resets it, as the
+  one deliberate "start fresh" action.
 -->
 
 <style>
@@ -4037,6 +4048,10 @@
     }catch(e){ if(e.name!=='AbortError') flash('Could not set projects folder: '+e.message); }
   }
   const AUDIO_EXTS=['wav','mp3','ogg','flac','m4a','aac'];
+  // Subfolders (relative to the Projects Folder) checked, in order, if the
+  // audio isn't sitting right next to the .mmvp — an "Audio" subfolder is a
+  // common way to keep a project directory tidy when there are several takes.
+  const AUDIO_SUBDIRS=['Audio','audio'];
   // Returns true/false so callers (notably autoLoadProjectAudio below) can
   // fall back to a different name to try, or skip the "reload it yourself"
   // flash once this already succeeded.
@@ -4051,6 +4066,19 @@
         flash('Auto-loaded audio: '+file.name);
         return true;
       }catch(e){ /* not found with this extension — try the next one */ }
+    }
+    for(const sub of AUDIO_SUBDIRS){
+      let subDir;
+      try{ subDir=await projDirHandle.getDirectoryHandle(sub); }catch(e){ continue; } // no such subfolder — fine
+      for(const ext of AUDIO_EXTS){
+        try{
+          const fh=await subDir.getFileHandle(baseName+'.'+ext);
+          const file=await fh.getFile();
+          await loadAudio(file);
+          flash('Auto-loaded audio: '+sub+'/'+file.name);
+          return true;
+        }catch(e){ /* not found with this extension — try the next one */ }
+      }
     }
     return false;
   }
@@ -5206,12 +5234,21 @@
   });
   $('audioLoadBtn').onclick=()=>$('audioFileInput').click();
   $('audioClearBtn').addEventListener('click',()=>{ if(!audioBuf) return; clearAudio(); flash('Audio removed'); });
+  // Deliberately does NOT reset state.audioOffset here. The most common
+  // reason to manually (re)load audio is reopening a project whose auto-load
+  // (see autoLoadProjectAudio) couldn't find the file — clearAudio() at the
+  // start of loadProject() already reset the offset to 0, and applyState()
+  // then restored the project's real saved offset from its snapshot. Zeroing
+  // it again here would silently throw that saved value away right when the
+  // user needs it most, forcing them to re-find the sync by ear. If someone
+  // genuinely swaps in an unrelated audio file, the existing offset badge
+  // (click to reset to 0) and drag-to-adjust are both one action away.
   $('audioFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return;
-    state.audioOffset=0; updateAudioOffsetBadge(); loadAudio(f); e.target.value=''; });
+    loadAudio(f); e.target.value=''; });
   // Drag-and-drop onto the audio canvas
   audioScroll.addEventListener('dragover',e=>e.preventDefault());
   audioScroll.addEventListener('drop',e=>{ e.preventDefault(); const f=e.dataTransfer.files[0];
-    if(f&&f.type.startsWith('audio/')){ state.audioOffset=0; updateAudioOffsetBadge(); loadAudio(f); } });
+    if(f&&f.type.startsWith('audio/')) loadAudio(f); });
   // Drag the waveform to move the audio track's start time — snaps to the
   // global Snap grid by default, hold Shift for a free (unsnapped) drag,
   // matching the same convention used for notes/CC points elsewhere.

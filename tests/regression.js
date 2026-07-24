@@ -5810,6 +5810,78 @@ async function run() {
       before === 0 && after === nPts && nPts === 3, { before, after, nPts });
   });
 
+  // ---------- Audio: "Audio" subfolder auto-load fallback (v0.9.28) ----------
+
+  await withPage(browser, async (page) => {
+    const found = await page.evaluate(async () => {
+      class MockFileHandle {
+        constructor(name, content, lastModified) { this.kind = 'file'; this.name = name; this._content = content; this._lastModified = lastModified; }
+        async getFile() { return new File([this._content], this.name, { lastModified: this._lastModified }); }
+      }
+      class MockDirHandle {
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); this._dirs = new Map(); }
+        async queryPermission() { return 'granted'; }
+        async requestPermission() { return 'granted'; }
+        async getFileHandle(name) {
+          if (!this._files.has(name)) { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          return this._files.get(name);
+        }
+        async getDirectoryHandle(name) {
+          if (!this._dirs.has(name)) { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          return this._dirs.get(name);
+        }
+        async *entries() { for (const [name, handle] of this._files) yield [name, handle]; }
+      }
+      const wavBytes = new Uint8Array([
+        0x52,0x49,0x46,0x46, 0x2c,0x00,0x00,0x00, 0x57,0x41,0x56,0x45,
+        0x66,0x6d,0x74,0x20, 0x10,0x00,0x00,0x00, 0x01,0x00, 0x01,0x00,
+        0x44,0xac,0x00,0x00, 0x88,0x58,0x01,0x00, 0x02,0x00, 0x10,0x00,
+        0x64,0x61,0x74,0x61, 0x08,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      ]);
+      const proj = (name) => JSON.stringify({ version: 1, projectName: name, snapshot: { notes: [], lanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: name, locS: null, locE: null } });
+      const dir = new MockDirHandle('MyProjects');
+      dir._files.set('subfolder-song.mmvp', new MockFileHandle('subfolder-song.mmvp', proj('subfolder-song'), Date.now()));
+      const audioDir = new MockDirHandle('Audio');
+      audioDir._files.set('subfolder-song.wav', new MockFileHandle('subfolder-song.wav', wavBytes, Date.now()));
+      dir._dirs.set('Audio', audioDir);
+      window._TEST_setProjDirHandle(dir);
+      const fh = dir._files.get('subfolder-song.mmvp');
+      window._TEST_loadProject(await fh.getFile());
+      return true;
+    });
+    await page.waitForTimeout(150);
+    const audioName = await page.evaluate(() => window._TEST_audioFileName());
+    check('when audio isn\'t next to the .mmvp, auto-load falls back to checking an "Audio" subfolder',
+      found === true && audioName === 'subfolder-song.wav', audioName);
+    await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  // ---------- Audio: manual reload preserves the restored offset (v0.9.28) ----------
+
+  await withPage(browser, async (page) => {
+    // Simulate a project whose snapshot had a non-zero audio offset (e.g.
+    // "moved everything 2 bars") but whose audio didn't auto-locate — the
+    // user has to manually pick the file via Load / drag-drop. That offset
+    // must survive, not silently reset to 0.
+    await page.evaluate(() => { window._TEST_state.audioOffset = 960; });
+    const bytes = makeWavBytes(1);
+    const wavTmpPath = path.join(__dirname, 'reload-preserve-offset.wav');
+    fs.writeFileSync(wavTmpPath, Buffer.from(bytes));
+    await page.setInputFiles('#audioFileInput', wavTmpPath);
+    await page.waitForTimeout(150);
+    const afterManualLoad = await page.evaluate(() => ({ offset: window._TEST_state.audioOffset, name: window._TEST_audioFileName() }));
+    fs.unlinkSync(wavTmpPath);
+    check('manually (re)loading audio via the Load button does NOT reset an already-set audio offset',
+      afterManualLoad.offset === 960 && afterManualLoad.name.endsWith('.wav'), afterManualLoad);
+
+    // The explicit clear (×) path must still reset it to 0 — that's the one
+    // deliberate "start fresh" action, unchanged.
+    await page.click('#audioClearBtn');
+    await page.waitForTimeout(50);
+    const afterClear = await page.evaluate(() => window._TEST_state.audioOffset);
+    check('explicitly clearing audio (×) still resets the offset to 0', afterClear === 0, afterClear);
+  });
+
   await browser.close();
   server.close();
 
