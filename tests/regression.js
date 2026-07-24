@@ -117,6 +117,11 @@ function buildTestHtml() {
       '  window._TEST_clearCcSel = () => ccSel.clear();',
       '  window._TEST_tempoSegAt = (t) => tempoSegAt(t);',
       '  window._TEST_commitTempoDrag = (tick0, dropLocalX) => commitTempoDrag(tick0, dropLocalX);',
+      '  window._TEST_alignTempoToTime = (tick0, sec) => alignTempoToTime(tick0, sec);',
+      '  window._TEST_setTempoAtTick = (tick, bpm) => setTempoAtTick(tick, bpm);',
+      '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
+      '  window._TEST_beatLineHitTest = (localX) => beatLineHitTest(localX);',
+      '  window._TEST_tickToBarBeat = (t) => tickToBarBeat(t);',
       '  window._TEST_tickToX = (t) => tickToX(t);',
       '  window._TEST_updateVariabilityIndicators = () => updateVariabilityIndicators();',
       '  window._TEST_buildSyncTrack = () => Array.from(buildSyncTrack());',
@@ -5254,7 +5259,9 @@ async function run() {
     // formula) to prove a tick-0 note is inset from the border by ~GUTTER
     // px, and that the border itself (x=0) is still plain background.
     const gutter = await page.evaluate(() => window._TEST_GUTTER());
-    check('GUTTER is a small positive inset (a few px, not zero and not huge)', gutter > 0 && gutter <= 40, gutter);
+    // Upper bound is generous enough for the widest gutter-parked label stack
+    // ("400 BPM" under "32/16" since v0.9.33) but still small in absolute terms.
+    check('GUTTER is a small positive inset (a few px, not zero and not huge)', gutter > 0 && gutter <= 48, gutter);
 
     const note = await page.evaluate(() => {
       const n = { id: window._TEST_state.nextId++, pitch: 70, start: 0, length: 480, vel: 100, ch: 0 };
@@ -5267,7 +5274,9 @@ async function run() {
       const cv = document.getElementById('prCanvas'), ctx = cv.getContext('2d');
       const nh = window._TEST_state.noteHeight, PITCH_MAX = 127;
       const y = Math.round((PITCH_MAX - pitch) * nh + nh / 2);
-      const row = ctx.getImageData(0, y, Math.min(40, cv.width), 1).data;
+      // Window has to reach past the gutter itself, or the note we're looking
+      // for falls outside it and the scan reports "nothing here".
+      const row = ctx.getImageData(0, y, Math.min(window._TEST_GUTTER() + 20, cv.width), 1).data;
       const bg = [row[0], row[1], row[2]];
       let firstDiff = -1;
       for (let x = 0; x < row.length / 4; x++) {
@@ -5406,17 +5415,22 @@ async function run() {
         const o = x * 4;
         if (Math.abs(row[o] - bg[0]) + Math.abs(row[o + 1] - bg[1]) + Math.abs(row[o + 2] - bg[2]) > 40) { noteX = x; break; }
       }
+      // Collect EVERY inked column in the ruler row rather than just the
+      // leftmost one: since v0.9.33 the bar-1 marker labels are stacked in the
+      // gutter and put ink well left of any bar line, so "first non-background
+      // pixel" no longer means "bar line".
       const rrow = rctx.getImageData(0, 2, rulerCv.width, 1).data;
       const rbg = [rrow[0], rrow[1], rrow[2]];
-      let barX = -1;
+      const inked = [];
       for (let x = 0; x < rrow.length / 4; x++) {
         const o = x * 4;
-        if (Math.abs(rrow[o] - rbg[0]) + Math.abs(rrow[o + 1] - rbg[1]) + Math.abs(rrow[o + 2] - rbg[2]) > 30) { barX = x; break; }
+        if (Math.abs(rrow[o] - rbg[0]) + Math.abs(rrow[o + 1] - rbg[1]) + Math.abs(rrow[o + 2] - rbg[2]) > 30) inked.push(x);
       }
-      return { noteX, barX };
+      const barX = inked.length ? inked.reduce((best, x) => Math.abs(x - noteX) < Math.abs(best - noteX) ? x : best, inked[0]) : -1;
+      return { noteX, barX, inked };
     }, note.pitch);
     check('the tick-1920 note (piano roll) and the ruler\'s bar line at the same tick land within 2px of each other',
-      xs.noteX >= 0 && xs.barX >= 0 && Math.abs(xs.noteX - xs.barX) <= 2, xs);
+      xs.noteX >= 0 && xs.barX >= 0 && Math.abs(xs.noteX - xs.barX) <= 2, { noteX: xs.noteX, barX: xs.barX });
   });
 
   // ---------------- Channel Pressure lanes (v0.9.19) ----------------
@@ -6568,16 +6582,242 @@ async function run() {
     const opened = await page.evaluate(() => ({
       open: document.getElementById('tempoMarkerPopover').classList.contains('open'),
       hasRemove: !!document.getElementById('tempoMarkerPopover').querySelector('.danger'),
-      bpmVal: document.getElementById('tempoMarkerPopover').querySelector('input[type=number]').value,
+      bpmVal: document.getElementById('tempoMarkerBpmInput').value,
     }));
     check('clicking an existing tempo marker opens its edit popover pre-filled with its BPM and a Remove button',
       opened.open && opened.hasRemove && opened.bpmVal === '145', opened);
-    await page.fill('#tempoMarkerPopover input[type=number]', '160');
-    await page.click('#tempoMarkerPopover button:not(.danger)');
+    await page.fill('#tempoMarkerBpmInput', '160');
+    await page.click('#tempoMarkerOkBtn');
     await page.waitForTimeout(50);
     const after = await page.evaluate(() => window._TEST_state.tempoMap.slice());
     check('updating the tempo marker popover changes that breakpoint\'s BPM in place',
       after.length === 2 && after.some(s => s.tick === 1920 && Math.abs(s.bpm - 160) < 0.01), after);
+  });
+
+  // ---------------- v0.9.33: ruler marker styling, time grid, beat-drag tempo ----------------
+
+  await withPage(browser, async (page) => {
+    // (a) The bar-1 time-signature and tempo labels are ONE matched pair: same
+    // font, stacked one above the other, both parked to the LEFT of the bar
+    // line in the gutter. Before v0.9.33 the TS label was 11px white at
+    // mid-height while the tempo label was 9px grey pinned bottom-right of the
+    // line, where it collided with the position label ("4/4" over "0:00").
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 70 }];
+      window._TEST_state.bpm = 70;
+      window._TEST_requestDraw();
+    });
+    await page.waitForTimeout(80);
+    const geo = await page.evaluate(() => ({
+      ts: window._TEST_tsMarkerHits().find(m => m.tick === 0),
+      tempo: window._TEST_tempoMarkerHits().find(m => m.tick === 0),
+      barLineX: window._TEST_tickToX(0),
+    }));
+    check('bar-1 TS label is stacked directly ABOVE the tempo label, not beside it',
+      geo.ts.cy + 8 <= geo.tempo.cy, geo);
+    check('both bar-1 marker labels sit to the LEFT of the bar-1 line, in the gutter',
+      geo.ts.cx < geo.barLineX && geo.tempo.cx < geo.barLineX, geo);
+
+    const drawn = await page.evaluate(() => {
+      const ctx = document.getElementById('rulerCanvas').getContext('2d');
+      const out = [];
+      const orig = ctx.fillText.bind(ctx);
+      ctx.fillText = (text, x, y) => { out.push({ text, x, font: ctx.font }); return orig(text, x, y); };
+      window._TEST_requestDraw();
+      return new Promise(r => setTimeout(() => r(out), 150));
+    });
+    const tsLbl = drawn.find(d => d.text === '4/4'), tempoLbl = drawn.find(d => d.text === '70 BPM');
+    check('the bar-1 "4/4" and "70 BPM" labels are drawn in one and the same font',
+      !!tsLbl && !!tempoLbl && tsLbl.font === tempoLbl.font, { tsLbl, tempoLbl });
+    // The collision that started this: the position label for bar 1 must not be
+    // drawn on top of either marker label.
+    const posLbl = drawn.find(d => d.text === '1');
+    check('the bar-1 position label is clear of the marker labels (no overlap)',
+      !!posLbl && posLbl.x > tsLbl.x && posLbl.x > tempoLbl.x, { posLbl, tsLbl, tempoLbl });
+  });
+
+  await withPage(browser, async (page) => {
+    // (b) Time-mode ruler labels are emitted on a TIME grid, not on the
+    // bar/beat grid merely formatted as times. At the whole-second resolution
+    // of mm:ss and hh:mm:ss the old approach both dropped labels (adjacent
+    // beats formatting identically) and repeated the same second across a bar
+    // boundary — the user saw "0:06" ending bar 2 and "0:06" opening bar 3.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 70 }];
+      window._TEST_state.bpm = 70;
+      window._TEST_state.bars = 32;
+    });
+    async function timeLabels(mode) {
+      await page.selectOption('#rulerMode', mode);
+      await page.waitForTimeout(60);
+      return page.evaluate(() => {
+        const ctx = document.getElementById('rulerCanvas').getContext('2d');
+        const out = [];
+        const orig = ctx.fillText.bind(ctx);
+        ctx.fillText = (text, x, y) => { out.push({ text, x }); return orig(text, x, y); };
+        window._TEST_requestDraw();
+        return new Promise(r => setTimeout(() => r(out), 150));
+      });
+    }
+    for (const [mode, re] of [['mmss', /^\d+:\d{2}$/], ['hhmmss', /^\d{2}:\d{2}:\d{2}$/]]) {
+      const times = (await timeLabels(mode)).filter(l => re.test(l.text));
+      const texts = times.map(l => l.text), xs = times.map(l => l.x);
+      check(`ruler ${mode}: no time label is printed twice`,
+        texts.length >= 4 && new Set(texts).size === texts.length, texts);
+      check(`ruler ${mode}: time labels advance monotonically left to right`,
+        xs.every((x, i) => i === 0 || x > xs[i - 1]), { texts, xs });
+      const gaps = xs.slice(1).map((x, i) => x - xs[i]);
+      check(`ruler ${mode}: time labels are evenly spaced (one per round interval of elapsed time)`,
+        gaps.length >= 3 && Math.max(...gaps) - Math.min(...gaps) < 2, { texts, gaps });
+    }
+    // Bars mode is untouched by the rewrite: still bar numbers plus beat subdivisions.
+    await page.selectOption('#rulerMode', 'bars');
+    await page.waitForTimeout(60);
+    const bars = await page.evaluate(() => {
+      const ctx = document.getElementById('rulerCanvas').getContext('2d');
+      const out = [];
+      const orig = ctx.fillText.bind(ctx);
+      ctx.fillText = (text) => { out.push(text); return orig(text, 0, 0); };
+      window._TEST_requestDraw();
+      return new Promise(r => setTimeout(() => r(out), 150));
+    });
+    check('switching back to bars mode still shows bar numbers with beat subdivisions',
+      ['2', '3', '4'].every(n => bars.includes(n)), bars);
+  });
+
+  await withPage(browser, async (page) => {
+    // (c) The tempo-align gesture grabs BEAT lines, not just bar lines. Cubase
+    // matches a tempo map beat by beat, so you can pull beat 3 of a bar onto a
+    // transient in the audio, not only a downbeat.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }];
+      window._TEST_state.bars = 8;
+      window._TEST_state.pxPerTick = 0.1; // 48px per beat: comfortably wider than the 8px hit radius
+      window._TEST_requestDraw();
+    });
+    await page.waitForTimeout(80);
+    const r = await page.evaluate(() => {
+      const ppq = window._TEST_state.ppq, x = t => window._TEST_tickToX(t);
+      return {
+        beat3: ppq * 2,
+        onBeat3: window._TEST_nearestBeatLineTick(x(ppq * 2)),
+        nearBeat3: window._TEST_nearestBeatLineTick(x(ppq * 2) + 3),
+        hitOnBeat: window._TEST_beatLineHitTest(x(ppq * 2)),
+        hitMidBeat: window._TEST_beatLineHitTest((x(ppq * 2) + x(ppq * 3)) / 2),
+      };
+    });
+    check('nearestBeatLineTick snaps to the nearest BEAT line, not the nearest bar line',
+      r.onBeat3 === r.beat3 && r.nearBeat3 === r.beat3, r);
+    check('beatLineHitTest grabs a beat line only when the cursor is close to one',
+      r.hitOnBeat === r.beat3 && r.hitMidBeat === null, r);
+    // Discoverability: the gesture is described on hover even without Alt held.
+    const tip = await page.evaluate(() => {
+      const rc = document.getElementById('rulerCanvas');
+      rc.title = '';
+      const pos = window._TEST_rulerScreenPos(window._TEST_tickToX(window._TEST_state.ppq * 2), 12);
+      rc.dispatchEvent(new MouseEvent('mousemove', { clientX: pos.x, clientY: pos.y, bubbles: true }));
+      return rc.title;
+    });
+    check('hovering a beat line explains the Alt+drag tempo-align gesture (discoverable without Alt held)',
+      /alt\+drag/i.test(tip) && /bpm/i.test(tip), tip);
+  });
+
+  await withPage(browser, async (page) => {
+    // A tempo breakpoint left mid-bar by a beat-level align still gets its own
+    // marker: before v0.9.33 markers were drawn inside the per-bar loop, so
+    // anything off a downbeat was invisible and therefore un-editable.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 960, bpm: 90 }];
+      window._TEST_state.bars = 8;
+      window._TEST_requestDraw();
+    });
+    await page.waitForTimeout(80);
+    const hits = await page.evaluate(() => window._TEST_tempoMarkerHits());
+    check('a mid-bar tempo breakpoint still gets a selectable ruler marker', hits.some(m => m.tick === 960), hits);
+    const labels = await page.evaluate(() => ({ midBar: window._TEST_tickToBarBeat(960), downbeat: window._TEST_tickToBarBeat(1920) }));
+    check('tickToBarBeat names a mid-bar point "bar.beat" but leaves a downbeat as a plain bar number',
+      labels.midBar === '1.3' && labels.downbeat === '2', labels);
+
+    // Editing that marker must NOT quantise it back to the bar line.
+    const hit = hits.find(m => m.tick === 960);
+    const pos = await page.evaluate((h) => window._TEST_rulerScreenPos(h.cx, h.cy), hit);
+    await page.mouse.click(pos.x, pos.y);
+    await page.waitForTimeout(80);
+    await page.fill('#tempoMarkerBpmInput', '135');
+    await page.click('#tempoMarkerOkBtn');
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_state.tempoMap.slice());
+    check('updating a mid-bar tempo marker keeps it on its exact tick (no re-quantising to the bar)',
+      after.length === 2 && after.some(s => s.tick === 960 && Math.abs(s.bpm - 135) < 0.01), after);
+  });
+
+  await withPage(browser, async (page) => {
+    // The typed half of the Cubase gesture: you give MME the wall-clock time a
+    // beat should land on, and it derives the BPM for the stretch since the
+    // previous tempo marker — not the other way round.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }];
+      window._TEST_state.bpm = 120;
+      window._TEST_state.bars = 8;
+    });
+    const ppq = await page.evaluate(() => window._TEST_state.ppq);
+    const bar2 = ppq * 4; // at 120 BPM that's 4 beats = 2.000s
+    const before = await page.evaluate((t) => window._TEST_tickToSeconds(t), bar2);
+    await page.evaluate((t) => window._TEST_alignTempoToTime(t, 4), bar2);
+    const res = await page.evaluate((t) => ({ sec: window._TEST_tickToSeconds(t), map: window._TEST_state.tempoMap.slice() }), bar2);
+    check('alignTempoToTime moves a beat to the requested wall-clock time by re-tempoing the stretch before it',
+      Math.abs(before - 2) < 0.01 && Math.abs(res.sec - 4) < 0.01, { before, res });
+    check('aligning halves the BPM when a beat is asked to arrive twice as late',
+      Math.abs(res.map[0].bpm - 60) < 0.01, res.map);
+    check('aligning plants a breakpoint at the aligned beat so later material keeps its original tempo',
+      res.map.some(s => s.tick === bar2 && Math.abs(s.bpm - 120) < 0.01), res.map);
+  });
+
+  await withPage(browser, async (page) => {
+    // The popover's "Align to … sec" row is the same primitive, reachable
+    // without dragging — and it is meaningless for the bar-1 start marker,
+    // which has no preceding stretch to re-tempo.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 120 }];
+      window._TEST_state.bpm = 120;
+      window._TEST_state.bars = 8;
+      window._TEST_requestDraw();
+    });
+    await page.waitForTimeout(80);
+    const startHit = await page.evaluate(() => window._TEST_tempoMarkerHits().find(m => m.isStart));
+    const startPos = await page.evaluate((h) => window._TEST_rulerScreenPos(h.cx, h.cy), startHit);
+    await page.mouse.click(startPos.x, startPos.y);
+    await page.waitForTimeout(80);
+    const startPop = await page.evaluate(() => ({
+      open: document.getElementById('tempoMarkerPopover').classList.contains('open'),
+      hasAlign: !!document.getElementById('tempoMarkerAlignBtn'),
+    }));
+    check('the bar-1 starting-tempo popover offers no "Align to" row (nothing precedes it to re-tempo)',
+      startPop.open && !startPop.hasAlign, startPop);
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(50);
+
+    const hit = await page.evaluate(() => window._TEST_tempoMarkerHits().find(m => m.tick === 1920));
+    const pos = await page.evaluate((h) => window._TEST_rulerScreenPos(h.cx, h.cy), hit);
+    await page.mouse.click(pos.x, pos.y);
+    await page.waitForTimeout(80);
+    const prefill = await page.evaluate(() => document.getElementById('tempoMarkerAlignSec').value);
+    // Tick 1920 is four quarter notes in, which at 120 BPM arrives at 2.000s.
+    check('the "Align to" field pre-fills with the point\'s current wall-clock time', Math.abs(+prefill - 2) < 0.01, prefill);
+    await page.fill('#tempoMarkerAlignSec', '6');
+    await page.click('#tempoMarkerAlignBtn');
+    await page.waitForTimeout(80);
+    const after = await page.evaluate(() => ({ sec: window._TEST_tickToSeconds(1920), map: window._TEST_state.tempoMap.slice() }));
+    // Asking a stretch that currently takes 2s to take 6s means running it at a
+    // third of the speed: 120 / 3 = 40 BPM.
+    check('typing a time into "Align to" and pressing Align lands that beat on that time',
+      Math.abs(after.sec - 6) < 0.02 && Math.abs(after.map[0].bpm - 40) < 0.02, after);
   });
 
   // ---------------- Drum Map (.drm) import ----------------

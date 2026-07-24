@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.32
+  MMV MIDI & CC Curve Editor v0.9.33
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -679,6 +679,40 @@
   described), not ONote — some Cubase maps are a note-remap table where ONote
   points at an entirely different note, which would attach the name to the
   wrong key.
+  v0.9.33 Timeline ruler overhaul, in three parts. (1) The bar-1 time-
+  signature and tempo labels are now one matched pair: same font, same size,
+  stacked one above the other and parked to the LEFT of the bar line in the
+  gutter. Previously the signature was 11px white at mid-height while the
+  tempo was 9px grey pinned to the bottom right of the line, so "4/4" sat on
+  top of "70 BPM" and both collided with the "0:00" position label. Marker
+  hit boxes now stop one pixel short of their own bar line, so clicking on or
+  right of the line is always a plain click-to-seek. GUTTER widened 30 -> 44px
+  to clear the wider of the two stacked labels. (2) The mm:ss and hh:mm:ss
+  ruler modes were emitting labels at bar/beat positions and merely FORMATTING
+  them as times, which at whole-second resolution both dropped labels
+  (adjacent beats formatting identically) and repeated them across bar
+  boundaries — the same second could appear twice, e.g. "0:06" ending one bar
+  and "0:06" opening the next. Time modes now draw a genuine time grid: one
+  label per round interval of elapsed time (0.01s up to 1h, whichever fits),
+  each at that instant's true x position, with its own tick mark. Labels are
+  evenly spaced and strictly increasing whatever the tempo and time signature
+  are doing. ssssss.ss, which looked right before only because two decimal
+  places made every beat distinct, uses the same grid. Bars mode is unchanged.
+  (3) Tempo matching now works the Cubase way round — you say WHERE a beat
+  should land and MME derives the BPM, rather than you working the BPM out
+  yourself. Alt+drag now grabs any BEAT line, not only a bar line, so you can
+  pull beat 3 of a bar onto a transient in the audio; the resulting breakpoint
+  can sit mid-bar and still gets its own ruler line, marker and popover
+  (labelled Cubase-style as "bar.beat", with downbeats staying plain bar
+  numbers). Hovering any beat line now describes the gesture in a tooltip
+  whether or not Alt is held — previously the hit test only ran while Alt was
+  already down, so there was no way to discover the gesture existed — and
+  holding Alt highlights the exact beat line that would be grabbed before you
+  commit. The tempo marker popover gains an "Align to … sec" row: type the
+  wall-clock time in the audio that this point should land on and press
+  Align, and MME re-tempos the stretch since the previous tempo marker to get
+  it there. The audio is never moved or time-stretched, and material after
+  the aligned beat keeps its original tempo.
 -->
 
 
@@ -1122,7 +1156,7 @@
      the ruler mousedown/mousemove/mouseup handlers). Small form: a couple of
      fields, Remove (hidden for the un-removable bar-1 "start" marker),
      Update. */
-  #tsMarkerPopover,#tempoMarkerPopover{position:fixed;width:200px;background:var(--panel);
+  #tsMarkerPopover,#tempoMarkerPopover{position:fixed;width:230px;background:var(--panel);
     border:1px solid var(--line);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);
     z-index:700;display:none;flex-direction:column;gap:7px;padding:10px 12px;font-size:11px;}
   #tsMarkerPopover{border-top:2px solid var(--accent2);}
@@ -1990,7 +2024,10 @@
   // renders to the LEFT of the bar-1 line, same as every other TS marker)
   // has room to draw its label without clipping against the pane edge, even
   // for a wide signature like "32/16" (num/den's own input limits).
-  const GUTTER=30;
+  // v0.9.33: widened again to 44 — the bar-1 tempo marker now stacks under the
+  // time-signature marker on that same left side, so the gutter has to clear
+  // the wider of the two labels ("400 BPM") rather than just "32/16".
+  const GUTTER=44;
   function pitchToY(p){ return (PITCH_MAX-p)*state.noteHeight; }
   function yToPitch(y){ return clamp(PITCH_MAX - Math.floor(y/state.noteHeight), PITCH_MIN, PITCH_MAX); }
   function fracTicks(s){ if(typeof s!=='string') return ticksPerBeat();
@@ -2010,6 +2047,13 @@
     const beat=Math.floor(tickInBar/tpe), remB=tickInBar-beat*tpe;
     const sub=Math.floor(remB/tps), tk=Math.round(remB-sub*tps);
     return `${bar+1}.${beat+1}.${sub+1}.${tk}`; }
+  // Short Cubase-style "bar.beat" form for labelling tempo breakpoints, which
+  // since v0.9.33 can sit on any beat rather than only on a downbeat. A
+  // downbeat drops the redundant ".1" and reads as a plain bar number, so the
+  // common case stays as readable as it was before beats were allowed.
+  function tickToBarBeat(t){ const {bar,seg,tickInBar}=walkToTick(t);
+    const beat=Math.floor(tickInBar/(state.ppq*4/seg.den));
+    return beat===0 ? String(bar+1) : (bar+1)+'.'+(beat+1); }
   function bbtToTick(str){ const p=str.split('.').map(s=>parseInt(s)||0);
     const barIdx=Math.max(0,(p[0]||1)-1), barStart=barToTick(barIdx), seg=tsSegAt(barStart);
     const tpe=state.ppq*4/seg.den, tps=Math.round(tpe/4);
@@ -2367,6 +2411,17 @@
     ctx.moveTo(Math.round(x0)+0.5,0); ctx.lineTo(Math.round(x0)+0.5,h);
     ctx.moveTo(Math.round(x1)+0.5,0); ctx.lineTo(Math.round(x1)+0.5,h); ctx.stroke(); }
 
+  // Shared look for BOTH kinds of ruler marker label. They stack one above the
+  // other to the LEFT of their bar line — time signature on top, tempo below —
+  // in one font and one size, so a bar's "4/4" and "70 BPM" read as a matched
+  // pair rather than two unrelated bits of text. (Before v0.9.33 the TS label
+  // was 11px mid-height while the tempo label was 9px pinned to the bottom
+  // right of the line, where it collided with the position label.)
+  const MARKER_FONT='9px system-ui', MARKER_Y_TS=7, MARKER_Y_TEMPO=18;
+  // Minimum bar width (px) before a bar other than bar 1 gets marker labels —
+  // enough room for the stacked labels plus the neighbouring bar's position
+  // label. Bar 1 is exempt: its labels live in the gutter, uncontested.
+  const MARKER_MIN_BAR_PX=64;
   function drawRuler(){ const cv=rulerCanvas,ctx=rctx,vw=cv.width,h=cv.height; beginPane(ctx,cv); const sx=state.scrollLeft;
     ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h);
     ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
@@ -2380,76 +2435,160 @@
     ctx.stroke();
     ctx.fillStyle=getCss('--txt'); ctx.font='11px system-ui'; ctx.textBaseline='middle'; ctx.textAlign='left';
     const barPx=(bars[0]?bars[0].tpb:ticksPerBar())*state.pxPerTick, every=Math.max(1,Math.ceil(36/Math.max(1,barPx)));
-    const tsColor=getCss('--accent2'), tempoColor=getCss('--tempoVar'), startTsColor=getCss('--txt'), startTempoColor=getCss('--txt2');
+    const tsColor=getCss('--accent2'), tempoColor=getCss('--tempoVar'), startColor=getCss('--txt2');
     // Rebuilt every draw — the ruler's own mousedown/mousemove/mouseup
     // handlers (below) hit-test the mouse against whichever regions were
     // drawn most recently, so these only ever need to reflect "right now".
     tsMarkerHits=[]; tempoMarkerHits=[];
+    // ---- Pass 1: bar lines ------------------------------------------------
     bars.forEach(b=>{ const t=b.startTick, x=tickToX(t), change=changeAt.get(t), tempoChange=tempoChangeAt.get(t);
-      const isStart=(t===0);
       ctx.lineWidth=(change||tempoChange)?2:1;
       ctx.strokeStyle=change?tsColor:(tempoChange?tempoColor:getCss('--gridBar'));
       ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
-      ctx.lineWidth=1;
-      let barLbl=null;
-      if(b.barIdx%every===0){ barLbl=state.rulerMode==='bars'?String(b.barIdx+1):formatRulerTime(tickToSeconds(t));
-        ctx.fillStyle=getCss('--txt'); ctx.fillText(barLbl,x+4,h/2); }
-      // Time-signature marker — every bar carrying an explicit change (orange),
-      // PLUS bar 1 always (the project's STARTING signature, in neutral white
-      // rather than orange — there's no "before" to contrast against there).
-      // Both kinds are selectable/draggable (see the mousedown/mousemove/
-      // mouseup handlers below), so this also records each one's on-screen
-      // hit region in tsMarkerHits. Sits to the LEFT of the line — the
-      // opposite side from the bar number, so the two never collide.
-      const tsMark = change || (isStart ? {tick:0,num:state.tsMap[0].num,den:state.tsMap[0].den} : null);
-      if(tsMark && b.tpb*state.pxPerTick>40 && every===1){
-        const label=tsMark.num+'/'+tsMark.den;
-        ctx.fillStyle=isStart?startTsColor:tsColor; ctx.textAlign='right';
-        ctx.fillText(label, x-4, h/2);
-        const tw=ctx.measureText(label).width;
-        ctx.textAlign='left';
-        tsMarkerHits.push({tick:t, isStart, x0:x-4-tw-3, y0:h/2-9, x1:x+2, y1:h/2+9});
-      }
-      // Tempo marker — mirror image on the RIGHT of the line (opposite the
-      // time-sig label), purple for a change / grey for the bar-1 starting
-      // tempo. Set low near the bottom edge in a smaller font so it also
-      // clears the bar-number label sharing that same side.
-      const tempoMark = tempoChange || (isStart ? {tick:0,bpm:state.tempoMap[0].bpm} : null);
-      if(tempoMark && b.tpb*state.pxPerTick>40 && every===1){
-        const label=Math.round(tempoMark.bpm)+' BPM';
-        ctx.fillStyle=isStart?startTempoColor:tempoColor; ctx.textAlign='left'; ctx.font='9px system-ui'; ctx.textBaseline='bottom';
-        ctx.fillText(label, x+4, h-2);
-        const tw=ctx.measureText(label).width;
-        ctx.font='11px system-ui'; ctx.textBaseline='middle';
-        tempoMarkerHits.push({tick:t, isStart, x0:x-2, y0:h-2-11, x1:x+4+tw+3, y1:h});
-      }
-      // Intra-bar subdivision labels fill in once there's enough room per
-      // beat, giving more populated position markers as you zoom further in.
-      // In "bars" mode these are plain beat numbers (2, 3, 4…); in any time
-      // format they instead show that beat's actual time, honoring the same
-      // format as the bar-start labels — skipped whenever it would either
-      // not fit in the available space or just repeat the previous label
-      // (e.g. several beats landing within the same displayed second).
-      if(every===1 && b.tpe*state.pxPerTick>24){
-        ctx.fillStyle=getCss('--txt2'); ctx.font='9px system-ui';
-        const stepPx=b.tpe*state.pxPerTick;
-        let prevLbl=barLbl;
-        for(let i=1,tt=t+b.tpe; tt<t+b.tpb-1e-6; tt+=b.tpe,i++){
-          if(tt<t0||tt>t1) continue;
-          let lbl2;
-          if(state.rulerMode==='bars') lbl2=String(i+1);
-          else{
-            lbl2=formatRulerTime(tickToSeconds(tt));
-            if(lbl2===prevLbl || ctx.measureText(lbl2).width+6>stepPx) continue;
-          }
-          ctx.fillText(lbl2,tickToX(tt)+2,h/2);
-          prevLbl=lbl2;
-        }
-        ctx.font='11px system-ui';
-      }
     });
+    // Since v0.9.33 a tempo breakpoint no longer has to sit on a bar line
+    // (Alt+drag aligns any BEAT), so any that fall mid-bar get their own line.
+    const barStartTicks=new Set(bars.map(b=>b.startTick));
+    ctx.strokeStyle=tempoColor; ctx.lineWidth=2; ctx.beginPath();
+    tempoMapSorted().forEach(s=>{ if(s.tick<=0||s.tick<t0||s.tick>t1||barStartTicks.has(s.tick)) return;
+      const x=Math.round(tickToX(s.tick))+0.5; ctx.moveTo(x,0); ctx.lineTo(x,h); });
+    ctx.stroke(); ctx.lineWidth=1;
+    // ---- Pass 2: TS/tempo markers ----------------------------------------
+    // A marker is drawn at every explicit change (orange for a time signature,
+    // purple for a tempo), PLUS tick 0 always — the project's STARTING
+    // signature and tempo, both in neutral grey since there's no "before" to
+    // contrast them against. The two labels stack to the LEFT of their line in
+    // one shared font/size (see MARKER_FONT), so a "4/4" and its "120 BPM"
+    // read as one matched pair. All of them are selectable/draggable (see the
+    // mousedown/mousemove/mouseup handlers below), so this records each one's
+    // on-screen hit region. Each label span also goes into `blockers`, so the
+    // position-label pass below can skip anything that would collide.
+    const blockers=[];
+    const markerAt=new Map();
+    const noteMarker=(tick,kind,label,isChange)=>{
+      let m=markerAt.get(tick); if(!m){ m={tick,ts:null,tempo:null}; markerAt.set(tick,m); }
+      m[kind]={label,isChange};
+    };
+    tsMapSorted().forEach(s=>{ if(s.tick>0) noteMarker(s.tick,'ts',s.num+'/'+s.den,true); });
+    tempoMapSorted().forEach(s=>{ if(s.tick>0) noteMarker(s.tick,'tempo',Math.round(s.bpm)+' BPM',true); });
+    noteMarker(0,'ts',state.tsMap[0].num+'/'+state.tsMap[0].den,false);
+    noteMarker(0,'tempo',Math.round(state.tempoMap[0].bpm)+' BPM',false);
+    ctx.font=MARKER_FONT; ctx.textBaseline='middle'; ctx.textAlign='right';
+    let lastRight=-Infinity;
+    [...markerAt.values()].sort((a,b)=>a.tick-b.tick).forEach(m=>{
+      const x=tickToX(m.tick);
+      if(x<sx-120||x>sx+vw) return;
+      const width=Math.max(m.ts?ctx.measureText(m.ts.label).width:0, m.tempo?ctx.measureText(m.tempo.label).width:0);
+      const left=x-4-width-3;
+      // Skipped when the bar it sits in is too narrow for the labels to read,
+      // or when it would run into the previous marker's labels. Tick 0 is
+      // exempt: its labels live in the gutter, where nothing competes.
+      if(m.tick!==0 && (segTicksPerBar(tsSegAt(m.tick))*state.pxPerTick<=MARKER_MIN_BAR_PX || left<=lastRight)) return;
+      const isStart=m.tick===0;
+      if(m.ts){
+        ctx.fillStyle=m.ts.isChange?tsColor:startColor;
+        ctx.fillText(m.ts.label,x-4,MARKER_Y_TS);
+        const tw=ctx.measureText(m.ts.label).width;
+        // Hit box stops one pixel SHORT of the bar line: the labels live
+        // entirely to the left of it, so clicking on or right of the line is
+        // always a plain click-to-seek, never a marker selection. (Until
+        // v0.9.33 the box reached x+2, which stole the first couple of pixels
+        // of the ruler at bar 1 from seeking.)
+        tsMarkerHits.push({tick:m.tick,isStart,x0:x-4-tw-3,y0:MARKER_Y_TS-6,x1:x-1,y1:MARKER_Y_TS+5});
+      }
+      if(m.tempo){
+        ctx.fillStyle=m.tempo.isChange?tempoColor:startColor;
+        ctx.fillText(m.tempo.label,x-4,MARKER_Y_TEMPO);
+        const tw=ctx.measureText(m.tempo.label).width;
+        tempoMarkerHits.push({tick:m.tick,isStart,x0:x-4-tw-3,y0:MARKER_Y_TEMPO-5,x1:x-1,y1:MARKER_Y_TEMPO+6});
+      }
+      blockers.push({x0:left,x1:x+2});
+      lastRight=x+2;
+    });
+    ctx.font='11px system-ui'; ctx.textAlign='left';
+    const blocked=(bx0,bx1)=>blockers.some(k=>bx1>k.x0&&bx0<k.x1);
+    // ---- Pass 3: position labels -----------------------------------------
+    if(state.rulerMode==='bars'){
+      bars.forEach(b=>{ const t=b.startTick, x=tickToX(t);
+        if(b.barIdx%every!==0) return;
+        const lbl=String(b.barIdx+1);
+        if(!blocked(x+4,x+4+ctx.measureText(lbl).width)){ ctx.fillStyle=getCss('--txt'); ctx.fillText(lbl,x+4,h/2); }
+        // Intra-bar beat numbers fill in once there's enough room per beat,
+        // giving more populated position markers as you zoom further in.
+        if(every===1 && b.tpe*state.pxPerTick>24){
+          ctx.fillStyle=getCss('--txt2'); ctx.font='9px system-ui';
+          for(let i=1,tt=t+b.tpe; tt<t+b.tpb-1e-6; tt+=b.tpe,i++){
+            if(tt<t0||tt>t1) continue;
+            const lbl2=String(i+1), lx=tickToX(tt)+2;
+            if(blocked(lx,lx+ctx.measureText(lbl2).width)) continue;
+            ctx.fillText(lbl2,lx,h/2);
+          }
+          ctx.font='11px system-ui';
+        }
+      });
+    } else {
+      drawRulerTimeGrid(ctx,h,t0,t1,blocked);
+    }
+    drawAltBeatHint(ctx,h);
     drawTempoDragGhost(ctx,h);
     drawTsDragGhost(ctx,h);
+  }
+  // Ladder of "round" label intervals (seconds) for the time-based ruler
+  // modes — the ruler picks the smallest one whose on-screen spacing still
+  // leaves room for a label.
+  const RULER_TIME_STEPS=[0.01,0.02,0.05,0.1,0.2,0.25,0.5,1,2,5,10,15,20,30,60,120,300,600,900,1800,3600];
+  // Position labels for the time-based ruler modes (mm:ss, hh:mm:ss,
+  // ssssss.ss). Deliberately NOT tied to the bar grid: one label per round
+  // interval of elapsed TIME, drawn at that instant's true x position, so the
+  // labels are evenly spaced and strictly increasing whatever the tempo and
+  // time signature are doing.
+  //
+  // Before v0.9.33 these were emitted at bar/beat positions and merely
+  // formatted as times, which at the whole-second resolution of mm:ss and
+  // hh:mm:ss both dropped labels (adjacent beats formatting identically) and
+  // repeated them across bar boundaries (the de-duplication only looked within
+  // a single bar) — e.g. at 70 BPM you'd get 0:00 . 0:01 0:02 | 0:03 0:04 0:05
+  // 0:06 | 0:06 …, with the same second appearing twice. The ssssss.ss mode
+  // looked fine only because two decimal places made every beat distinct.
+  function drawRulerTimeGrid(ctx,h,t0,t1,blocked){
+    const sec0=tickToSeconds(t0), sec1=tickToSeconds(t1);
+    if(!(sec1>sec0)) return;
+    const pxPerSec=(tickToX(t1)-tickToX(t0))/(sec1-sec0);
+    if(!(pxPerSec>0)) return;
+    ctx.font='10px system-ui'; ctx.textAlign='left'; ctx.textBaseline='middle';
+    // mm:ss and hh:mm:ss resolve only to whole seconds, so a sub-second step
+    // would just print the same string several times in a row.
+    const minStep=state.rulerMode==='secs'?0.01:1;
+    const needPx=ctx.measureText(formatRulerTime(sec1)).width+14;
+    let step=RULER_TIME_STEPS[RULER_TIME_STEPS.length-1];
+    for(const s of RULER_TIME_STEPS){ if(s<minStep-1e-9) continue; if(s*pxPerSec>=needPx){ step=s; break; } }
+    const first=Math.ceil(sec0/step-1e-9)*step;
+    ctx.strokeStyle=getCss('--txt2');
+    for(let k=0;k<600;k++){
+      // Snapped to 1e-6 so accumulated float drift can never push a label
+      // just under its own round value and make floor() print the previous
+      // second twice — the exact duplication this rewrite exists to kill.
+      const sec=+((first+k*step).toFixed(6));
+      if(sec>sec1+1e-9) break;
+      const x=tickToX(secondsToTicks(sec));
+      // The label marks a real instant, which in general is NOT a bar or beat
+      // line, so give it its own tick along the ruler's top edge.
+      ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,4); ctx.stroke();
+      const lbl=formatRulerTime(sec);
+      if(blocked(x+3,x+3+ctx.measureText(lbl).width)) continue;
+      ctx.fillStyle=getCss('--txt'); ctx.fillText(lbl,x+3,h/2);
+    }
+    ctx.font='11px system-ui';
+  }
+  // Highlights the beat line an Alt+drag would grab, so the tempo-align
+  // gesture shows you its target before you commit to it.
+  function drawAltBeatHint(ctx,h){
+    if(altBeatHint==null||tempoDrag||tsMarkerDrag) return;
+    const x=Math.round(tickToX(altBeatHint))+0.5;
+    ctx.save();
+    ctx.strokeStyle=getCss('--tempoVar'); ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+    ctx.restore();
   }
   // Live-preview line for an in-progress Alt+drag tempo-align gesture (see
   // the rulerCanvas mousedown handler below) — a dashed purple vertical line
@@ -2727,14 +2866,29 @@
   // starting signature) but never dragged — moving bar 1 doesn't mean
   // anything, so tsMarkerDrag.isStart short-circuits movement tracking.
   let tsMarkerDrag=null;
+  // Tick of the beat line an Alt+drag would grab right now (null = none under
+  // the cursor / Alt not held). Purely a hover affordance — drawAltBeatHint().
+  let altBeatHint=null;
   const BAR_HIT_PX=8;
   function nearestBarLineTick(localX){
     const t=clamp(xToTick(localX),0,totalTicks());
     const barIdx=Math.max(0,nearestBarAt(t)-1);
     return Math.round(barToTick(barIdx));
   }
-  function barLineHitTest(localX){
-    const tick=nearestBarLineTick(localX);
+  // Nearest BEAT line — the grab target for tempo alignment. Cubase matches a
+  // tempo map beat by beat, not bar by bar, so you can pull e.g. beat 3 of bar
+  // 2 onto a transient in the audio, not only a downbeat. (Time-SIGNATURE
+  // changes still snap to bar lines via nearestBarLineTick() — a signature can
+  // only change at a bar boundary.)
+  function nearestBeatLineTick(localX){
+    const t=clamp(xToTick(localX),0,totalTicks());
+    const w=walkToTick(t); if(!w) return 0;
+    const tpe=state.ppq*4/w.seg.den;
+    const barStart=Math.round(barToTick(w.bar));
+    return clamp(Math.round(barStart+Math.round(w.tickInBar/tpe)*tpe),0,totalTicks());
+  }
+  function beatLineHitTest(localX){
+    const tick=nearestBeatLineTick(localX);
     return Math.abs(tickToX(tick)-localX)<=BAR_HIT_PX ? tick : null;
   }
   rulerCanvas.addEventListener('mousedown',e=>{
@@ -2744,9 +2898,12 @@
     const tempoHit=hitTestMarkerList(tempoMarkerHits,lx,ly);
     if(tempoHit){ tempoDrag={tick0:tempoHit.tick, isStart:tempoHit.isStart, curLocalX:lx, moved:false, isExistingMarker:true}; requestDraw(); return; }
     if(e.altKey){
-      const hit=barLineHitTest(lx);
-      if(hit!=null){ tempoDrag={tick0:hit, curLocalX:lx, moved:false, isExistingMarker:false}; requestDraw(); }
-      return; // Alt held: either started a tempo drag / TS-create click, or a deliberate no-op near no bar line
+      const hit=beatLineHitTest(lx);
+      // barTick: where a no-drag Alt+CLICK would create a time-signature
+      // change instead — always the nearest bar line, even when the beat line
+      // actually grabbed is mid-bar.
+      if(hit!=null){ tempoDrag={tick0:hit, barTick:nearestBarLineTick(lx), curLocalX:lx, moved:false, isExistingMarker:false}; altBeatHint=null; requestDraw(); }
+      return; // Alt held: either started a tempo drag / TS-create click, or a deliberate no-op near no beat line
     }
     const x=lx; rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false};
   });
@@ -2769,24 +2926,34 @@
       const d=tempoDrag; tempoDrag=null;
       if(d.moved) commitTempoDrag(d.tick0,d.curLocalX);
       else if(d.isExistingMarker) openTempoMarkerPopover(d.tick0,!!d.isStart);
-      else openTsMarkerPopover(d.tick0,false); // Alt+click (no drag) on a bare bar line: create a TS marker there
+      else openTsMarkerPopover(d.barTick!=null?d.barTick:d.tick0,false); // Alt+click (no drag) on a bare beat line: create a TS marker at that bar
       requestDraw(); return;
     }
     if(!rulerDrag) return;
     if(!rulerDrag.moved){ state.playhead=clamp(rulerDrag.startT,0,totalTicks()); updatePlayPos(); updatePlayheadEl(); }
     rulerDrag=null; });
+  // Discoverability: the tempo-align gesture is described on hover whether or
+  // not Alt is currently held (before v0.9.33 the hit test only ran while Alt
+  // was down, so there was no way to find out the gesture existed). Holding
+  // Alt additionally switches the cursor and highlights the beat line that
+  // would be grabbed, so the target is unambiguous before the drag starts.
+  const TEMPO_DRAG_TIP='Alt+drag this beat line onto the point in the audio waveform where it belongs — MME works out the BPM needed to get there, for the stretch since the previous tempo marker. The audio is never moved or time-stretched.\nAlt+click (no drag) to add a time-signature change at this bar.';
   rulerCanvas.addEventListener('mousemove',e=>{
     updateStatusPos(rulerX(e));
     if(!rulerDrag&&!tempoDrag&&!tsMarkerDrag){
       const lx=rulerX(e), ly=rulerY(e);
       const tsHit=hitTestMarkerList(tsMarkerHits,lx,ly), tempoHit=hitTestMarkerList(tempoMarkerHits,lx,ly);
-      const overBar=e.altKey?barLineHitTest(lx):null;
+      const overBeat=(tsHit||tempoHit)?null:beatLineHitTest(lx);
+      const hint=(overBeat!=null&&e.altKey&&overBeat>0)?overBeat:null;
+      if(hint!==altBeatHint){ altBeatHint=hint; requestDraw(); }
       if(tsHit){ rulerCanvas.style.cursor=tsHit.isStart?'pointer':'grab'; rulerCanvas.title=tsHit.isStart?'Click to edit the project\'s starting time signature':'Click to edit or remove this time signature change — drag to move it to a different bar'; }
       else if(tempoHit){ rulerCanvas.style.cursor=tempoHit.isStart?'pointer':'grab'; rulerCanvas.title=tempoHit.isStart?'Click to edit the project\'s starting tempo':'Click to edit or remove this tempo change — drag to re-align it with a point in the audio waveform'; }
-      else if(overBar!=null){ rulerCanvas.style.cursor='ew-resize'; rulerCanvas.title='Alt+drag to align this bar with a point in the audio waveform below (tempo bends to fit — audio is not time-stretched)\nAlt+click (no drag) to add a time-signature change at this bar'; }
+      else if(overBeat!=null){ rulerCanvas.style.cursor=e.altKey?'ew-resize':''; rulerCanvas.title=TEMPO_DRAG_TIP; }
       else { rulerCanvas.style.cursor=''; rulerCanvas.title=''; }
     }
   });
+  rulerCanvas.addEventListener('mouseleave',()=>{ if(altBeatHint!=null){ altBeatHint=null; requestDraw(); } });
+  window.addEventListener('keyup',e=>{ if(!e.altKey&&altBeatHint!=null){ altBeatHint=null; requestDraw(); } });
   rulerCanvas.addEventListener('dblclick',()=>{ state.locStart=state.locEnd=null; updateLoopStatus(); requestDraw(); });
 
   // ---------- Piano roll interaction ----------
@@ -5749,9 +5916,8 @@
     const list=$('tempoMapList'); if(!list) return;
     list.innerHTML='';
     tempoMapSorted().forEach(s=>{
-      const {bar}=walkToTick(s.tick);
       const row=document.createElement('div'); row.style.cssText='display:flex;align-items:center;gap:6px;';
-      const lbl=document.createElement('span'); lbl.textContent='Bar '+(bar+1)+': '+(Math.round(s.bpm*100)/100)+' BPM';
+      const lbl=document.createElement('span'); lbl.textContent='Bar '+tickToBarBeat(s.tick)+': '+(Math.round(s.bpm*100)/100)+' BPM';
       lbl.style.cssText='flex:1;color:var(--txt2);';
       row.appendChild(lbl);
       if(s.tick!==0){
@@ -5774,6 +5940,20 @@
     if(idx>=0) state.tempoMap[idx]={tick,bpm}; else state.tempoMap.push({tick,bpm});
     state.tempoMap.sort((a,b)=>a.tick-b.tick);
     if(bar===0){ state.bpm=bpm; syncInputs(); }
+    updateDuration(); renderTsMapUI(); requestDraw();
+  }
+  // Sets (or creates) a tempo breakpoint at an EXACT tick. The Tempo Map
+  // panel's own form is bar-numbered and goes through addTempoMapChange()
+  // above; the ruler marker popover comes here instead, because since v0.9.33
+  // its marker may sit mid-bar (Alt+drag aligns any beat, not just downbeats)
+  // and re-quantising it to the bar start would silently move the breakpoint.
+  function setTempoAtTick(tick,bpm){
+    tick=Math.max(0,Math.round(tick));
+    pushUndo();
+    const idx=state.tempoMap.findIndex(s=>s.tick===tick);
+    if(idx>=0) state.tempoMap[idx]={tick,bpm}; else state.tempoMap.push({tick,bpm});
+    state.tempoMap.sort((a,b)=>a.tick-b.tick);
+    if(tick===0){ state.bpm=bpm; syncInputs(); }
     updateDuration(); renderTsMapUI(); requestDraw();
   }
   function removeTempoMapChange(tick){
@@ -5843,22 +6023,41 @@
     const pop=ensureTempoMarkerPopover(); pop.innerHTML='';
     const existing=state.tempoMap.find(s=>s.tick===tick);
     const eff=existing||tempoSegAt(tick);
-    const {bar}=walkToTick(tick);
     const title=document.createElement('div'); title.className='marker-pop-title';
-    title.textContent=isStart?'Starting Tempo':('Bar '+(bar+1)+' Tempo');
+    title.textContent=isStart?'Starting Tempo':('Tempo at bar '+tickToBarBeat(tick));
     pop.appendChild(title);
     const row=document.createElement('div'); row.className='marker-pop-row';
-    const bpmI=document.createElement('input'); bpmI.type='number'; bpmI.min=20; bpmI.max=400; bpmI.step='0.01'; bpmI.value=Math.round(eff.bpm*100)/100; bpmI.style.width='72px';
+    const bpmI=document.createElement('input'); bpmI.id='tempoMarkerBpmInput'; bpmI.type='number'; bpmI.min=20; bpmI.max=400; bpmI.step='0.01'; bpmI.value=Math.round(eff.bpm*100)/100; bpmI.style.width='72px';
     const lbl=document.createElement('span'); lbl.textContent='BPM'; lbl.style.color='var(--txt2)';
     row.appendChild(bpmI); row.appendChild(lbl);
     pop.appendChild(row);
+    // "Align to" — the tempo-matching gesture, typed instead of dragged. You
+    // read the time off the audio (or off the ruler in one of its time modes)
+    // and MME derives the BPM that gets this point there, rather than you
+    // having to work the BPM out yourself. Same primitive as an Alt+drag.
+    // Meaningless for the bar-1 start marker, which has nothing before it.
+    if(!isStart){
+      const hint=document.createElement('div'); hint.style.color='var(--txt2)'; hint.style.lineHeight='1.35';
+      hint.textContent='…or type the time in the audio this point should land on, and let MME work out the BPM:';
+      pop.appendChild(hint);
+      const arow=document.createElement('div'); arow.className='marker-pop-row';
+      const secI=document.createElement('input'); secI.id='tempoMarkerAlignSec'; secI.type='number'; secI.min=0; secI.step='0.01';
+      secI.value=Math.round(tickToSeconds(tick)*100)/100; secI.style.width='72px';
+      secI.title='Wall-clock time (seconds) this beat should fall on';
+      const secLbl=document.createElement('span'); secLbl.textContent='sec'; secLbl.style.color='var(--txt2)';
+      const alignBtn=document.createElement('button'); alignBtn.id='tempoMarkerAlignBtn'; alignBtn.textContent='Align';
+      alignBtn.title='Re-tempo the stretch since the previous tempo marker so this point lands at that time. The audio is never moved or time-stretched.';
+      alignBtn.addEventListener('click',()=>{ alignTempoToTime(tick,+secI.value||0); closeTempoMarkerPopover(); });
+      arow.appendChild(secI); arow.appendChild(secLbl); arow.appendChild(alignBtn);
+      pop.appendChild(arow);
+    }
     const actions=document.createElement('div'); actions.className='marker-pop-actions';
     if(!isStart&&existing){ const rm=document.createElement('button'); rm.className='danger'; rm.textContent='Remove'; rm.title='Remove this tempo change';
       rm.addEventListener('click',()=>{ removeTempoMapChange(tick); closeTempoMarkerPopover(); }); actions.appendChild(rm); }
-    const ok=document.createElement('button'); ok.textContent=existing?'Update':'Add';
+    const ok=document.createElement('button'); ok.id='tempoMarkerOkBtn'; ok.textContent=existing?'Update':'Add';
     ok.addEventListener('click',()=>{
       const bpm=clamp(Math.round((+bpmI.value||120)*100)/100,20,400);
-      addTempoMapChange(bar,bpm); closeTempoMarkerPopover();
+      setTempoAtTick(tick,bpm); closeTempoMarkerPopover();
     });
     actions.appendChild(ok);
     pop.appendChild(actions);
@@ -5869,16 +6068,20 @@
     pop.style.top=Math.round(top)+'px';
     bpmI.focus(); bpmI.select();
   }
-  // Commits an Alt+drag-a-bar-line tempo-align gesture (see the rulerCanvas
-  // mousedown handler above). tick0 is the ORIGINAL, unmoved tick of the bar
+  // Commits an Alt+drag-a-beat-line tempo-align gesture (see the rulerCanvas
+  // mousedown handler above). tick0 is the ORIGINAL, unmoved tick of the beat
   // that was dragged; dropLocalX is the ruler-local pixel (rulerX()-space) it
-  // was released at. Only the segment immediately before tick0 changes tempo
-  // — everything before that segment's own start, and everything after
-  // tick0, is deliberately left untouched (matching Logic/Cubase "Adjust
-  // Tempo Using Beat Markers": the audio never moves, only the grid bends).
-  function commitTempoDrag(tick0,dropLocalX){
-    if(tick0<=0){ flash('Cannot retime the first bar — Alt+drag a later bar line instead'); return; }
-    const newSeconds=tickToSeconds(xToTick(dropLocalX)); // current (pre-edit) tick<->time mapping
+  // was released at, resolved against the CURRENT (pre-edit) tick<->time
+  // mapping to get the wall-clock instant it should land on.
+  function commitTempoDrag(tick0,dropLocalX){ return alignTempoToTime(tick0,tickToSeconds(xToTick(dropLocalX))); }
+  // The tempo-matching primitive both the ruler drag and the tempo popover's
+  // "Align to" field go through: make `tick0` fall at `newSeconds` on the
+  // clock. Only the segment immediately before tick0 changes tempo —
+  // everything before that segment's own start, and everything after tick0,
+  // is deliberately left untouched (matching Logic/Cubase "Adjust Tempo Using
+  // Beat Markers": the audio never moves, only the grid bends to meet it).
+  function alignTempoToTime(tick0,newSeconds){
+    if(tick0<=0){ flash('Cannot retime the very start — Alt+drag a later beat line instead'); return; }
     const m=tempoMapSorted();
     let prevTick=0;
     for(const s of m){ if(s.tick<tick0) prevTick=s.tick; else break; }
@@ -5900,8 +6103,8 @@
     state.tempoMap.sort((a,b)=>a.tick-b.tick);
     if(prevTick===0){ state.bpm=state.tempoMap[0].bpm; syncInputs(); }
     updateDuration(); renderTsMapUI(); requestDraw();
-    const {bar}=walkToTick(prevTick);
-    flash('Tempo aligned — bar '+(bar+1)+' is now '+newBpm+' BPM');
+    flash('Tempo aligned — '+tickToBBT(prevTick)+' → '+tickToBBT(tick0)+' is now '+newBpm+' BPM');
+    return newBpm;
   }
   function updateVariabilityIndicators(){
     const bpmEl=$('bpm'), tempoBadge=$('tempoVarBadge');
