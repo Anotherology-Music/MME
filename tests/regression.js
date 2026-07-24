@@ -47,7 +47,7 @@ function buildTestHtml() {
       '  window._TEST_snapshot = snapshot;',
       '  window._TEST_applyState = applyState;',
       '  window._TEST_buildMidi = (opts) => Array.from(buildMidi(opts));',
-      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, pbMap: r.pbMap, cpMap: r.cpMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents }; };',
+      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, pbMap: r.pbMap, cpMap: r.cpMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents, tempoEvents: r.tempoEvents }; };',
       '  window._TEST_addLane = (cc, ch) => { const l = addLane(cc, ch); return l.id; };',
       '  window._TEST_addPbLane = (ch) => { const l = addPbLane(ch); return l.id; };',
       '  window._TEST_addCpLane = (ch) => { const l = addCpLane(ch); return l.id; };',
@@ -106,6 +106,11 @@ function buildTestHtml() {
       '  window._TEST_selectLanePoints = (id) => { const l = state.ccLanes.find(x => x.id === id); if (!l) return; ccSel.clear(); l.points.forEach(p => ccSel.add(p)); setActiveLane(id); };',
       '  window._TEST_ccSelSize = () => ccSel.size;',
       '  window._TEST_clearCcSel = () => ccSel.clear();',
+      '  window._TEST_tempoSegAt = (t) => tempoSegAt(t);',
+      '  window._TEST_commitTempoDrag = (tick0, dropLocalX) => commitTempoDrag(tick0, dropLocalX);',
+      '  window._TEST_tickToX = (t) => tickToX(t);',
+      '  window._TEST_updateVariabilityIndicators = () => updateVariabilityIndicators();',
+      '  window._TEST_buildSyncTrack = () => Array.from(buildSyncTrack());',
       '  init();',
     ].join('\n')
   );
@@ -5880,6 +5885,255 @@ async function run() {
     await page.waitForTimeout(50);
     const afterClear = await page.evaluate(() => window._TEST_state.audioOffset);
     check('explicitly clearing audio (×) still resets the offset to 0', afterClear === 0, afterClear);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Tempo map (v0.9.29)
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ---------- tickToSeconds/secondsToTicks: single-segment round trip, tsDen=4 (matches old flat behavior) ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bpm = 120; s.tempoMap = [{ tick: 0, bpm: 120 }]; s.ppq = 480; s.tsNum = 4; s.tsDen = 4;
+      const half = window._TEST_tickToSeconds(480); // 1 quarter note @120bpm = 0.5s
+      const rt = [0, 240, 480, 1920, 4800].map(t => {
+        const sec = window._TEST_tickToSeconds(t);
+        const back = window._TEST_secondsToTicks(sec);
+        return { t, sec, back };
+      });
+      return { half, rt };
+    });
+    check('tickToSeconds: 1 quarter note (480 ticks) @120bpm, tsDen=4 = 0.5s', Math.abs(r.half - 0.5) < 1e-9, r.half);
+    check('tickToSeconds/secondsToTicks round-trip (single segment, tsDen=4)',
+      r.rt.every(x => Math.abs(x.back - x.t) < 1e-6), r.rt);
+  });
+
+  // ---------- tsDen != 4 correctness fix: bpm is always quarter-notes/min, NOT tied to ticksPerBeat() ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bpm = 120; s.tempoMap = [{ tick: 0, bpm: 120 }]; s.ppq = 480; s.tsNum = 6; s.tsDen = 8;
+      // ticksPerBeat() in 6/8 is an EIGHTH note = 240 ticks. The old buggy
+      // formula (tickToSeconds = t/ticksPerBeat()*(60/bpm)) would treat those
+      // 240 ticks as if they were a full 60/bpm-second beat, giving 0.5s. The
+      // fix is quarter-note-based: 240 ticks = half a quarter note = 0.25s.
+      const eighthNoteSec = window._TEST_tickToSeconds(240);
+      const quarterNoteSec = window._TEST_tickToSeconds(480);
+      return { eighthNoteSec, quarterNoteSec };
+    });
+    check('tsDen=6/8 fix: 240 ticks (an eighth note) = 0.25s, NOT 0.5s (old ticksPerBeat()-tied bug)',
+      Math.abs(r.eighthNoteSec - 0.25) < 1e-9, r.eighthNoteSec);
+    check('tsDen=6/8: a full quarter note (480 ticks) is still 0.5s regardless of time signature',
+      Math.abs(r.quarterNoteSec - 0.5) < 1e-9, r.quarterNoteSec);
+  });
+
+  // ---------- Piecewise correctness across 2+ tempo breakpoints ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ppq = 480; s.tsNum = 4; s.tsDen = 4; s.bpm = 120;
+      // Segment 0: [0,1920) @120bpm — 1920 ticks = 4 quarter notes = 2.0s
+      // Segment 1: [1920,∞) @240bpm — 480 ticks = 1 quarter note = 0.25s
+      s.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 240 }];
+      const atBoundary = window._TEST_tickToSeconds(1920);
+      const midSeg2 = window._TEST_tickToSeconds(1920 + 960); // +0.5s into segment 2
+      const rt = [0, 960, 1920, 1920 + 480, 1920 + 960, 1920 + 2400].map(t => {
+        const sec = window._TEST_tickToSeconds(t);
+        const back = window._TEST_secondsToTicks(sec);
+        return { t, sec, back };
+      });
+      return { atBoundary, midSeg2, rt };
+    });
+    check('piecewise tickToSeconds: segment boundary (bar 2 @120bpm) lands at 2.0s', Math.abs(r.atBoundary - 2.0) < 1e-6, r.atBoundary);
+    check('piecewise tickToSeconds: 960 ticks into the 240bpm segment lands at 2.5s', Math.abs(r.midSeg2 - 2.5) < 1e-6, r.midSeg2);
+    check('piecewise tickToSeconds/secondsToTicks round-trip across a tempo-segment boundary',
+      r.rt.every(x => Math.abs(x.back - x.t) < 1e-6), r.rt);
+  });
+
+  // ---------- Drag-to-align (commitTempoDrag) algorithm ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ppq = 480; s.tsNum = 4; s.tsDen = 4; s.bpm = 120; s.bars = 8;
+      s.tempoMap = [{ tick: 0, bpm: 120 }];
+      const tick0 = window._TEST_barToTick(4); // bar 5 (0-indexed 4) = 7680 ticks
+      // Drag it to land at 6.4s, which (ticks/ppq*60/sec, over 7680 ticks from
+      // tick 0) implies exactly 150 BPM for the segment before it.
+      const dropTick = window._TEST_secondsToTicks(6.4); // computed under the CURRENT (pre-edit) flat 120bpm map
+      const dropLocalX = window._TEST_tickToX(dropTick);
+      window._TEST_commitTempoDrag(tick0, dropLocalX);
+      return { tick0, tempoMap: s.tempoMap.slice(), bpm: s.bpm };
+    });
+    check('drag-to-align: segment before the dragged bar gets the computed BPM (150)',
+      r.tempoMap.length === 2 && r.tempoMap[0].tick === 0 && Math.abs(r.tempoMap[0].bpm - 150) < 0.5, r);
+    check('drag-to-align: a new breakpoint is inserted at the dragged bar, inheriting the PRE-edit tempo (120) so nothing after it shifts',
+      r.tempoMap[1] && r.tempoMap[1].tick === r.tick0 && Math.abs(r.tempoMap[1].bpm - 120) < 0.5, r);
+    check('drag-to-align: state.bpm mirrors the (now-changed) first tempo-map entry', Math.abs(r.bpm - 150) < 0.5, r.bpm);
+  });
+
+  // ---------- Drag-to-align: rejects an impossible drop (negative/absurd tempo) without mutating anything ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ppq = 480; s.tsNum = 4; s.tsDen = 4; s.bpm = 120; s.bars = 8;
+      s.tempoMap = [{ tick: 0, bpm: 120 }];
+      const tick0 = window._TEST_barToTick(4);
+      // Drop BEFORE the previous anchor's time (negative span) — must reject.
+      const dropLocalX = window._TEST_tickToX(window._TEST_secondsToTicks(-1));
+      window._TEST_commitTempoDrag(tick0, dropLocalX);
+      return { tempoMap: s.tempoMap.slice() };
+    });
+    check('drag-to-align: an impossible drop (past the previous anchor\'s time) leaves the tempo map untouched',
+      r.tempoMap.length === 1 && r.tempoMap[0].bpm === 120, r.tempoMap);
+  });
+
+  // ---------- Tempo map persists through snapshot()/applyState() (save/reload round-trip) ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.tempoMap = [{ tick: 0, bpm: 100 }, { tick: 1920, bpm: 140 }, { tick: 3840, bpm: 90 }];
+      const snap = window._TEST_snapshot();
+      s.tempoMap = [{ tick: 0, bpm: 120 }]; // scramble it
+      window._TEST_applyState(snap);
+      return s.tempoMap.slice();
+    });
+    check('tempoMap round-trips through snapshot()/applyState() unchanged',
+      r.length === 3 && r[0].bpm === 100 && r[1].tick === 1920 && r[1].bpm === 140 && r[2].tick === 3840 && r[2].bpm === 90, r);
+  });
+
+  // ---------- Old-project (pre-v0.9.29) snapshots with no tempoMap field synthesize one from bpm ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      const oldSnap = JSON.stringify({
+        notes: [], lanes: [], bars: 10, bpm: 133, ppq: 480, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }],
+        locS: null, locE: null, next: 1, pitchNames: {}, projectName: '',
+      });
+      window._TEST_applyState(oldSnap);
+      return s.tempoMap.slice();
+    });
+    check('loading an old snapshot with no tempoMap synthesizes [{tick:0,bpm:<its bpm>}]',
+      r.length === 1 && r[0].tick === 0 && r[0].bpm === 133, r);
+  });
+
+  // ---------- buildMidi() emits one tempo meta-event per tempoMap breakpoint ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ppq = 480; s.tempoMap = [{ tick: 0, bpm: 100 }, { tick: 1920, bpm: 150 }];
+      const bytes = window._TEST_buildMidi({});
+      const parsed = window._TEST_parseMidi(bytes);
+      return parsed.tempoEvents;
+    });
+    check('buildMidi() writes one 0xFF 0x51 tempo event per tempo-map breakpoint (was: always exactly one, at tick 0)',
+      r.length === 2 && r[0].tick === 0 && Math.abs(r[0].bpm - 100) <= 1 && r[1].tick === 1920 && Math.abs(r[1].bpm - 150) <= 1, r);
+  });
+
+  // ---------- buildSyncTrack() also writes one tempo event per breakpoint (same fix, applied to the Follow-MMV sync-track export) ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ppq = 480; s.bars = 8; s.tsNum = 4; s.tsDen = 4;
+      s.tempoMap = [{ tick: 0, bpm: 100 }, { tick: 1920, bpm: 150 }];
+      const bytes = window._TEST_buildSyncTrack();
+      const parsed = window._TEST_parseMidi(bytes);
+      return parsed.tempoEvents;
+    });
+    check('buildSyncTrack() writes one tempo meta-event per tempo-map breakpoint (was: always exactly one, at tick 0)',
+      r.length === 2 && r[0].tick === 0 && Math.abs(r[0].bpm - 100) <= 1 && r[1].tick === 1920 && Math.abs(r[1].bpm - 150) <= 1, r);
+  });
+
+  // ---------- Toolbar "variable tempo/sig" indicators ----------
+  await withPage(browser, async (page) => {
+    const PURPLE = 'rgb(185, 138, 255)';
+    const single = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.tempoMap = [{ tick: 0, bpm: 120 }]; s.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      window._TEST_updateVariabilityIndicators();
+      const g = sel => getComputedStyle(document.querySelector(sel));
+      return {
+        bpmColor: g('#bpm').borderColor, sigColor: g('#tsNum').borderColor,
+        bpmBadge: getComputedStyle(document.getElementById('tempoVarBadge')).display,
+        sigBadge: getComputedStyle(document.getElementById('sigVarBadge')).display,
+      };
+    });
+    check('with a single tempo/sig entry, the BPM and Sig fields are NOT purple and badges are hidden',
+      single.bpmColor !== PURPLE && single.sigColor !== PURPLE && single.bpmBadge === 'none' && single.sigBadge === 'none', single);
+
+    const multi = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.tempoMap = [{ tick: 0, bpm: 118 }, { tick: 1920, bpm: 132 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 3, den: 4 }, { tick: 3840, num: 4, den: 4 }];
+      window._TEST_updateVariabilityIndicators();
+      const g = sel => getComputedStyle(document.querySelector(sel));
+      const bpmBadge = document.getElementById('tempoVarBadge'), sigBadge = document.getElementById('sigVarBadge');
+      return {
+        bpmColor: g('#bpm').borderColor, sigColor: g('#tsNum').borderColor,
+        bpmBadgeDisplay: getComputedStyle(bpmBadge).display, sigBadgeDisplay: getComputedStyle(sigBadge).display,
+        bpmTitle: bpmBadge.title, sigTitle: sigBadge.title,
+      };
+    });
+    check('with 2+ tempo breakpoints, #bpm turns purple and its badge shows a "118–132 BPM" range tooltip',
+      multi.bpmColor === PURPLE && multi.bpmBadgeDisplay !== 'none' && /118.*132/.test(multi.bpmTitle) && /varies/i.test(multi.bpmTitle), multi);
+    check('with 3 time-sig segments, #tsNum turns purple and its badge tooltip lists each distinct signature',
+      multi.sigColor === PURPLE && multi.sigBadgeDisplay !== 'none' && /4\/4.*3\/4.*4\/4/.test(multi.sigTitle), multi);
+  });
+
+  // ---------- Ruler: tempo-change bar lines render in the purple --tempoVar colour, distinct from the orange time-sig colour ----------
+  await withPage(browser, async (page) => {
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ppq = 480; s.tsNum = 4; s.tsDen = 4; s.bars = 8; s.pxPerTick = 0.06; s.scrollLeft = 0;
+      // Bar 1 (tick 1920) carries ONLY a tempo change; bar 3 (tick 5760) carries ONLY a time-sig change — kept on
+      // separate bars so each bar line's stroke colour unambiguously identifies which kind of change it is.
+      s.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 150 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 5760, num: 3, den: 4 }];
+      window._TEST_requestDraw();
+      const cv = document.getElementById('rulerCanvas'); const ctx = cv.getContext('2d');
+      const GUTTER = window._TEST_GUTTER();
+      function sampleNear(tick) {
+        const cx = Math.round(GUTTER + window._TEST_tickToX(tick));
+        let best = null, bestD = Infinity;
+        for (let dx = -3; dx <= 3; dx++) {
+          const x = cx + dx; if (x < 0 || x >= cv.width) continue;
+          const d = ctx.getImageData(x, 4, 1, 1).data;
+          const px = [d[0], d[1], d[2]];
+          const distTo = (t) => Math.hypot(px[0] - t[0], px[1] - t[1], px[2] - t[2]);
+          const dPurple = distTo([185, 138, 255]), dOrange = distTo([255, 180, 84]);
+          const dBest = Math.min(dPurple, dOrange);
+          if (dBest < bestD) { bestD = dBest; best = { px, dPurple, dOrange }; }
+        }
+        return best;
+      }
+      return { tempoBar: sampleNear(1920), sigBar: sampleNear(5760) };
+    });
+    check('ruler: the tempo-only bar line (bar 2) samples closer to purple (--tempoVar) than to the orange time-sig colour',
+      r.tempoBar && r.tempoBar.dPurple < r.tempoBar.dOrange && r.tempoBar.dPurple < 90, r.tempoBar);
+    check('ruler: the time-sig-only bar line (bar 4) samples closer to orange (--accent2) than to the purple tempo colour',
+      r.sigBar && r.sigBar.dOrange < r.sigBar.dPurple && r.sigBar.dOrange < 90, r.sigBar);
+  });
+
+  // ---------- Tempo Map popover UI: add + remove a breakpoint via the same list convention as the Time Sig map ----------
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => { window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }]; window._TEST_state.bars = 8; });
+    await page.click('#tsBtn');
+    await page.fill('#tempoMapBar', '3');
+    await page.fill('#tempoMapBpm', '140');
+    await page.click('#tempoMapAddBtn');
+    await page.waitForTimeout(50);
+    const afterAdd = await page.evaluate(() => window._TEST_state.tempoMap.slice());
+    check('Tempo Map popover: "+ Add" inserts a breakpoint at the given bar/BPM',
+      afterAdd.length === 2 && Math.abs(afterAdd[1].bpm - 140) < 0.001, afterAdd);
+
+    const listText = await page.evaluate(() => document.getElementById('tempoMapList').textContent);
+    check('Tempo Map popover list shows the new breakpoint', /140/.test(listText), listText);
+
+    await page.click('#tempoMapList button'); // × on the (only removable) row
+    await page.waitForTimeout(50);
+    const afterRemove = await page.evaluate(() => window._TEST_state.tempoMap.slice());
+    check('Tempo Map popover: × removes a breakpoint (tick-0 entry always remains)',
+      afterRemove.length === 1 && afterRemove[0].tick === 0, afterRemove);
   });
 
   await browser.close();

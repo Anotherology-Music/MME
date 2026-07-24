@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.28
+  MMV MIDI & CC Curve Editor v0.9.29
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -595,6 +595,34 @@
   discarding a value the user had painstakingly set by ear, right when they
   needed it most. The explicit × (clear audio) button still resets it, as the
   one deliberate "start fresh" action.
+  v0.9.29 Tempo map. Tempo is no longer a single flat project-wide BPM — like
+  time signature, it's now a map of {tick, bpm} breakpoints (state.tempoMap),
+  so a project can speed up or slow down over its length. Two ways to edit
+  it: the Time Sig popover gained a matching "Tempo Map" list (add/remove
+  breakpoints by bar + BPM), and — the headline feature — Alt+drag any bar
+  line on the ruler to align it with a point in the audio waveform below,
+  Logic/Cubase-style "Adjust Tempo Using Beat Markers": only the tick<->time
+  mapping bends to fit where you drop it, the audio itself is never
+  time-stretched. The ruler now shows tempo breakpoints as purple bar-line
+  markers with the new BPM spelled out to the right of the line (time-sig
+  changes stay orange, to the left — a bar with both shows both). The Tempo
+  and Sig toolbar fields still show their STARTING value, but turn purple
+  with a tooltip summary ("Tempo varies (2 breakpoints): 118-132 BPM" /
+  "Time signature varies (3 changes): 4/4, 3/4, 4/4") whenever their map has
+  more than one entry — previously they gave no indication a project wasn't
+  using one flat value throughout. Every real-time-vs-tick conversion in the
+  app (playback scheduling, the audio waveform's sample alignment, MIDI
+  Follow/sync, count-in, recorded note length, buildMidi()'s and the Sync
+  Track's tempo meta-events, etc.) now goes through the tempo map instead of
+  a flat state.bpm. Old projects with no saved tempoMap load exactly as
+  before (synthesized into a single tick-0 breakpoint from their old flat
+  bpm). Incidental fix along the way: tickToSeconds/secondsToTicks were
+  previously computed off ticksPerBeat(), which is time-signature-denominator
+  -dependent (e.g. an eighth note in 6/8) — correct for the beat grid/snap,
+  but wrong for real time, which MIDI (and this app's own export) always
+  measures in quarter-notes-per-minute regardless of tsDen. They're now
+  quarter-note-based, matching buildMidi() exactly; this only changes
+  displayed/scheduled timing for projects using a non-4 denominator.
 -->
 
 <style>
@@ -604,6 +632,7 @@
     --grid:#272c35; --gridBar:#3a414f; --gridBeat:#323844;
     --txt:#d7dbe2; --txt2:#8c93a1; --accent:#4fa3ff; --accent2:#ffb454;
     --sel:#ffe08a; --white:#e9edf3; --black:#1a1d23; --play:#ff5d6c; --pos:#7ed957;
+    --tempoVar:#b98aff;
     --keys-w:300px;
   }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
@@ -637,6 +666,13 @@
   .position-grp b,.position-grp .lbl2{flex-shrink:0;}
   .position-grp .lbl2{white-space:nowrap;}
   .project-grp .group{display:flex;align-items:center;gap:5px;}
+  /* Tempo/Sig "varies across the project" indicator — purple field border +
+     a small badge whose title tooltip spells out the actual variation. The
+     field itself keeps showing the STARTING value; only colour/badge signal
+     that it isn't the whole story. */
+  .var-badge{display:none;color:var(--tempoVar);font-size:11px;cursor:help;line-height:1;}
+  .var-badge.show{display:inline;}
+  #bpm.field-variable,#tsNum.field-variable,#tsDen.field-variable{border-color:var(--tempoVar);color:var(--tempoVar);}
   /* ── Setup dropdown ── */
   #setupWrapper{position:relative;}
   #setupPanel{position:absolute;top:calc(100% + 3px);right:0;width:500px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;}
@@ -1262,6 +1298,7 @@
         <span class="lbl">Tempo</span>
         <input type="number" id="bpm" value="120" min="20" max="400" title="BPM — changing this requires a new Export Sync Track for MMV sync">
         <span class="pill">BPM</span>
+        <span id="tempoVarBadge" class="var-badge">◆</span>
       </div>
       <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="100" min="1" max="999"></div>
       <div class="group">
@@ -1269,6 +1306,7 @@
         <input type="number" id="tsNum" value="4" min="1" max="32">
         <span class="pill">/</span>
         <select id="tsDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
+        <span id="sigVarBadge" class="var-badge">◆</span>
       </div>
       <div class="group">
         <span class="lbl">Length</span>
@@ -1426,6 +1464,15 @@
           <span class="pill">/</span>
           <select id="tsMapDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
           <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
+        </div>
+        <div class="setup-title" style="margin-top:6px;border-top:1px solid var(--line);padding-top:8px;">Tempo Map</div>
+        <div style="font-size:11px;color:var(--txt2);">Alt+drag a bar line on the ruler to align it with the audio waveform — tempo bends to fit, audio is never time-stretched.</div>
+        <div id="tempoMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
+        <div class="setup-row">
+          <span class="lbl">At bar</span><input type="number" id="tempoMapBar" value="1" min="1" style="width:56px;">
+          <span class="lbl">BPM</span>
+          <input type="number" id="tempoMapBpm" value="120" min="20" max="400" style="width:56px;">
+          <button id="tempoMapAddBtn" title="Add or replace the tempo change at this bar">+ Add</button>
         </div>
       </div>
     </div>
@@ -1727,6 +1774,7 @@
 
   const state = {
     bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4, tsMap:[{tick:0,num:4,den:4}],
+    tempoMap:[{tick:0,bpm:120}],
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
     recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false, recOffsetMs:0, quantIterative:false,
@@ -1792,6 +1840,16 @@
   function tsMapSorted(){ return state.tsMap.slice().sort((a,b)=>a.tick-b.tick); }
   function segTicksPerBar(seg){ return state.ppq*4/seg.den*seg.num; }
   function tsSegAt(tick){ const m=tsMapSorted(); let seg=m[0]; for(const s of m){ if(s.tick<=tick) seg=s; else break; } return seg; }
+
+  // ---------- Tempo map ----------
+  // state.tempoMap: [{tick, bpm}, ...] sorted by tick, always starts at tick 0.
+  // bpm is ALWAYS quarter-notes-per-minute (matching MIDI's own convention and
+  // buildMidi()'s mpqn calc) — unlike ticksPerBeat(), which is deliberately
+  // time-signature-denominator-dependent for beat-grid/metronome/snap purposes.
+  // state.bpm mirrors tempoMap[0].bpm and is what the toolbar BPM field reads/
+  // writes directly.
+  function tempoMapSorted(){ return state.tempoMap.slice().sort((a,b)=>a.tick-b.tick); }
+  function tempoSegAt(tick){ const m=tempoMapSorted(); let seg=m[0]; for(const s of m){ if(s.tick<=tick) seg=s; else break; } return seg; }
   // Walks the map up to `tick`, returning the 0-indexed bar it falls in, the
   // segment governing that bar, and how many ticks into that bar it is.
   function walkToTick(tick){
@@ -1861,8 +1919,31 @@
     // 3-part fallback (Bar.Beat.FineTick)
     const beat=Math.max(0,(p[1]||1)-1),tk=Math.max(0,p[2]||0);
     return barStart+beat*tpe+tk; }
-  function tickToSeconds(t){ return t/ticksPerBeat()*(60/state.bpm); }
-  function secondsToTicks(s){ return s*ticksPerBeat()*state.bpm/60; }
+  // Piecewise over the tempo map, using state.ppq ticks = 1 quarter note (the
+  // same convention buildMidi() uses for its tempo meta-events) — NOT
+  // ticksPerBeat(), which is time-signature-denominator-dependent and would
+  // silently desync on-screen timing from what's actually exported/played.
+  function tickToSeconds(t){
+    const m=tempoMapSorted(); let acc=0;
+    for(let i=0;i<m.length;i++){
+      const segStart=m[i].tick, segEnd=(i+1<m.length)?m[i+1].tick:Infinity;
+      const secPerTick=60/(m[i].bpm*state.ppq);
+      if(t<segEnd){ return acc+(t-segStart)*secPerTick; }
+      acc+=(segEnd-segStart)*secPerTick;
+    }
+    return acc;
+  }
+  function secondsToTicks(s){
+    const m=tempoMapSorted(); let acc=0;
+    for(let i=0;i<m.length;i++){
+      const segStart=m[i].tick, segEnd=(i+1<m.length)?m[i+1].tick:Infinity;
+      const secPerTick=60/(m[i].bpm*state.ppq);
+      const segDurSec=(segEnd===Infinity)?Infinity:(segEnd-segStart)*secPerTick;
+      if(s<acc+segDurSec||segEnd===Infinity){ return segStart+(s-acc)/secPerTick; }
+      acc+=segDurSec;
+    }
+    return 0;
+  }
   // Combines the coarse drag offset (audioOffset, ticks — where you've
   // positioned the track) with the fine latency trim (audioLatencyMs, a
   // fixed ms correction for decoder/output latency, e.g. MP3 encoder
@@ -1986,6 +2067,7 @@
   function snapshot(){ return JSON.stringify({ notes:state.notes,
     lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points,isf:l.isf||null})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
+    tempoMap:state.tempoMap,
     isfHistory:state.isfHistory||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
     genLen:state.genLen,channelNames:state.channelNames,
@@ -2002,6 +2084,9 @@
   function applyState(s){ const o=JSON.parse(s);
     state.notes=o.notes; state.bars=o.bars; state.bpm=o.bpm; state.ppq=o.ppq; state.tsNum=o.tsNum; state.tsDen=o.tsDen;
     state.tsMap=o.tsMap||[{tick:0,num:o.tsNum,den:o.tsDen}];
+    // Old projects (pre-v0.9.29) have no tempoMap at all — synthesize a
+    // single tick-0 entry from their flat bpm so they still load correctly.
+    state.tempoMap=o.tempoMap||[{tick:0,bpm:o.bpm}];
     state.locStart=o.locS; state.locEnd=o.locE; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
     state.projectName=o.projectName||''; if($('projectName')) $('projectName').value=state.projectName;
     if(o.isfHistory) state.isfHistory=o.isfHistory;
@@ -2111,14 +2196,16 @@
     const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
     const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
     const changeAt=new Map(tsMapSorted().filter(s=>s.tick>0).map(s=>[s.tick,s]));
+    const tempoChangeAt=new Map(tempoMapSorted().filter(s=>s.tick>0).map(s=>[s.tick,s]));
     ctx.strokeStyle=getCss('--gridBeat'); ctx.beginPath();
     bars.forEach(b=>{ for(let t=b.startTick;t<b.startTick+b.tpb-1e-6;t+=b.tpe){ if(t<t0||t>t1) continue; const x=Math.round(tickToX(t))+0.5; ctx.moveTo(x,h-7); ctx.lineTo(x,h); } });
     ctx.stroke();
     ctx.fillStyle=getCss('--txt'); ctx.font='11px system-ui'; ctx.textBaseline='middle'; ctx.textAlign='left';
     const barPx=(bars[0]?bars[0].tpb:ticksPerBar())*state.pxPerTick, every=Math.max(1,Math.ceil(36/Math.max(1,barPx)));
-    const tsColor=getCss('--accent2');
-    bars.forEach(b=>{ const t=b.startTick, x=tickToX(t), change=changeAt.get(t);
-      ctx.lineWidth=change?2:1; ctx.strokeStyle=change?tsColor:getCss('--gridBar');
+    const tsColor=getCss('--accent2'), tempoColor=getCss('--tempoVar');
+    bars.forEach(b=>{ const t=b.startTick, x=tickToX(t), change=changeAt.get(t), tempoChange=tempoChangeAt.get(t);
+      ctx.lineWidth=(change||tempoChange)?2:1;
+      ctx.strokeStyle=change?tsColor:(tempoChange?tempoColor:getCss('--gridBar'));
       ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
       ctx.lineWidth=1;
       let barLbl=null;
@@ -2132,6 +2219,17 @@
         ctx.fillStyle=tsColor; ctx.textAlign='right';
         ctx.fillText(change.num+'/'+change.den, x-4, h/2);
         ctx.textAlign='left';
+      }
+      // Tempo change marker: distinct purple so it never reads as identical to
+      // a time-sig change, labeled to the RIGHT of the line (opposite the
+      // time-sig label, which sits to the left) so a bar carrying both never
+      // collides. Set low near the bottom edge in a smaller font so it also
+      // clears the bar-number label, which shares the same (right) side at
+      // the ruler's vertical center.
+      if(tempoChange && b.tpb*state.pxPerTick>40 && every===1){
+        ctx.fillStyle=tempoColor; ctx.textAlign='left'; ctx.font='9px system-ui'; ctx.textBaseline='bottom';
+        ctx.fillText(Math.round(tempoChange.bpm)+' BPM', x+4, h-2);
+        ctx.font='11px system-ui'; ctx.textBaseline='middle';
       }
       // Intra-bar subdivision labels fill in once there's enough room per
       // beat, giving more populated position markers as you zoom further in.
@@ -2158,6 +2256,20 @@
         ctx.font='11px system-ui';
       }
     });
+    drawTempoDragGhost(ctx,h);
+  }
+  // Live-preview line for an in-progress Alt+drag tempo-align gesture (see
+  // the rulerCanvas mousedown handler below) — a dashed purple vertical line
+  // at the drop position, drawn on BOTH the ruler and the audio waveform
+  // (which share the same tick<->pixel mapping) so the user can see it line
+  // up with a transient in the waveform before releasing.
+  function drawTempoDragGhost(ctx,h){
+    if(!tempoDrag) return;
+    const x=Math.round(tempoDrag.curLocalX)+0.5;
+    ctx.save();
+    ctx.strokeStyle=getCss('--tempoVar'); ctx.lineWidth=2; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+    ctx.restore();
   }
   function drawAudioWave(){
     const cv=audioCanvas, ctx=actx, w=cv.width, h=cv.height; beginPane(ctx,cv);
@@ -2169,22 +2281,26 @@
     if(!audioBuf){
       ctx.fillStyle=getCss('--txt2'); ctx.font='11px system-ui'; ctx.textAlign='left'; ctx.textBaseline='middle';
       ctx.fillText('Load an audio file — use the Load button or drop a file here',sx+12,h/2);
+      drawTempoDragGhost(ctx,h);
       return;
     }
     const ch=audioBuf.getChannelData(0), sr=audioBuf.sampleRate;
-    const spt=sr*60/(state.bpm*ticksPerBeat()); // audio samples per tick
     const mid=h/2, pad=2;
     // audioOffset shifts the buffer's sample-0 to that timeline tick — a
     // positive offset delays audio (silent gap at the start), negative
     // trims/pulls it earlier (content before tick 0 is simply never shown).
+    // Sample position is derived via tickToSeconds (tempo-map-aware, piecewise)
+    // rather than a flat samples-per-tick constant, so the waveform stays in
+    // sync with wherever the tempo map says each tick actually falls in time.
     const off=state.audioOffset||0;
+    const offSec=tickToSeconds(off);
     const linePath=new Path2D(), fillPath=new Path2D();
     for(let px=0;px<w;px++){
       const cx=sx+px;
-      const t0px=cx/state.pxPerTick-off, t1px=(cx+1)/state.pxPerTick-off;
+      const t0px=tickToSeconds(cx/state.pxPerTick)-offSec, t1px=tickToSeconds((cx+1)/state.pxPerTick)-offSec;
       if(t1px<0) continue; // still within the pre-audio silent gap — keep scanning right
-      const i0=Math.max(0,Math.floor(t0px*spt));
-      const i1=Math.min(ch.length,Math.ceil(t1px*spt)+1);
+      const i0=Math.max(0,Math.floor(t0px*sr));
+      const i1=Math.min(ch.length,Math.ceil(t1px*sr)+1);
       if(i0>=ch.length) break;
       let mn=0,mx=0; const skip=Math.max(1,Math.floor((i1-i0)/256));
       for(let i=i0;i<i1;i+=skip){const s=ch[i]; if(s<mn)mn=s; if(s>mx)mx=s;}
@@ -2197,6 +2313,7 @@
     // zero line
     ctx.strokeStyle=getCss('--line'); ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(sx,mid+0.5); ctx.lineTo(sx+w,mid+0.5); ctx.stroke();
+    drawTempoDragGhost(ctx,h);
   }
   function drawKeys(){ const w=keysCanvas.width,h=keysCanvas.height,nh=state.noteHeight;
     kctx.setTransform(1,0,0,1,0,0); kctx.clearRect(0,0,w,h);
@@ -2368,15 +2485,49 @@
   function rulerX(e){ const r=rulerScroll.getBoundingClientRect(); return e.clientX-r.left+state.scrollLeft-GUTTER; }
   function snapLoc(t){ if(state.snap==='off') return Math.round(t); return Math.round(snapT(t)); }
   let rulerDrag=null;
-  rulerCanvas.addEventListener('mousedown',e=>{ const x=rulerX(e); rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false}; });
-  window.addEventListener('mousemove',e=>{ if(!rulerDrag) return;
+
+  // ---------- Ruler: Alt+drag a bar line to align it with the waveform
+  // below (tempo-track-from-beat-markers, Logic/Cubase-style). Only the tick
+  // <-> time mapping bends to fit — the audio itself is never time-stretched.
+  // See commitTempoDrag() (Tempo Map section, below) for the actual algorithm.
+  let tempoDrag=null;
+  const BAR_HIT_PX=8;
+  function nearestBarLineTick(localX){
+    const t=clamp(xToTick(localX),0,totalTicks());
+    const barIdx=Math.max(0,nearestBarAt(t)-1);
+    return Math.round(barToTick(barIdx));
+  }
+  function barLineHitTest(localX){
+    const tick=nearestBarLineTick(localX);
+    return Math.abs(tickToX(tick)-localX)<=BAR_HIT_PX ? tick : null;
+  }
+  rulerCanvas.addEventListener('mousedown',e=>{
+    if(e.altKey){
+      const hit=barLineHitTest(rulerX(e));
+      if(hit!=null){ tempoDrag={tick0:hit, curLocalX:rulerX(e), moved:false}; requestDraw(); }
+      return; // Alt held: either started a tempo drag, or a deliberate no-op near no bar line
+    }
+    const x=rulerX(e); rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false};
+  });
+  window.addEventListener('mousemove',e=>{
+    if(tempoDrag){ tempoDrag.curLocalX=rulerX(e); tempoDrag.moved=true; requestDraw(); return; }
+    if(!rulerDrag) return;
     if(Math.abs(e.clientX-rulerDrag.startX)>4) rulerDrag.moved=true;
     if(rulerDrag.moved){ const t=clamp(snapLoc(xToTick(rulerX(e))),0,totalTicks());
       state.locStart=Math.min(rulerDrag.startT,t); state.locEnd=Math.max(rulerDrag.startT,t); updateLoopStatus(); requestDraw(); } });
-  window.addEventListener('mouseup',()=>{ if(!rulerDrag) return;
+  window.addEventListener('mouseup',()=>{
+    if(tempoDrag){ const d=tempoDrag; tempoDrag=null; if(d.moved) commitTempoDrag(d.tick0,d.curLocalX); requestDraw(); return; }
+    if(!rulerDrag) return;
     if(!rulerDrag.moved){ state.playhead=clamp(rulerDrag.startT,0,totalTicks()); updatePlayPos(); updatePlayheadEl(); }
     rulerDrag=null; });
-  rulerCanvas.addEventListener('mousemove',e=>{ updateStatusPos(rulerX(e)); });
+  rulerCanvas.addEventListener('mousemove',e=>{
+    updateStatusPos(rulerX(e));
+    if(!rulerDrag&&!tempoDrag){
+      const overBar=e.altKey?barLineHitTest(rulerX(e)):null;
+      rulerCanvas.style.cursor=overBar!=null?'ew-resize':'';
+      rulerCanvas.title=overBar!=null?'Alt+drag to align this bar with a point in the audio waveform below (tempo bends to fit — audio is not time-stretched)':'';
+    }
+  });
   rulerCanvas.addEventListener('dblclick',()=>{ state.locStart=state.locEnd=null; updateLoopStatus(); requestDraw(); });
 
   // ---------- Piano roll interaction ----------
@@ -3950,8 +4101,8 @@
   // export unless explicitly opted into via the Setup panel checkboxes.
   function buildMidi(opts){ opts=opts||{};
     const anySolo=opts.soloOnly&&state.ccLanes.some(l=>l.soloed);
-    const ev=[]; const mpqn=Math.round(60000000/state.bpm);
-    ev.push({tick:0,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]});
+    const ev=[];
+    tempoMapSorted().forEach(s=>{ const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
     tsMapSorted().forEach(s=>{ const dd=Math.round(Math.log2(s.den)); ev.push({tick:s.tick,o:0,d:[0xFF,0x58,0x04,s.num,dd,24,8]}); });
     ev.push({tick:0,o:0,d:buildMmvMeta()});
     for(const n of state.notes){ const ch=n.ch&15; ev.push({tick:Math.round(n.start),o:2,d:[0x90|ch,n.pitch&127,clamp(n.vel,1,127)]}); ev.push({tick:Math.round(n.start+Math.max(1,n.length)),o:1,d:[0x80|ch,n.pitch&127,0]}); }
@@ -3979,8 +4130,8 @@
     // Encoding: beatIdx = pitch + (velocity - 1) * 128
     // velocity is offset by +1 so it is always >= 1 (velocity 0 = Note Off in MIDI).
     // Decoder: bar = floor(beatIdx / tsNum), beat = beatIdx % tsNum
-    const ev=[]; const mpqn=Math.round(60000000/state.bpm);
-    ev.push({tick:0,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]});
+    const ev=[];
+    tempoMapSorted().forEach(s=>{ const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
     const dd=Math.round(Math.log2(state.tsDen));
     ev.push({tick:0,o:0,d:[0xFF,0x58,0x04,state.tsNum,dd,24,8]});
     const tpb=ticksPerBeat(), noteDur=Math.max(1,Math.round(tpb/8)); // 1/32-note pulse
@@ -4237,12 +4388,12 @@
 
   function parseMidi(buf){ const dv=new DataView(buf); let p=0; const rd=n=>{let v=0;for(let i=0;i<n;i++){v=(v<<8)|dv.getUint8(p++);}return v;};
     if(rd(4)!==0x4D546864) throw new Error('Not a MIDI file'); rd(4); const fmt=rd(2), ntrk=rd(2), div=rd(2);
-    const notes=[], ccMap={}, pbMap={}, cpMap={}, tsEvents=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
+    const notes=[], ccMap={}, pbMap={}, cpMap={}, tsEvents=[], tempoEvents=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
     for(let ti=0;ti<ntrk;ti++){ if(rd(4)!==0x4D54726B) break; const len=rd(4); const end=p+len; let abs=0, status=0; const open={};
       while(p<end){ let delta=0,b; do{ b=dv.getUint8(p++); delta=(delta<<7)|(b&0x7F);}while(b&0x80); abs+=delta;
         let s=dv.getUint8(p); if(s&0x80){ status=s; p++; } else { s=status; } const type=s&0xF0, ch=s&0x0F;
         if(s===0xFF){ const meta=dv.getUint8(p++); let l=0,bb; do{bb=dv.getUint8(p++);l=(l<<7)|(bb&0x7F);}while(bb&0x80);
-          if(meta===0x51 && l===3){ const t=(dv.getUint8(p)<<16)|(dv.getUint8(p+1)<<8)|dv.getUint8(p+2); bpm=Math.round(60000000/t); }
+          if(meta===0x51 && l===3){ const t=(dv.getUint8(p)<<16)|(dv.getUint8(p+1)<<8)|dv.getUint8(p+2); bpm=Math.round(60000000/t); tempoEvents.push({tick:abs,bpm}); }
           if(meta===0x58 && l>=2){ tsN=dv.getUint8(p); tsD=Math.pow(2,dv.getUint8(p+1)); tsEvents.push({tick:abs,num:tsN,den:tsD}); }
           if(meta===0x7F && l>3 && dv.getUint8(p)===0x4D && dv.getUint8(p+1)===0x4D && dv.getUint8(p+2)===0x56){
             try{ mmvMeta=JSON.parse(new TextDecoder().decode(dv.buffer.slice(p+3,p+l))); }catch(e){} }
@@ -4255,7 +4406,7 @@
         else if(type===0xE0){ const lsb=dv.getUint8(p++),msb=dv.getUint8(p++); const pv=(lsb|(msb<<7))-8192; const k='pb_'+ch; (pbMap[k]=pbMap[k]||{ch,points:[]}).points.push({t:abs,v:pv}); }
         else if(type===0xD0){ const v=dv.getUint8(p++); const k='cp_'+ch; (cpMap[k]=cpMap[k]||{ch,points:[]}).points.push({t:abs,v}); }
         else if(type===0xC0){ p+=1; } else { p++; } } p=end; }
-    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,cpMap,mmvMeta,tsEvents}; }
+    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,cpMap,mmvMeta,tsEvents,tempoEvents}; }
   function closeNote(open,ch,pitch,abs,notes){ const arr=open[ch+'_'+pitch]; if(arr&&arr.length){ const o=arr.shift(); notes.push({start:o.start,length:Math.max(1,abs-o.start),pitch,vel:o.vel,ch}); } }
   function importMidi(buf, filename){ let r; try{ r=parseMidi(buf); }catch(err){ alert('Could not read file: '+err.message); return; }
     if(!projectHasContent()){ applyMidiImport(r,'replace'); return; }
@@ -4365,11 +4516,21 @@
     const out=[]; evs.forEach(e=>{ if(out.length&&out[out.length-1].tick===e.tick) out[out.length-1]=e; else out.push(e); });
     return out;
   }
+  // Same shape as tsMapFromEvents, for the file's tempo meta-events.
+  function tempoMapFromEvents(tempoEvents, bpm, scale){
+    const evs=(tempoEvents||[]).map(e=>({tick:Math.round(e.tick*scale),bpm:clamp(e.bpm,20,400)})).sort((a,b)=>a.tick-b.tick);
+    if(!evs.length) return [{tick:0,bpm}];
+    if(evs[0].tick!==0) evs.unshift({tick:0,bpm:evs[0].bpm});
+    const out=[]; evs.forEach(e=>{ if(out.length&&out[out.length-1].tick===e.tick) out[out.length-1]=e; else out.push(e); });
+    return out;
+  }
   function applyMidiImport(r, mode, remapChannels){
     pushUndo();
     if(mode==='replace'){
-      state.ppq=midiDiv(r); state.bpm=clamp(r.bpm,20,400); state.tsNum=r.tsN; state.tsDen=r.tsD;
+      state.ppq=midiDiv(r); state.tsNum=r.tsN; state.tsDen=r.tsD;
       state.tsMap=tsMapFromEvents(r.tsEvents,r.tsN,r.tsD,1);
+      state.tempoMap=tempoMapFromEvents(r.tempoEvents,clamp(r.bpm,20,400),1);
+      state.bpm=state.tempoMap[0].bpm;
       state.notes=r.notes.map(n=>({id:state.nextId++,...n}));
       let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+n.length)); Object.values(r.ccMap).forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,pt.t)));
       state.bars=Math.max(1,Math.ceil(maxT/ticksPerBar())+1);
@@ -4524,7 +4685,11 @@
     }
   }
   function followScheduleBeat(beatTick, wallMs){
-    const tpb=ticksPerBeat(), mspt=(60000/state.bpm)/tpb, msPerBeat=mspt*tpb;
+    // mspt is ms per raw MIDI tick — always quarter-note-rate (state.ppq
+    // ticks/quarter), same convention as tickToSeconds/buildMidi. tpb
+    // (ticksPerBeat, tsDen-dependent) is only the sync-track protocol's own
+    // beat-pulse spacing in RAW ticks, unrelated to the bpm-to-ms conversion.
+    const tpb=ticksPerBeat(), mspt=60000/(tempoSegAt(beatTick).bpm*state.ppq), msPerBeat=mspt*tpb;
     _followWindow(beatTick, wallMs, tpb, mspt);               // current beat
     _followWindow(beatTick+tpb, wallMs+msPerBeat, tpb, mspt); // next beat (lookahead)
   }
@@ -4565,7 +4730,7 @@
     syncRaf=null;
     if(!state.syncFollow||state.playing) return;
     if(syncAnchor){
-      const msPerTick=60000/(state.bpm*ticksPerBeat());
+      const msPerTick=60000/(tempoSegAt(syncAnchor.tick).bpm*state.ppq);
       state.playhead=clamp(Math.round(syncAnchor.tick+(now-syncAnchor.wallMs)/msPerTick),0,totalTicks());
       applyScrollLock(); updatePlayheadEl(); updatePlayPos();
     }
@@ -4621,7 +4786,7 @@
   function wallTimeToTick(wallMs){
     if(!sched) return state.playhead;
     const s=sched;
-    return (wallMs<s.t0) ? s.startTick : s.a + wrapv((wallMs-s.t0)/s.mpt + (s.startTick-s.a), s.span);
+    return (wallMs<s.t0) ? s.startTick : schedTickAtElapsed(s,wallMs-s.t0);
   }
   function handleRecordIn(e){
     if(!state.recording) return;
@@ -4667,7 +4832,7 @@
     // a short note played right at the recording boundary, which used to read as
     // a zero-length note and get "corrected" by adding a full loop span — turning
     // a quick tap into a note almost as long as the whole timeline.
-    const length=sched ? Math.max(1,Math.round((wallMs-o.wallMs)/sched.mpt)) : Math.max(1,tick-o.start);
+    const length=sched ? Math.max(1,Math.round(secondsToTicks(tickToSeconds(o.start)+(wallMs-o.wallMs)/1000)-o.start)) : Math.max(1,tick-o.start);
     state.notes.push({id:state.nextId++,pitch:d1,start:o.start,length,vel:o.vel,ch:o.ch});
     requestDraw();
   }
@@ -4676,7 +4841,7 @@
     const nowWall=performance.now(), tick=state.playhead;
     for(const [key,o] of recOpenNotes){
       const pitch=+key.split('_')[0];
-      const length=sched ? Math.max(1,Math.round((nowWall-o.wallMs)/sched.mpt)) : Math.max(1,tick-o.start);
+      const length=sched ? Math.max(1,Math.round(secondsToTicks(tickToSeconds(o.start)+(nowWall-o.wallMs)/1000)-o.start)) : Math.max(1,tick-o.start);
       state.notes.push({id:state.nextId++,pitch,start:o.start,length,vel:o.vel,ch:o.ch});
     }
     recOpenNotes.clear();
@@ -4708,7 +4873,7 @@
     const bars=+$('recCountIn').value||0;
     if(bars<=0){ beginRecording(); return; }
     state.recArmed=true; updateTransportBtns();
-    const localNum=tsSegAt(state.playhead).num, beatsTotal=bars*localNum, mspb=60000/state.bpm;
+    const localNum=tsSegAt(state.playhead).num, beatsTotal=bars*localNum, mspb=60000/tempoSegAt(state.playhead).bpm;
     flash('Count-in: '+bars+' bar'+(bars>1?'s':'')+'…');
     // Schedule every count-in click up front against one fixed future timestamp
     // (recordStartWall) instead of firing them live off a drifting setInterval —
@@ -4739,6 +4904,41 @@
   const LOOKAHEAD=150, START_DELAY=90, POLL=20;
   const AUDIO_FADE=0.008, AUDIO_WRAP_DIP=0.004; // seconds — anti-click ramps at start/stop/loop-wrap
   function wrapv(x,s){ return ((x % s)+s)%s; }
+  // ---- Tempo-map-aware pass timing helpers (replace the old flat "ms per
+  // tick" scheduling math) ----
+  // A playback pass loops the tick range [s.a, s.b) forever once past the
+  // initial (possibly partial) pass that starts at s.startTick. Because that
+  // range is identical every repeat, its real-world duration is constant
+  // across repeats even though the tempo map isn't flat within it — so each
+  // full pass takes exactly (tickToSeconds(b)-tickToSeconds(a)) seconds,
+  // regardless of how many tempo breakpoints fall inside it.
+  // schedElapsedMs(s,passIndex,tick): ms elapsed since s.t0 for `tick` on
+  // pass `passIndex` (0 = the initial partial pass from startTick to b).
+  function schedElapsedMs(s,passIndex,tick){
+    if(passIndex<=0) return (tickToSeconds(tick)-tickToSeconds(s.startTick))*1000;
+    const pass0Ms=(tickToSeconds(s.b)-tickToSeconds(s.startTick))*1000;
+    const fullPassMs=(tickToSeconds(s.b)-tickToSeconds(s.a))*1000;
+    return pass0Ms+(passIndex-1)*fullPassMs+(tickToSeconds(tick)-tickToSeconds(s.a))*1000;
+  }
+  // Inverse: given ms elapsed since s.t0 (>=0), the tick position within the
+  // loop right now (wrapping through a..b — same convention wrapv gave for a
+  // flat tempo).
+  function schedTickAtElapsed(s,elapsedMs){
+    const pass0Ms=(tickToSeconds(s.b)-tickToSeconds(s.startTick))*1000;
+    if(elapsedMs<pass0Ms) return secondsToTicks(tickToSeconds(s.startTick)+elapsedMs/1000);
+    const fullPassMs=Math.max(1e-9,(tickToSeconds(s.b)-tickToSeconds(s.a))*1000);
+    const rem=(elapsedMs-pass0Ms)%fullPassMs;
+    return secondsToTicks(tickToSeconds(s.a)+rem/1000);
+  }
+  // Which pass (0-indexed) `elapsedMs` since s.t0 falls in — used only to pace
+  // s.passIndex forward while a pass has no events of its own to do it (e.g.
+  // the metronome toggled on over an otherwise-empty project).
+  function schedPassIndexAt(s,elapsedMs){
+    const pass0Ms=(tickToSeconds(s.b)-tickToSeconds(s.startTick))*1000;
+    if(elapsedMs<pass0Ms) return 0;
+    const fullPassMs=Math.max(1e-9,(tickToSeconds(s.b)-tickToSeconds(s.a))*1000);
+    return 1+Math.floor((elapsedMs-pass0Ms)/fullPassMs);
+  }
   function makeWorker(){ try{
     const src="var id=null;self.onmessage=function(e){var d=e.data||{};if(d.cmd==='start'){if(id)clearInterval(id);id=setInterval(function(){self.postMessage(0);},d.ms||20);}else if(d.cmd==='stop'){if(id)clearInterval(id);id=null;}};";
     const w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
@@ -4774,10 +4974,15 @@
     let startTick=state.playhead; if(startTick<a||startTick>=b) startTick=a;
     state.lastPlayStart=startTick;
     state.playing=true; updateTransportBtns();
-    const mpt=(60000/state.bpm)/ticksPerBeat(), span=b-a, t0=explicitT0!=null?explicitT0:(performance.now()+START_DELAY);
+    const span=b-a, t0=explicitT0!=null?explicitT0:(performance.now()+START_DELAY);
     const evs=buildPassEvents(a,b); let idx=0; while(idx<evs.length && evs[idx].tick<startTick) idx++;
-    const msPerClock=60000/(state.bpm*24);
-    sched={a,b,mpt,span,t0,startTick,evs,idx,passIndex:0,msPerClock,clockIdx:0};
+    // MIDI Clock (0xF8) is a fixed-interval pulse train with no room for a
+    // tempo change mid-stream — it's generated once per playback session at
+    // whatever tempo governs the pass's start tick (a defensible judgement
+    // call: true variable-rate MIDI clock generation for hardware/MMV sync
+    // is out of scope here, same as most DAWs' basic clock-out).
+    const msPerClock=60000/(tempoSegAt(startTick).bpm*24);
+    sched={a,b,span,t0,startTick,evs,idx,passIndex:0,msPerClock,clockIdx:0};
     if(state.midiOut){
       if(!state.syncFollow) mSend([0xFA], t0);
       // Chase: send Note On for any notes already in progress at startTick
@@ -4879,12 +5084,12 @@
           // appearing mid-play (e.g. the metronome toggled on over an empty
           // project) were scheduled minutes into the future and never heard.
           // Pin it to the wall clock instead while the pass stays empty.
-          s.passIndex=Math.max(s.passIndex, Math.floor((now-s.t0)/(s.span*s.mpt)));
+          s.passIndex=Math.max(s.passIndex, schedPassIndexAt(s,now-s.t0));
           s.evs=rebuilt; break;
         }
         s.passIndex++; s.evs=rebuilt;
       }
-      const ev=s.evs[s.idx]; const t=s.t0+(s.passIndex*s.span + ev.tick - s.startTick)*s.mpt;
+      const ev=s.evs[s.idx]; const t=s.t0+schedElapsedMs(s,s.passIndex,ev.tick);
       if(t<=now+LOOKAHEAD){
         if(ev.click){ scheduleClickAt(t, ev.accent); }
         else if(state.midiOut){
@@ -4897,7 +5102,7 @@
     }
   }
   function visualFrame(now){ if(!state.playing||!sched) return; const s=sched;
-    state.playhead = (now<s.t0) ? s.startTick : s.a + wrapv((now-s.t0)/s.mpt + (s.startTick-s.a), s.span);
+    state.playhead = (now<s.t0) ? s.startTick : schedTickAtElapsed(s,now-s.t0);
     applyScrollLock(); updatePlayheadEl(); updatePlayPos(); rafVisual=requestAnimationFrame(visualFrame);
   }
   function stopTransport(){ if(rafVisual){ cancelAnimationFrame(rafVisual); rafVisual=null; } stopClock();
@@ -4946,7 +5151,7 @@
     // already moved on from 0 — using the exact math the very next
     // schedulerTick() call will use to decide what's due keeps the two in
     // lockstep no matter how far into the pass we already are.
-    let idx=0; while(idx<newEvs.length && s.t0+(s.passIndex*s.span+newEvs[idx].tick-s.startTick)*s.mpt<now) idx++;
+    let idx=0; while(idx<newEvs.length && s.t0+schedElapsedMs(s,s.passIndex,newEvs[idx].tick)<now) idx++;
     s.evs=newEvs; s.idx=idx;
   }
   function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn);
@@ -5012,6 +5217,8 @@
       }
       list.appendChild(row);
     });
+    renderTempoMapUI();
+    updateVariabilityIndicators();
   }
   function addTsMapChange(){
     const bar=Math.max(1,Math.round(+$('tsMapBar').value||1))-1;
@@ -5032,6 +5239,105 @@
     updateDuration(); resizeCanvases(); renderTsMapUI(); requestDraw();
   }
 
+  // ---------- Tempo map UI (mirrors the Time Sig map UI above) ----------
+  function renderTempoMapUI(){
+    const list=$('tempoMapList'); if(!list) return;
+    list.innerHTML='';
+    tempoMapSorted().forEach(s=>{
+      const {bar}=walkToTick(s.tick);
+      const row=document.createElement('div'); row.style.cssText='display:flex;align-items:center;gap:6px;';
+      const lbl=document.createElement('span'); lbl.textContent='Bar '+(bar+1)+': '+(Math.round(s.bpm*100)/100)+' BPM';
+      lbl.style.cssText='flex:1;color:var(--txt2);';
+      row.appendChild(lbl);
+      if(s.tick!==0){
+        const del=document.createElement('button'); del.textContent='×'; del.title='Remove this tempo change';
+        del.style.cssText='font-size:10px;padding:1px 5px;';
+        del.addEventListener('click',()=>removeTempoMapChange(s.tick));
+        row.appendChild(del);
+      }
+      list.appendChild(row);
+    });
+  }
+  function addTempoMapChange(){
+    const bar=Math.max(1,Math.round(+$('tempoMapBar').value||1))-1;
+    const bpm=clamp(Math.round((+$('tempoMapBpm').value||120)*100)/100,20,400);
+    pushUndo();
+    const tick=bar===0?0:Math.round(barToTick(bar));
+    const idx=state.tempoMap.findIndex(s=>s.tick===tick);
+    if(idx>=0) state.tempoMap[idx]={tick,bpm}; else state.tempoMap.push({tick,bpm});
+    state.tempoMap.sort((a,b)=>a.tick-b.tick);
+    if(bar===0){ state.bpm=bpm; syncInputs(); }
+    updateDuration(); renderTsMapUI(); requestDraw();
+  }
+  function removeTempoMapChange(tick){
+    if(tick===0) return;
+    pushUndo();
+    state.tempoMap=state.tempoMap.filter(s=>s.tick!==tick);
+    if(!state.tempoMap.length) state.tempoMap=[{tick:0,bpm:state.bpm}];
+    updateDuration(); renderTsMapUI(); requestDraw();
+  }
+  // Commits an Alt+drag-a-bar-line tempo-align gesture (see the rulerCanvas
+  // mousedown handler above). tick0 is the ORIGINAL, unmoved tick of the bar
+  // that was dragged; dropLocalX is the ruler-local pixel (rulerX()-space) it
+  // was released at. Only the segment immediately before tick0 changes tempo
+  // — everything before that segment's own start, and everything after
+  // tick0, is deliberately left untouched (matching Logic/Cubase "Adjust
+  // Tempo Using Beat Markers": the audio never moves, only the grid bends).
+  function commitTempoDrag(tick0,dropLocalX){
+    if(tick0<=0){ flash('Cannot retime the first bar — Alt+drag a later bar line instead'); return; }
+    const newSeconds=tickToSeconds(xToTick(dropLocalX)); // current (pre-edit) tick<->time mapping
+    const m=tempoMapSorted();
+    let prevTick=0;
+    for(const s of m){ if(s.tick<tick0) prevTick=s.tick; else break; }
+    const prevSeconds=tickToSeconds(prevTick);
+    const spanSec=newSeconds-prevSeconds, spanTicks=tick0-prevTick;
+    if(!(spanSec>0)||spanTicks<=0){ flash('Can\'t align there — drop point must land after the previous tempo marker'); return; }
+    const rawBpm=spanTicks/state.ppq*60/spanSec;
+    if(!isFinite(rawBpm)||rawBpm<=0){ flash('Invalid tempo for that drop point — try again'); return; }
+    const newBpm=clamp(Math.round(rawBpm*100)/100,20,400);
+    // Tempo currently governing tick0, captured BEFORE any mutation below —
+    // if we need to insert a fresh breakpoint at tick0 (step 6), it inherits
+    // this so the segment AFTER the dragged bar doesn't shift as a side
+    // effect of the drag.
+    const afterBpm=tempoSegAt(tick0).bpm;
+    pushUndo();
+    const prevIdx=state.tempoMap.findIndex(s=>s.tick===prevTick);
+    if(prevIdx>=0) state.tempoMap[prevIdx].bpm=newBpm; else state.tempoMap.push({tick:prevTick,bpm:newBpm});
+    if(!state.tempoMap.some(s=>s.tick===tick0)) state.tempoMap.push({tick:tick0,bpm:afterBpm});
+    state.tempoMap.sort((a,b)=>a.tick-b.tick);
+    if(prevTick===0){ state.bpm=state.tempoMap[0].bpm; syncInputs(); }
+    updateDuration(); renderTsMapUI(); requestDraw();
+    const {bar}=walkToTick(prevTick);
+    flash('Tempo aligned — bar '+(bar+1)+' is now '+newBpm+' BPM');
+  }
+  function updateVariabilityIndicators(){
+    const bpmEl=$('bpm'), tempoBadge=$('tempoVarBadge');
+    if(bpmEl&&tempoBadge){
+      const tm=tempoMapSorted();
+      if(tm.length>1){
+        bpmEl.classList.add('field-variable'); tempoBadge.classList.add('show');
+        const bpms=tm.map(s=>Math.round(s.bpm));
+        const n=tm.length-1;
+        tempoBadge.title='Tempo varies ('+n+' breakpoint'+(n>1?'s':'')+'): '+Math.min(...bpms)+'–'+Math.max(...bpms)+' BPM';
+      } else {
+        bpmEl.classList.remove('field-variable'); tempoBadge.classList.remove('show'); tempoBadge.title='';
+      }
+    }
+    const tsNumEl=$('tsNum'), tsDenEl=$('tsDen'), sigBadge=$('sigVarBadge');
+    if(tsNumEl&&tsDenEl&&sigBadge){
+      const tm=tsMapSorted();
+      if(tm.length>1){
+        tsNumEl.classList.add('field-variable'); tsDenEl.classList.add('field-variable'); sigBadge.classList.add('show');
+        const sigs=[]; tm.forEach(s=>{ const label=s.num+'/'+s.den; if(sigs[sigs.length-1]!==label) sigs.push(label); });
+        const n=tm.length-1;
+        const summary=sigs.length<=6?sigs.join(', '):(sigs.length+' distinct signatures');
+        sigBadge.title='Time signature varies ('+n+' change'+(n>1?'s':'')+'): '+summary;
+      } else {
+        tsNumEl.classList.remove('field-variable'); tsDenEl.classList.remove('field-variable'); sigBadge.classList.remove('show'); sigBadge.title='';
+      }
+    }
+  }
+
   // ---------- Inputs ----------
   function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; if($('audioLatencyMs')) $('audioLatencyMs').value=state.audioLatencyMs||0; renderTsMapUI(); }
   function setTool(t){ state.tool=t; [...$('tools').children].forEach(x=>x.classList.toggle('on',x.dataset.tool===t)); }
@@ -5040,7 +5346,7 @@
   $('quantStartBtn').addEventListener('click',e=>{ quantizeSelection('start', state.quantIterative||e.altKey); });
   $('quantEndBtn').addEventListener('click',e=>{ quantizeSelection('end', state.quantIterative||e.altKey); });
   $('quantIterBtn').addEventListener('click',()=>{ state.quantIterative=!state.quantIterative; $('quantIterBtn').classList.toggle('on',state.quantIterative); });
-  $('bpm').addEventListener('input',e=>{ state.bpm=clamp(+e.target.value||120,20,400); updateDuration(); requestDraw(); flash('Tempo changed — re-export Sync Track if using Follow MMV'); });
+  $('bpm').addEventListener('input',e=>{ state.bpm=clamp(+e.target.value||120,20,400); state.tempoMap[0].bpm=state.bpm; updateDuration(); renderTsMapUI(); requestDraw(); flash('Tempo changed — re-export Sync Track if using Follow MMV'); });
   $('bars').addEventListener('change',e=>{ state.bars=clamp(+e.target.value||4,1,999); updateDuration(); resizeCanvases(); });
   $('tsNum').addEventListener('change',e=>{ state.tsNum=clamp(+e.target.value||4,1,32); state.tsMap[0].num=state.tsNum; updateDuration(); resizeCanvases(); renderTsMapUI(); });
   $('tsDen').addEventListener('change',e=>{ state.tsDen=+e.target.value||4; state.tsMap[0].den=state.tsDen; updateDuration(); resizeCanvases(); renderTsMapUI(); });
@@ -5282,6 +5588,7 @@
   $('metroBtn').onclick=toggleMetronome;
   $('recCh').addEventListener('change',e=>{ state.recCh=e.target.value===''?null:+e.target.value; updateRecordBadge(); });
   $('tsMapAddBtn').addEventListener('click',addTsMapChange);
+  $('tempoMapAddBtn').addEventListener('click',addTempoMapChange);
   $('recOffsetMs').addEventListener('input',e=>{ state.recOffsetMs=+e.target.value||0; });
   $('recordBtn').addEventListener('contextmenu',e=>{
     e.preventDefault(); e.stopPropagation();
@@ -5289,7 +5596,7 @@
     if(open) populateRecCh();
   });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
-    state.playhead=clamp(Math.round(sec*state.bpm/60*ticksPerBeat()),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
+    state.playhead=clamp(Math.round(secondsToTicks(sec)),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
   $('midiEnable').onclick=initMidi; $('midiOut').addEventListener('change',e=>setMidiOutById(e.target.value));
   // Skip the manual "Enable" click on repeat launches: if this origin already
   // has MIDI permission granted (from a previous session), silently connect
@@ -6764,7 +7071,7 @@
     schedWorker=makeWorker();
     // Setup panel toggle
     $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
-    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); } });
+    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); $('tempoMapBar').value=nearestBarAt(state.playhead); } });
     // Note Info manual minimize/maximize — same ▾/▸ two-state convention as
     // the CC lane toggle, independent of the existing auto-collapse (see
     // updateNoteInfo()); a UI-only in-memory preference, not persisted.
