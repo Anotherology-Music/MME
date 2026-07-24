@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.31
+  MMV MIDI & CC Curve Editor v0.9.32
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -659,6 +659,26 @@
   the span when nothing is selected (a loop range sets the span instead),
   so it's now dimmed and unclickable whenever a loop range is active, in
   both the basic and Advanced Generate panels.
+  v0.9.32 Undo/redo no longer knocks you out of what you were doing: it used
+  to unconditionally clear the piano-roll note selection and rebuild every CC
+  lane's DOM from scratch on every single call, silently dropping keyboard
+  focus from whatever field you were mid-edit in and blanking the CC point
+  selection. Both are now restored afterward — note selection survives by id,
+  CC point selection/active point and DOM focus (lane Name/Value/Position/
+  Steps/Tags fields) are re-matched by lane + tick position, since the
+  underlying objects don't survive a revert but their ids/ticks do. The Shift
+  tool now highlights the segment under the cursor on hover, not just while
+  actively dragging, so there's a visual cue before you commit to grabbing a
+  line. New "Import Drum Map" (Setup › Files): reads a Cubase .drm file and
+  applies its note names to piano-roll keys on a chosen channel (defaults to
+  Ch10/GM percussion) — built for importing General MIDI and custom drum
+  maps so notes show real names instead of numbers. A review dialog lists
+  every named note with a checkbox before anything is applied; generic
+  placeholder names ("Sound N", "---") start unticked since most stock/blank
+  Cubase maps are mostly that. Reads the INote column (the note being
+  described), not ONote — some Cubase maps are a note-remap table where ONote
+  points at an entirely different note, which would attach the name to the
+  wrong key.
 -->
 
 
@@ -1430,6 +1450,10 @@
             <input type="file" id="isfFileInput" accept=".fs,.glsl,.isf,.frag" style="display:none">
             <button id="isfMigrateBtn" title="Review which imported ISF parameters are automated vs. static, bake updated defaults, and export a wiring sheet for MMV's Source/Feature/CC + Modifiers">&#x21C4; Migrate to MMV</button>
           </div>
+          <div class="setup-row">
+            <button id="drumMapImportBtn" title="Import a Cubase drum map (.drm) to name piano-roll keys on a chosen channel — e.g. General MIDI percussion note names">&#x1F941; Import Drum Map</button>
+            <input type="file" id="drumMapFileInput" accept=".drm,.xml" style="display:none">
+          </div>
         </div>
         <div class="setup-section" id="chNamesSection">
           <div class="setup-title">Channel Names</div>
@@ -2198,9 +2222,86 @@
       const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; updateLaneCompactness(lane._row); } });
     refreshMuteSoloUI();
     state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
-    state.selection.clear(); syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
-  function undo(){ if(!undoStack.length) return; redoStack.push(snapshot()); applyState(undoStack.pop()); updateUndoBtns(); }
-  function redo(){ if(!redoStack.length) return; undoStack.push(snapshot()); applyState(redoStack.pop()); updateUndoBtns(); }
+    // Note selection is stored by id (stable across a revert), not object
+    // reference — drop only ids that no longer exist (e.g. undoing the add
+    // of a note that was selected) instead of wiping the whole selection on
+    // every single call. This is also what loadProject()/crash-recovery want:
+    // a fresh project's ids never collide with a leftover selection anyway,
+    // so filtering is a no-op there and a real fix for undo/redo.
+    const validNoteIds=new Set(state.notes.map(n=>n.id));
+    state.selection=new Set([...state.selection].filter(id=>validNoteIds.has(id)));
+    syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
+  // ---------- Undo/redo view preservation ----------
+  // applyState() necessarily tears down and rebuilds every lane's DOM (see
+  // its own comment above on why — points/lanes are wholesale-replaced
+  // objects, not patched in place), which would otherwise silently drop
+  // keyboard focus from whatever field you were editing and blank out the
+  // CC lane point selection every single undo/redo. Capture "which lane +
+  // field + point (by tick, not object reference)" beforehand and re-derive
+  // the equivalent afterward — ids and tick positions are what actually
+  // survive a revert, not the JS objects themselves.
+  function captureViewState(){
+    const el=document.activeElement;
+    let focus=null;
+    if(el && el!==document.body){
+      const laneRow=el.closest && el.closest('.lane');
+      if(laneRow){
+        const role = el.classList.contains('lname')?'name'
+          : el.classList.contains('val-input')?'val'
+          : el.classList.contains('pos-input')?'pos'
+          : el.classList.contains('stepsn')?'steps'
+          : el.classList.contains('ltags')?'tags' : null;
+        if(role) focus={laneId:+laneRow.dataset.id,role,selStart:el.selectionStart,selEnd:el.selectionEnd};
+      } else if(el.id){
+        focus={elId:el.id,selStart:el.selectionStart,selEnd:el.selectionEnd};
+      }
+    }
+    const ccSelByLane=new Map();
+    ccSel.forEach(p=>{
+      for(const l of state.ccLanes){ if(l.points.indexOf(p)>=0){ if(!ccSelByLane.has(l.id)) ccSelByLane.set(l.id,[]); ccSelByLane.get(l.id).push(p.t); break; } }
+    });
+    const activeLane=state.ccLanes.find(l=>l.id===state.activeLaneId);
+    const activePtT=activeLane&&activeLane._activePt?activeLane._activePt.t:null;
+    return {focus,ccSelByLane,activeLaneId:state.activeLaneId,activePtT};
+  }
+  function restoreViewState(v){
+    if(!v) return;
+    ccSel.clear();
+    v.ccSelByLane.forEach((ticks,laneId)=>{
+      const lane=state.ccLanes.find(l=>l.id===laneId); if(!lane) return;
+      ticks.forEach(t=>{ const p=lane.points.find(pp=>pp.t===t); if(p) ccSel.add(p); });
+    });
+    if(v.activeLaneId!=null){
+      const lane=state.ccLanes.find(l=>l.id===v.activeLaneId);
+      if(lane && v.activePtT!=null){
+        const p=lane.points.find(pp=>pp.t===v.activePtT);
+        if(p){ lane._activePt=p; updateLaneValInput(lane); }
+      }
+    }
+    if(v.focus){
+      let el=null;
+      if(v.focus.elId) el=$(v.focus.elId);
+      else{
+        const lane=state.ccLanes.find(l=>l.id===v.focus.laneId);
+        if(lane){
+          el = v.focus.role==='name'?lane._nameInput
+             : v.focus.role==='val'?lane._valInput
+             : v.focus.role==='pos'?lane._posInput
+             : v.focus.role==='steps'?lane._stepsInput
+             : v.focus.role==='tags'?lane._tagsInput : null;
+        }
+      }
+      if(el){
+        el.focus();
+        if(typeof el.setSelectionRange==='function' && v.focus.selStart!=null){
+          try{ el.setSelectionRange(v.focus.selStart,v.focus.selEnd); }catch(e){}
+        }
+      }
+    }
+    requestDraw();
+  }
+  function undo(){ if(!undoStack.length) return; const v=captureViewState(); redoStack.push(snapshot()); applyState(undoStack.pop()); updateUndoBtns(); restoreViewState(v); }
+  function redo(){ if(!redoStack.length) return; const v=captureViewState(); undoStack.push(snapshot()); applyState(redoStack.pop()); updateUndoBtns(); restoreViewState(v); }
   function updateUndoBtns(){ $('undoBtn').disabled=!undoStack.length; $('redoBtn').disabled=!redoStack.length; }
 
   // ---------- Drawing (virtualised: only the visible slice) ----------
@@ -2583,6 +2684,8 @@
       ctx.moveTo(tickToX(d.t0),val2yForLane(h,d.v0,lane)); ctx.lineTo(tickToX(d.t1),val2yForLane(h,d.v1,lane)); ctx.stroke(); ctx.setLineDash([]); }
     if(ccDrag&&ccDrag.mode==='segShift'&&ccDrag.lane===lane){ ctx.strokeStyle='#ffffff'; ctx.lineWidth=3; ctx.beginPath();
       ctx.moveTo(tickToX(ccDrag.p0.t),val2yForLane(h,ccDrag.p0.v,lane)); ctx.lineTo(tickToX(ccDrag.p1.t),val2yForLane(h,ccDrag.p1.v,lane)); ctx.stroke(); ctx.lineWidth=2; }
+    else if(!ccDrag&&segHover&&segHover.lane===lane){ ctx.strokeStyle=getCss('--accent'); ctx.lineWidth=3; ctx.beginPath();
+      ctx.moveTo(tickToX(segHover.p0.t),val2yForLane(h,segHover.p0.v,lane)); ctx.lineTo(tickToX(segHover.p1.t),val2yForLane(h,segHover.p1.v,lane)); ctx.stroke(); ctx.lineWidth=2; }
     if(ccDrag&&ccDrag.mode==='marquee'&&ccDrag.lane===lane){ ctx.strokeStyle=getCss('--accent'); ctx.lineWidth=1; ctx.setLineDash([3,3]);
       ctx.strokeRect(Math.min(ccDrag.x0,ccDrag.x1),ccDrag.y0,Math.abs(ccDrag.x1-ccDrag.x0),ccDrag.y1-ccDrag.y0); ctx.setLineDash([]); }
     if(chMuted) ctx.globalAlpha=1;
@@ -3001,6 +3104,11 @@
     return {seg:best,d:bd};
   }
   let ccDrag=null, ccSel=new Set();
+  // Which segment (if any) the mouse is currently hovering while the Shift
+  // tool is active — a visual cue that a line, not just points, is grabbable
+  // here. Cleared on tool switch / mouseleave / drag start (the drag itself
+  // draws its own, differently-coloured, highlight — see drawLane()).
+  let segHover=null;
   function clearCcSel(lane){ if(typeof window._clearAdvPreview==='function') window._clearAdvPreview(lane); ccSel.clear(); }
   // "step 11/12" — which of the lane's Steps levels a value lands on. Empty
   // string when Steps is off, so callers can just check truthiness.
@@ -3078,7 +3186,18 @@
       const near=nearestCCPoint(lane,x,y);
       if(near.p&&near.d<7){ lane._activePt=near.p; ccDrag={lane,mode:'movept',pt:near.p,origT:near.p.t,origV:near.p.v}; updateLaneValInput(lane); return; }
       ccDrag={lane,mode:'pencil',lastT:t,lastV:v}; upsertPoint(lane,t,v); requestDraw(); });
-    cv.addEventListener('mousemove',e=>{ const {x,y}=laneCoords(lane,e); updateStatusCC(lane,x,y); });
+    cv.addEventListener('mousemove',e=>{ const {x,y}=laneCoords(lane,e); updateStatusCC(lane,x,y);
+      if(ccDrag){ return; }
+      if(state.tool==='segShift'){
+        const near=nearestCCSegment(lane,x,y);
+        const hit=(near.seg&&near.d<SEG_HIT_PX)?near.seg:null;
+        const wasHit=segHover&&segHover.lane===lane?segHover.p0:null;
+        if(hit&&wasHit!==hit.p0){ segHover={lane,p0:hit.p0,p1:hit.p1}; requestDraw(); }
+        else if(!hit&&segHover&&segHover.lane===lane){ segHover=null; requestDraw(); }
+        cv.style.cursor=hit?'ns-resize':'';
+      } else if(segHover&&segHover.lane===lane){ segHover=null; cv.style.cursor=''; requestDraw(); }
+    });
+    cv.addEventListener('mouseleave',()=>{ if(segHover&&segHover.lane===lane){ segHover=null; requestDraw(); } if(!ccDrag) cv.style.cursor=''; });
     cv.addEventListener('dblclick',e=>{ const {x,y}=laneCoords(lane,e); const near=nearestCCPoint(lane,x,y);
       if(near.p&&near.d<14){ pushUndo(); removePoint(lane,near.p); requestDraw(); }
       else { const t=(state.snap==='off'||e.shiftKey)?xToTick(x):snapT(xToTick(x)); pushUndo(); upsertPoint(lane,t,y2valForLane(y,cv.height,lane)); requestDraw(); } });
@@ -3686,6 +3805,11 @@
     leftInner.appendChild(row2); leftInner.appendChild(row3);
     left.appendChild(leftInner);
     lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
+    // Stable-by-role refs (not otherwise needed by the lane itself) so undo/
+    // redo's view-preservation can refocus "the same field on the same lane"
+    // after applyState() tears down and rebuilds this row — see
+    // captureViewState/restoreViewState.
+    lane._nameInput=lname; lane._stepsInput=stepsInput; lane._tagsInput=ltags;
 
     const sc=document.createElement('div'); sc.className='scroll hx lane-canvas-scroll';
     const cv=document.createElement('canvas'); sc.appendChild(cv);
@@ -4629,6 +4753,125 @@
     Object.values(r.pbMap||{}).forEach(l=>chs.add(l.ch));
     Object.values(r.cpMap||{}).forEach(l=>chs.add(l.ch));
     return chs;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // DRUM MAP IMPORT — Cubase .drm files are a simple XML dialect:
+  // <DrumMap><list name="Map"><item> entries each carrying INote/ONote/Name
+  // (plus a lot of Cubase-only fields — quantize grid, head symbol, voice,
+  // etc — with no MME equivalent, which are ignored). INote is the note that
+  // this map entry is FOR — i.e. the note whose name this is — which matters
+  // because some drum maps are a "note remap" table converting one kit's
+  // layout to another's, where ONote points at a completely different note
+  // than the one being described. Using ONote there would attach names to
+  // the wrong keys; INote is always correct for naming purposes.
+  // ═══════════════════════════════════════════════════════════════
+  function parseDrumMapXml(xmlText){
+    const doc=new DOMParser().parseFromString(xmlText,'application/xml');
+    if(doc.querySelector('parsererror')) throw new Error('Not a valid XML file');
+    const mapList=doc.querySelector('DrumMap > list[name="Map"]');
+    if(!mapList) throw new Error('Not a Cubase drum map (.drm) — no <DrumMap><list name="Map"> found');
+    const out=[];
+    mapList.querySelectorAll(':scope > item').forEach(item=>{
+      const inoteEl=item.querySelector(':scope > int[name="INote"]');
+      const nameEl=item.querySelector(':scope > string[name="Name"]');
+      if(!inoteEl||!nameEl) return;
+      const note=parseInt(inoteEl.getAttribute('value'),10);
+      const name=(nameEl.getAttribute('value')||'').trim();
+      if(isNaN(note)||note<0||note>127||!name) return;
+      out.push({note,name});
+    });
+    out.sort((a,b)=>a.note-b.note);
+    return out;
+  }
+  function handleDrumMapFile(file){
+    const fr=new FileReader();
+    fr.onload=()=>{
+      let entries;
+      try{ entries=parseDrumMapXml(fr.result); }
+      catch(e){ flash('Drum map import failed: '+e.message); return; }
+      if(!entries.length){ flash('No named notes found in that drum map'); return; }
+      showDrumMapImportDialog(entries,file.name);
+    };
+    fr.readAsText(file);
+  }
+  // Review dialog — mirrors showMidiImportDialog's dialog styling. Rows tick
+  // by default UNLESS their name is a generic "Sound N" placeholder (most of
+  // a stock/blank Cubase map is exactly that — see the sample files this was
+  // built from) so importing a mostly-empty map doesn't clobber 100+ keys
+  // with meaningless labels; still listed (unticked) so they can be opted
+  // back in individually if genuinely wanted.
+  function showDrumMapImportDialog(entries, filename){
+    const existing=document.getElementById('drumMapImportDialog'); if(existing) existing.remove();
+    const dlg=document.createElement('dialog');
+    dlg.id='drumMapImportDialog';
+    dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+      +'width:min(480px,95vw);max-height:85vh;overflow:hidden;display:flex;flex-direction:column;';
+
+    const hdr=document.createElement('div');
+    hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;';
+    const hdrTitle=document.createElement('div'); hdrTitle.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;'; hdrTitle.textContent='Import Drum Map';
+    const hdrFile=document.createElement('div'); hdrFile.style.cssText='font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;'; hdrFile.textContent=filename;
+    const hdrMsg=document.createElement('div'); hdrMsg.style.cssText='font-size:12px;color:#7a8099;margin-top:8px;'; hdrMsg.textContent='Tick the notes to name, choose the channel, then Import. Generic placeholder names ("Sound N", "---") start unticked.';
+    hdr.appendChild(hdrTitle); hdr.appendChild(hdrFile); hdr.appendChild(hdrMsg);
+    dlg.appendChild(hdr);
+
+    const chRow=document.createElement('div');
+    chRow.style.cssText='padding:10px 18px;display:flex;align-items:center;gap:8px;font-size:12px;border-bottom:1px solid #2c313b;';
+    const chLbl=document.createElement('span'); chLbl.textContent='Channel'; chLbl.style.color='#7a8099';
+    const chSel=document.createElement('select'); chSel.style.cssText='background:#23272f;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:3px 6px;';
+    for(let c=0;c<16;c++){ const o=document.createElement('option'); o.value=c; o.textContent='Ch'+(c+1)+(c===9?' (GM percussion)':''); chSel.appendChild(o); }
+    chSel.value=String(state.viewCh!=null?state.viewCh:9);
+    const selAllBtn=document.createElement('button'); selAllBtn.type='button'; selAllBtn.textContent='All';
+    selAllBtn.style.cssText='margin-left:auto;background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;';
+    const selNoneBtn=document.createElement('button'); selNoneBtn.type='button'; selNoneBtn.textContent='None'; selNoneBtn.style.cssText=selAllBtn.style.cssText+'margin-left:0;';
+    chRow.appendChild(chLbl); chRow.appendChild(chSel); chRow.appendChild(selAllBtn); chRow.appendChild(selNoneBtn);
+    dlg.appendChild(chRow);
+
+    const body=document.createElement('div');
+    body.style.cssText='padding:6px 18px;font-size:12px;overflow-y:auto;flex:1 1 auto;';
+    const rowRefs=[];
+    entries.forEach(entry=>{
+      // Cubase's own blank-template placeholders — seen in the wild as both
+      // "Sound N" (numbered) and a bare run of dashes, depending which
+      // template the map started from.
+      const isPlaceholder=/^Sound\s+\d+$/i.test(entry.name)||/^-+$/.test(entry.name);
+      const row=document.createElement('label');
+      row.style.cssText='display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;';
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!isPlaceholder;
+      const noteSpan=document.createElement('span'); noteSpan.style.cssText='font-family:monospace;color:#7a8099;width:76px;flex-shrink:0;'; noteSpan.textContent=entry.note+' ('+noteName(entry.note)+')';
+      const nameSpan=document.createElement('span'); nameSpan.textContent=entry.name; nameSpan.style.color=isPlaceholder?'#5a6075':'#c8cdd8';
+      row.appendChild(cb); row.appendChild(noteSpan); row.appendChild(nameSpan);
+      body.appendChild(row);
+      rowRefs.push({cb,entry});
+    });
+    dlg.appendChild(body);
+    selAllBtn.addEventListener('click',()=>rowRefs.forEach(r=>{ r.cb.checked=true; }));
+    selNoneBtn.addEventListener('click',()=>rowRefs.forEach(r=>{ r.cb.checked=false; }));
+
+    const footer=document.createElement('div');
+    footer.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;display:flex;gap:8px;align-items:center;';
+    const cancelBtn=document.createElement('button'); cancelBtn.textContent='Cancel';
+    cancelBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;margin-right:auto;';
+    const importBtnEl=document.createElement('button'); importBtnEl.textContent='Import';
+    importBtnEl.style.cssText='background:#4fa3ff;color:#0d0f14;border:none;border-radius:4px;padding:6px 18px;cursor:pointer;font-size:13px;font-weight:700;';
+    footer.appendChild(cancelBtn); footer.appendChild(importBtnEl);
+    dlg.appendChild(footer);
+
+    document.body.appendChild(dlg);
+    dlg.showModal();
+    cancelBtn.addEventListener('click',()=>{ dlg.close(); dlg.remove(); });
+    dlg.addEventListener('cancel',()=>{ dlg.remove(); });
+    importBtnEl.addEventListener('click',()=>{
+      const ch=+chSel.value;
+      const toApply=rowRefs.filter(r=>r.cb.checked);
+      dlg.close(); dlg.remove();
+      if(!toApply.length){ flash('Nothing ticked — no names imported'); return; }
+      pushUndo();
+      toApply.forEach(r=>{ state.pitchNames[ch+'_'+r.entry.note]=r.entry.name; });
+      requestDraw();
+      flash('Named '+toApply.length+' key'+(toApply.length!==1?'s':'')+' on Ch'+(ch+1)+' from '+filename);
+    });
   }
 
   // ── Show the "existing project data" choice dialog ─────────────
@@ -5700,7 +5943,8 @@
 
   // ---------- Inputs ----------
   function syncInputs(){ $('bpm').value=state.bpm; $('bars').value=state.bars; $('ppq').value=state.ppq; $('tsNum').value=state.tsNum; $('tsDen').value=state.tsDen; if($('projectName')) $('projectName').value=state.projectName||''; if($('audioLatencyMs')) $('audioLatencyMs').value=state.audioLatencyMs||0; renderTsMapUI(); }
-  function setTool(t){ state.tool=t; [...$('tools').children].forEach(x=>x.classList.toggle('on',x.dataset.tool===t)); }
+  function setTool(t){ state.tool=t; [...$('tools').children].forEach(x=>x.classList.toggle('on',x.dataset.tool===t));
+    if(t!=='segShift'&&segHover){ segHover=null; requestDraw(); } }
   $('tools').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; setTool(b.dataset.tool); });
   $('snap').addEventListener('change',e=>{ state.snap=e.target.value; requestDraw(); });
   $('quantStartBtn').addEventListener('click',e=>{ quantizeSelection('start', state.quantIterative||e.altKey); });
@@ -5834,6 +6078,8 @@
   $('scrollLockBtn').addEventListener('click',()=>{ state.scrollLock=!state.scrollLock; $('scrollLockBtn').classList.toggle('on',state.scrollLock);
     if(state.scrollLock) applyScrollLock(); });
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
+  $('drumMapImportBtn').onclick=()=>$('drumMapFileInput').click();
+  $('drumMapFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f) return; handleDrumMapFile(f); e.target.value=''; });
   $('saveProjectBtn').onclick=saveProject;
   $('loadProjectBtn').addEventListener('click',e=>{ e.stopPropagation();
     if(!hasFSA){ $('projectFileInput').click(); return; }

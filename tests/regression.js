@@ -71,6 +71,10 @@ function buildTestHtml() {
       '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft + GUTTER, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
       '  window._TEST_pushUndo = pushUndo;',
       '  window._TEST_undo = undo;',
+      '  window._TEST_redo = redo;',
+      '  window._TEST_segHover = () => segHover ? { laneId: segHover.lane.id, t0: segHover.p0.t, t1: segHover.p1.t } : null;',
+      '  window._TEST_parseDrumMapXml = (xml) => parseDrumMapXml(xml);',
+      '  window._TEST_showDrumMapImportDialog = (entries, filename) => showDrumMapImportDialog(entries, filename);',
       '  window._TEST_play = (t0) => play(t0);',
       '  window._TEST_pause = () => pause();',
       '  window._TEST_stop = () => stop();',
@@ -247,6 +251,64 @@ async function run() {
     const afterRedo = await page.evaluate(() => window._TEST_state.notes.length);
     check('undo/redo roundtrip after delete', before === 1 && afterDelete === 0 && afterUndo === 1 && afterRedo === 0,
       { before, afterDelete, afterUndo, afterRedo });
+  });
+
+  await withPage(browser, async (page) => {
+    // Undo/redo must only revert DATA — not the current note selection.
+    // applyState() replaces every note object wholesale, so this can only
+    // survive by id, not object reference.
+    const note = await page.evaluate(() => {
+      const n = { id: window._TEST_state.nextId++, pitch: 64, start: 480, length: 240, vel: 100, ch: 0 };
+      window._TEST_state.notes.push(n);
+      window._TEST_state.selection.clear(); window._TEST_state.selection.add(n.id);
+      return n;
+    });
+    await page.evaluate(() => window._TEST_pushUndo());
+    await page.evaluate((id) => { window._TEST_state.notes.find(n => n.id === id).vel = 90; }, note.id);
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(50);
+    const stillSelected = await page.evaluate((id) => window._TEST_state.selection.has(id), note.id);
+    check('undo does not clear the piano-roll note selection', stillSelected === true, stillSelected);
+  });
+
+  await withPage(browser, async (page) => {
+    // Undo/redo must not steal keyboard focus from a lane field you were
+    // mid-edit in — applyState() tears down and rebuilds every lane's DOM,
+    // so this only works if focus is explicitly restored afterward.
+    const laneId = await page.evaluate(() => window._TEST_addLane(30, 0));
+    const nameInput = await page.evaluateHandle((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._nameInput, laneId);
+    await nameInput.asElement().click();
+    await page.evaluate(() => window._TEST_pushUndo());
+    await page.evaluate((laneId) => { window._TEST_state.ccLanes.find(l => l.id === laneId).name = 'Renamed'; }, laneId);
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(50);
+    const stillFocused = await page.evaluate((laneId) => document.activeElement === window._TEST_state.ccLanes.find(l => l.id === laneId)._nameInput, laneId);
+    check('undo restores keyboard focus to the same lane\'s Name field after the DOM rebuild', stillFocused === true, stillFocused);
+  });
+
+  await withPage(browser, async (page) => {
+    // Same for the CC lane point selection (ccSel) and active point — these
+    // are object references into lane.points, which applyState() entirely
+    // replaces with new objects every call, so re-matching by tick (not
+    // reference) is the only thing that can make this survive.
+    const laneId = await page.evaluate(() => window._TEST_addLane(31, 0));
+    await page.evaluate((laneId) => window._TEST_upsertPoint(laneId, 960, 64), laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="select"]');
+    const pt = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 960, 64), laneId);
+    await page.mouse.click(pt.x, pt.y);
+    await page.waitForTimeout(50);
+    await page.evaluate(() => window._TEST_pushUndo());
+    await page.evaluate((laneId) => { window._TEST_state.ccLanes.find(l => l.id === laneId).points[0].v = 100; }, laneId);
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(50);
+    const afterUndo = await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId);
+      return { valInputValue: lane._valInput.value, hasActivePt: !!lane._activePt };
+    }, laneId);
+    check('undo re-selects the same CC point (by tick) after the lane DOM/points rebuild',
+      afterUndo.hasActivePt === true && afterUndo.valInputValue === '64', afterUndo);
   });
 
   await withPage(browser, async (page) => {
@@ -1222,6 +1284,42 @@ async function run() {
     const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
     check('Shift tool: clicking away from any segment leaves points untouched',
       pts.length === 2 && pts.every(p => p.v === 64), pts);
+  });
+
+  await withPage(browser, async (page) => {
+    // Hovering a segment (no click) with the Shift tool active should light
+    // it up — the visual cue that a line, not just points, is grabbable —
+    // and clear again once the mouse leaves the segment or the tool changes.
+    const laneId = await page.evaluate(() => window._TEST_addLane(27, 0));
+    await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId); lane.points = [];
+      window._TEST_upsertPoint(laneId, 960, 64); window._TEST_upsertPoint(laneId, 2880, 64);
+    }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+
+    const before = await page.evaluate(() => window._TEST_segHover());
+    check('no hover highlight before the mouse moves over any segment', before === null, before);
+
+    const mid = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 64), laneId);
+    await page.mouse.move(mid.x, mid.y);
+    await page.waitForTimeout(50);
+    const over = await page.evaluate(() => window._TEST_segHover());
+    check('Shift tool: hovering a segment sets the hover highlight to that segment',
+      over && over.laneId === laneId && over.t0 === 960 && over.t1 === 2880, over);
+
+    const far = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 100, 64), laneId);
+    await page.mouse.move(far.x, far.y);
+    await page.waitForTimeout(50);
+    const away = await page.evaluate(() => window._TEST_segHover());
+    check('moving off the segment clears the hover highlight', away === null, away);
+
+    await page.mouse.move(mid.x, mid.y);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="select"]');
+    const afterToolSwitch = await page.evaluate(() => window._TEST_segHover());
+    check('switching away from the Shift tool clears any active hover highlight', afterToolSwitch === null, afterToolSwitch);
   });
 
   // ---------------- Quantise ----------------
@@ -6480,6 +6578,120 @@ async function run() {
     const after = await page.evaluate(() => window._TEST_state.tempoMap.slice());
     check('updating the tempo marker popover changes that breakpoint\'s BPM in place',
       after.length === 2 && after.some(s => s.tick === 1920 && Math.abs(s.bpm - 160) < 0.01), after);
+  });
+
+  // ---------------- Drum Map (.drm) import ----------------
+
+  // A minimal Cubase-shaped drum map: one generic "Sound N" placeholder, one
+  // normal GM-style entry (INote===ONote), and one entry shaped like the
+  // user's "note remap" example (85bc7f6a-DM2_IMAP_to_DM2_GM.drm) where
+  // ONote points at a completely different note than the one being named —
+  // proving the parser reads INote, not ONote.
+  const SAMPLE_DRM = `<?xml version="1.0" encoding="utf-8"?>
+<DrumMap>
+   <string name="Name" value="Test Map" wide="true"/>
+   <list name="Quantize" type="list">
+      <item><int name="Grid" value="4"/></item>
+   </list>
+   <list name="Map" type="list">
+      <item>
+         <int name="INote" value="0"/>
+         <int name="ONote" value="0"/>
+         <int name="Channel" value="9"/>
+         <string name="Name" value="Sound 1" wide="true"/>
+      </item>
+      <item>
+         <int name="INote" value="35"/>
+         <int name="ONote" value="35"/>
+         <int name="Channel" value="9"/>
+         <string name="Name" value="Acoustic Bass Drum" wide="true"/>
+      </item>
+      <item>
+         <int name="INote" value="25"/>
+         <int name="ONote" value="37"/>
+         <int name="Channel" value="9"/>
+         <string name="Name" value="Snare Sidestick" wide="true"/>
+      </item>
+      <item>
+         <int name="INote" value="5"/>
+         <int name="ONote" value="5"/>
+         <int name="Channel" value="9"/>
+         <string name="Name" value="---" wide="true"/>
+      </item>
+   </list>
+</DrumMap>`;
+
+  await withPage(browser, async (page) => {
+    const entries = await page.evaluate((xml) => window._TEST_parseDrumMapXml(xml), SAMPLE_DRM);
+    check('parseDrumMapXml extracts one entry per named note', entries.length === 4, entries);
+    check('parseDrumMapXml keys entries by INote, not ONote — the remap-table case',
+      entries.some(e => e.note === 25 && e.name === 'Snare Sidestick') && !entries.some(e => e.note === 37),
+      entries);
+    check('parseDrumMapXml keeps a plain INote===ONote entry\'s name correctly',
+      entries.some(e => e.note === 35 && e.name === 'Acoustic Bass Drum'), entries);
+    check('parseDrumMapXml still includes generic "Sound N" placeholder entries (dialog decides ticked/unticked)',
+      entries.some(e => e.note === 0 && e.name === 'Sound 1'), entries);
+  });
+
+  await withPage(browser, async (page) => {
+    const err = await page.evaluate(() => {
+      try { window._TEST_parseDrumMapXml('<NotADrumMap/>'); return null; }
+      catch (e) { return e.message; }
+    });
+    check('parseDrumMapXml rejects a non-drum-map XML file with a clear error', typeof err === 'string' && err.length > 0, err);
+  });
+
+  await withPage(browser, async (page) => {
+    const entries = await page.evaluate((xml) => window._TEST_parseDrumMapXml(xml), SAMPLE_DRM);
+    await page.evaluate((entries) => window._TEST_showDrumMapImportDialog(entries, 'Test Map.drm'), entries);
+    await page.waitForTimeout(50);
+    const dlg = await page.evaluate(() => {
+      const d = document.getElementById('drumMapImportDialog');
+      const rows = [...d.querySelectorAll('label')].map(l => ({
+        checked: l.querySelector('input[type=checkbox]').checked,
+        text: l.textContent,
+      }));
+      return { open: d.open, filename: d.querySelector('div[style*="monospace"]').textContent, rows };
+    });
+    check('Import Drum Map dialog opens showing the source filename', dlg.open && dlg.filename === 'Test Map.drm', dlg.filename);
+    const soundRow = dlg.rows.find(r => r.text.includes('Sound 1'));
+    const dashRow = dlg.rows.find(r => r.text.endsWith('---'));
+    const bassRow = dlg.rows.find(r => r.text.includes('Acoustic Bass Drum'));
+    check('generic "Sound N" and "---" placeholder rows start unticked; real drum names start ticked',
+      soundRow && soundRow.checked === false && dashRow && dashRow.checked === false && bassRow && bassRow.checked === true, dlg.rows);
+
+    await page.click('#drumMapImportDialog button:has-text("Import")');
+    await page.waitForTimeout(50);
+    const pitchNames = await page.evaluate(() => window._TEST_state.pitchNames);
+    check('Import writes only the ticked entries into state.pitchNames, keyed by channel_note (INote)',
+      pitchNames['9_35'] === 'Acoustic Bass Drum' && pitchNames['9_25'] === 'Snare Sidestick' && pitchNames['9_0'] === undefined && pitchNames['9_5'] === undefined,
+      pitchNames);
+  });
+
+  await withPage(browser, async (page) => {
+    // Cancel makes no changes at all.
+    const entries = await page.evaluate((xml) => window._TEST_parseDrumMapXml(xml), SAMPLE_DRM);
+    await page.evaluate((entries) => window._TEST_showDrumMapImportDialog(entries, 'Test Map.drm'), entries);
+    await page.waitForTimeout(50);
+    await page.click('#drumMapImportDialog button:has-text("Cancel")');
+    await page.waitForTimeout(50);
+    const pitchNames = await page.evaluate(() => window._TEST_state.pitchNames);
+    check('Cancel closes the drum map dialog without writing any names', Object.keys(pitchNames).length === 0, pitchNames);
+  });
+
+  await withPage(browser, async (page) => {
+    // "All"/"None" buttons and picking a different channel.
+    const entries = await page.evaluate((xml) => window._TEST_parseDrumMapXml(xml), SAMPLE_DRM);
+    await page.evaluate((entries) => window._TEST_showDrumMapImportDialog(entries, 'Test Map.drm'), entries);
+    await page.waitForTimeout(50);
+    await page.click('#drumMapImportDialog button:has-text("All")');
+    await page.selectOption('#drumMapImportDialog select', '3'); // Ch4
+    await page.click('#drumMapImportDialog button:has-text("Import")');
+    await page.waitForTimeout(50);
+    const pitchNames = await page.evaluate(() => window._TEST_state.pitchNames);
+    check('"All" ticks every row (including "Sound 1") and the chosen channel is used for every key',
+      pitchNames['3_0'] === 'Sound 1' && pitchNames['3_35'] === 'Acoustic Bass Drum' && pitchNames['3_25'] === 'Snare Sidestick',
+      pitchNames);
   });
 
   await browser.close();
