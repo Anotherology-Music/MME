@@ -44,6 +44,7 @@ function buildTestHtml() {
       '  window._TEST_onMidiIn = onMidiIn;',
       '  window._TEST_sched = () => sched;',
       '  window._TEST_updateNoteInfo = updateNoteInfo;',
+      '  window._TEST_updateLoopStatus = () => updateLoopStatus();',
       '  window._TEST_snapshot = snapshot;',
       '  window._TEST_applyState = applyState;',
       '  window._TEST_buildMidi = (opts) => Array.from(buildMidi(opts));',
@@ -1108,6 +1109,121 @@ async function run() {
       !!startPt && !!endPt && endPt.v === startPt.v, { pts, startPt, endPt });
   });
 
+  // ---------------- Shift tool (select a line segment, drag both endpoints' values in unison) ----------------
+
+  await withPage(browser, async (page) => {
+    // A flat run held at the same value for several bars — the exact scenario
+    // the tool exists for: grab the line, drag it up, both ends rise together.
+    const laneId = await page.evaluate(() => window._TEST_addLane(22, 0));
+    await page.evaluate((laneId) => { window._TEST_upsertPoint(laneId, 960, 64); window._TEST_upsertPoint(laneId, 2880, 64); }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const mid = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 64), laneId);
+    await page.mouse.move(mid.x, mid.y);
+    await page.mouse.down();
+    await page.mouse.move(mid.x, mid.y - 40, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    await page.click('[data-tool="select"]');
+    const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
+    const p0 = pts.find(p => p.t === 960), p1 = pts.find(p => p.t === 2880);
+    check('Shift tool: dragging a flat segment up moves both endpoints by the same amount, times unchanged',
+      !!p0 && !!p1 && p0.v === p1.v && p0.v > 64 && p0.t === 960 && p1.t === 2880, { pts, p0, p1 });
+  });
+
+  await withPage(browser, async (page) => {
+    // Sloped segment: both endpoints should move by the same delta, so the
+    // original difference between them (the slope) is preserved.
+    const laneId = await page.evaluate(() => window._TEST_addLane(23, 0));
+    await page.evaluate((laneId) => { window._TEST_upsertPoint(laneId, 960, 40); window._TEST_upsertPoint(laneId, 2880, 80); }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const mid = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 60), laneId);
+    await page.mouse.move(mid.x, mid.y);
+    await page.mouse.down();
+    await page.mouse.move(mid.x, mid.y - 20, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    await page.click('[data-tool="select"]');
+    const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
+    const p0 = pts.find(p => p.t === 960), p1 = pts.find(p => p.t === 2880);
+    check('Shift tool: dragging a sloped segment preserves the original gap between endpoint values',
+      !!p0 && !!p1 && (p1.v - p0.v) === 40 && p0.v > 40, { pts, p0, p1 });
+  });
+
+  await withPage(browser, async (page) => {
+    // Dragging beyond the top of the range clamps both endpoints at 127
+    // rather than letting one overshoot while the other catches up.
+    const laneId = await page.evaluate(() => window._TEST_addLane(24, 0));
+    await page.evaluate((laneId) => { window._TEST_upsertPoint(laneId, 960, 100); window._TEST_upsertPoint(laneId, 2880, 110); }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const mid = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 105), laneId);
+    await page.mouse.move(mid.x, mid.y);
+    await page.mouse.down();
+    await page.mouse.move(mid.x, mid.y - 400, { steps: 5 }); // far beyond the top of the lane
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    await page.click('[data-tool="select"]');
+    const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
+    const p0 = pts.find(p => p.t === 960), p1 = pts.find(p => p.t === 2880);
+    check('Shift tool: dragging past the top of the range clamps at 127, keeping both endpoints moving together',
+      !!p0 && !!p1 && p1.v === 127 && p0.v === 117, { pts, p0, p1 });
+  });
+
+  await withPage(browser, async (page) => {
+    // Undo restores both endpoints to their pre-drag values in one step.
+    const laneId = await page.evaluate(() => window._TEST_addLane(25, 0));
+    await page.evaluate((laneId) => { window._TEST_upsertPoint(laneId, 960, 64); window._TEST_upsertPoint(laneId, 2880, 64); }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const mid = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 1920, 64), laneId);
+    await page.mouse.move(mid.x, mid.y);
+    await page.mouse.down();
+    await page.mouse.move(mid.x, mid.y - 40, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const ctrl = process.platform === 'darwin' ? 'Meta' : 'Control';
+    await page.keyboard.press(`${ctrl}+z`);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="select"]');
+    const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
+    const p0 = pts.find(p => p.t === 960), p1 = pts.find(p => p.t === 2880);
+    check('Shift tool: undo restores both endpoints to their original values in one step',
+      !!p0 && !!p1 && p0.v === 64 && p1.v === 64, { pts, p0, p1 });
+  });
+
+  await withPage(browser, async (page) => {
+    // Clicking well away from any segment (no drag) selects nothing and does
+    // not create/alter points. Uses a tick clearly outside the one segment's
+    // time range (960-2880) so the miss is guaranteed by the x-test alone,
+    // regardless of the lane's actual on-screen height/px-per-value scale.
+    const laneId = await page.evaluate(() => window._TEST_addLane(26, 0));
+    // _TEST_addLane seeds a default point at (t:0, v:0) — clear it so the
+    // lane holds exactly the two points this test cares about.
+    await page.evaluate((laneId) => {
+      const lane = window._TEST_state.ccLanes.find(l => l.id === laneId); lane.points = [];
+      window._TEST_upsertPoint(laneId, 960, 64); window._TEST_upsertPoint(laneId, 2880, 64);
+    }, laneId);
+    await page.evaluate((laneId) => window._TEST_state.ccLanes.find(l => l.id === laneId)._row.scrollIntoView({ block: 'center' }), laneId);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const far = await page.evaluate((laneId) => window._TEST_laneClientPos(laneId, 100, 64), laneId);
+    await page.mouse.move(far.x, far.y);
+    await page.mouse.down();
+    await page.mouse.move(far.x, far.y - 40, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    await page.click('[data-tool="select"]');
+    const pts = await page.evaluate(laneId => window._TEST_state.ccLanes.find(l => l.id === laneId).points.map(p => ({ t: p.t, v: p.v })), laneId);
+    check('Shift tool: clicking away from any segment leaves points untouched',
+      pts.length === 2 && pts.every(p => p.v === 64), pts);
+  });
+
   // ---------------- Quantise ----------------
 
   await withPage(browser, async (page) => {
@@ -2049,16 +2165,16 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // D/S/E/L keyboard shortcuts switch tools.
+    // D/S/E/L/V keyboard shortcuts switch tools.
     await page.locator('body').click({ position: { x: 5, y: 5 } });
     const results = {};
-    for (const [key, tool] of [['d', 'draw'], ['e', 'erase'], ['l', 'line'], ['s', 'select']]) {
+    for (const [key, tool] of [['d', 'draw'], ['e', 'erase'], ['l', 'line'], ['v', 'segShift'], ['s', 'select']]) {
       await page.keyboard.press(key);
       await page.waitForTimeout(20);
       results[key] = await page.evaluate(() => window._TEST_state.tool);
     }
-    check('D/S/E/L keyboard shortcuts switch Draw/Select/Erase/Line tools',
-      results.d === 'draw' && results.e === 'erase' && results.l === 'line' && results.s === 'select', results);
+    check('D/S/E/L/V keyboard shortcuts switch Draw/Select/Erase/Line/Shift tools',
+      results.d === 'draw' && results.e === 'erase' && results.l === 'line' && results.v === 'segShift' && results.s === 'select', results);
   });
 
   // ---------------- CC lane Steps (snap-to) ----------------
@@ -3757,6 +3873,68 @@ async function run() {
     await page.evaluate(() => window._TEST_stop());
     const stopRamp = await page.evaluate(() => window.__gainCalls.some((c) => c.m === 'linearRampToValueAtTime' && c.args[0] === 0));
     check('stop() ramps the gain down to 0 (not an instant cut) to avoid a click', stopRamp, stopRamp);
+  });
+
+  await withPage(browser, async (page) => {
+    // With no A/B loop range selected, playing the whole track should play
+    // through once and STOP at the end — not wrap back to bar 1. Shrink the
+    // project to 1 bar @ 120bpm/4-4 (2 real seconds) so the test can just
+    // wait it out on the real clock instead of faking performance.now().
+    await page.evaluate(() => { window._TEST_state.bars = 1; window._TEST_state.locStart = null; window._TEST_state.locEnd = null; window._TEST_state.playhead = 0; });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(700);
+    const midPlay = await page.evaluate(() => window._TEST_state.playing);
+    await page.waitForTimeout(1800); // past the ~2s whole-track duration
+    const after = await page.evaluate(() => ({ playing: window._TEST_state.playing, playhead: window._TEST_state.playhead, totalTicks: window._TEST_totalTicks() }));
+    check('with no loop range selected, playback stops at the end instead of looping back to bar 1',
+      midPlay === true && after.playing === false && after.playhead === after.totalTicks, { midPlay, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // Same short project, but WITH an explicit A/B loop range selected —
+    // existing behavior (loop forever until Stop/Pause) must be unaffected.
+    await page.evaluate(() => {
+      window._TEST_state.bars = 1; window._TEST_state.playhead = 0;
+      window._TEST_state.locStart = 0; window._TEST_state.locEnd = window._TEST_totalTicks();
+    });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(2500); // past the ~2s whole-track duration
+    const stillPlaying = await page.evaluate(() => window._TEST_state.playing);
+    await page.evaluate(() => window._TEST_stop());
+    check('with an explicit loop range selected, playback keeps looping past the end (unaffected by the no-selection stop fix)',
+      stillPlaying === true, stillPlaying);
+  });
+
+  await withPage(browser, async (page) => {
+    // Generate's "Len" field only sets the span when nothing is selected —
+    // with a loop range active it's the range that sets the span instead, so
+    // Len has no effect and should read as dimmed (both the basic and
+    // Advanced panel copies, which mirror the same state.genLen).
+    const before = await page.evaluate(() => getComputedStyle(document.getElementById('genLen')).opacity);
+    check('Len is full-opacity when no loop range is selected', before === '1', before);
+
+    await page.evaluate(() => {
+      window._TEST_state.locStart = 480; window._TEST_state.locEnd = 1920;
+      window._TEST_updateLoopStatus();
+    });
+    const stLoopText = await page.evaluate(() => document.getElementById('stLoop').textContent);
+    const afterOp = await page.evaluate(() => ({
+      genLen: getComputedStyle(document.getElementById('genLen')).opacity,
+      genLenLbl: getComputedStyle(document.getElementById('genLenLbl')).opacity,
+      advLen: getComputedStyle(document.getElementById('advLen')).opacity,
+      advLenLbl: getComputedStyle(document.getElementById('advLenLbl')).opacity,
+      genLenPointerEvents: getComputedStyle(document.getElementById('genLen')).pointerEvents,
+    }));
+    check('Len (basic + Advanced panel) dims to 0.3 opacity and stops accepting clicks once a loop range is selected',
+      afterOp.genLen === '0.3' && afterOp.genLenLbl === '0.3' && afterOp.advLen === '0.3' && afterOp.advLenLbl === '0.3' && afterOp.genLenPointerEvents === 'none',
+      { stLoopText, afterOp });
+
+    await page.evaluate(() => {
+      window._TEST_state.locStart = null; window._TEST_state.locEnd = null;
+      window._TEST_updateLoopStatus();
+    });
+    const restoredOp = await page.evaluate(() => getComputedStyle(document.getElementById('genLen')).opacity);
+    check('Len returns to full opacity once the loop range is cleared', restoredOp === '1', restoredOp);
   });
 
   await withPage(browser, async (page) => {

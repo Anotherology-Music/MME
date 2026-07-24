@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.30
+  MMV MIDI & CC Curve Editor v0.9.31
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -643,6 +643,22 @@
   "…" appended once that map has more than one entry. The ruler's left
   margin (GUTTER) widened from 6 to 30px so the bar-1 time-signature label
   has room to render without clipping against the pane edge.
+  v0.9.31 New "Shift" tool for CC/PB/CP lanes (toolbar, next to Select;
+  shortcut V): click the LINE between two adjacent data points — rather than
+  a point itself — to select that segment, then drag vertically to move both
+  endpoints' values together in unison, clamped so neither can overshoot
+  0/127 while the other keeps moving. Position (left/right) is locked; this
+  tool only moves values. Built for the common case of a value held flat for
+  several bars that needs raising or lowering as one gesture, instead of
+  moving each end individually or dragging a marquee that also catches
+  neighbouring points. Playback with no A/B loop range selected now plays
+  the whole track once and stops at the end instead of silently looping
+  back to bar 1 forever — audio no longer loops either in that case. An
+  explicit loop range still loops exactly as before; only the previously-
+  mislabelled "whole track" case changes. Generate's Len field only sets
+  the span when nothing is selected (a loop range sets the span instead),
+  so it's now dimmed and unclickable whenever a loop range is active, in
+  both the basic and Advanced Generate panels.
 -->
 
 
@@ -1462,6 +1478,7 @@
       <div class="btnrow" id="tools">
         <button data-tool="draw" title="Draw notes (single-click to add) (D)">Draw</button>
         <button data-tool="select" class="on" title="Select &amp; move (S). Shift=add to sel, Alt=erase.&#10;While dragging: hold Ctrl to move horizontally only, Alt to move vertically only.&#10;With a single note/point selected: ←/→ steps to the previous/next one.">Select</button>
+        <button data-tool="segShift" title="Shift Line (V) — CC/PB/CP lanes only.&#10;Click the line between two data points to select that segment, then drag up/down to move both endpoints' values together in unison.&#10;Position (left/right) is locked — this tool only moves values vertically.">Shift</button>
         <button data-tool="line" title="Straight ramp (CC) (L). Hold Ctrl while dragging to force a flat/horizontal line at the origin value.">Line</button>
         <button data-tool="erase" title="Erase (E) (or hold Alt)">Erase</button>
       </div>
@@ -1622,7 +1639,7 @@
           <button data-shape="square" data-gen="square">Sqr</button>
           <button data-shape="step" data-gen="step">Step</button>
           <span class="pill">cycles</span><input type="number" id="genCycles" value="1" min="1" max="64" style="width:48px;">
-          <span class="pill">len</span><select id="genLen" style="width:72px;font-size:11px;"><option value="1/1">1/1</option><option value="1/2">1/2</option><option value="1/4" selected>1/4</option><option value="1/8">1/8</option><option value="1/16">1/16</option><option value="1/32">1/32</option><option value="1/4T">1/4T</option><option value="1/8T">1/8T</option><option value="1/16T">1/16T</option><option value="1/32T">1/32T</option><option value="2 bars">2 bars</option><option value="4 bars">4 bars</option><option value="8 bars">8 bars</option></select>
+          <span class="pill" id="genLenLbl" title="Len sets how far Generate reaches from the playhead — ignored while a loop range is selected, since the range itself sets the span.">len</span><select id="genLen" style="width:72px;font-size:11px;" title="Len sets how far Generate reaches from the playhead — ignored while a loop range is selected, since the range itself sets the span."><option value="1/1">1/1</option><option value="1/2">1/2</option><option value="1/4" selected>1/4</option><option value="1/8">1/8</option><option value="1/16">1/16</option><option value="1/32">1/32</option><option value="1/4T">1/4T</option><option value="1/8T">1/8T</option><option value="1/16T">1/16T</option><option value="1/32T">1/32T</option><option value="2 bars">2 bars</option><option value="4 bars">4 bars</option><option value="8 bars">8 bars</option></select>
           <button id="genAdvBtn" style="margin-left:6px;">Advanced ▾</button>
         </div>
         <div id="genAdvPanel" style="display:none;position:fixed;top:60px;right:20px;width:780px;max-width:96vw;
@@ -1722,8 +1739,8 @@
                   </select>
                   <span class="adv-lbl" style="margin-left:6px;">Cycles</span>
                   <input type="number" id="advCycles" min="1" max="64" value="1" class="adv-num" style="width:44px;">
-                  <span class="adv-lbl">Len</span>
-                  <select id="advLen" style="font-size:11px;width:72px;">
+                  <span class="adv-lbl" id="advLenLbl" title="Len sets how far Generate reaches from the playhead — ignored while a loop range is selected, since the range itself sets the span.">Len</span>
+                  <select id="advLen" style="font-size:11px;width:72px;" title="Len sets how far Generate reaches from the playhead — ignored while a loop range is selected, since the range itself sets the span.">
                     <option value="1/1">1/1</option><option value="1/2">1/2</option><option value="1/4" selected>1/4</option>
                     <option value="1/8">1/8</option><option value="1/16">1/16</option><option value="1/32">1/32</option>
                     <option value="1/4T">1/4T</option><option value="1/8T">1/8T</option>
@@ -2564,6 +2581,8 @@
     for(const p of lane.points){ if(p.t<t0-5||p.t>t1+5) continue; const x=tickToX(p.t), y=val2yForLane(h,p.v,lane); const sel=ccSel.has(p)||(!!rangeHi&&p.t>=rangeHi.a&&p.t<=rangeHi.b); ctx.beginPath(); ctx.arc(x,y,2.6,0,7); ctx.fillStyle=sel?'#ffffff':lane.color; ctx.fill(); } ctx.fillStyle=lane.color;
     if(lane._preview){ const d=lane._preview; ctx.strokeStyle=getCss('--accent2'); ctx.setLineDash([4,3]); ctx.beginPath();
       ctx.moveTo(tickToX(d.t0),val2yForLane(h,d.v0,lane)); ctx.lineTo(tickToX(d.t1),val2yForLane(h,d.v1,lane)); ctx.stroke(); ctx.setLineDash([]); }
+    if(ccDrag&&ccDrag.mode==='segShift'&&ccDrag.lane===lane){ ctx.strokeStyle='#ffffff'; ctx.lineWidth=3; ctx.beginPath();
+      ctx.moveTo(tickToX(ccDrag.p0.t),val2yForLane(h,ccDrag.p0.v,lane)); ctx.lineTo(tickToX(ccDrag.p1.t),val2yForLane(h,ccDrag.p1.v,lane)); ctx.stroke(); ctx.lineWidth=2; }
     if(ccDrag&&ccDrag.mode==='marquee'&&ccDrag.lane===lane){ ctx.strokeStyle=getCss('--accent'); ctx.lineWidth=1; ctx.setLineDash([3,3]);
       ctx.strokeRect(Math.min(ccDrag.x0,ccDrag.x1),ccDrag.y0,Math.abs(ccDrag.x1-ccDrag.x0),ccDrag.y1-ccDrag.y0); ctx.setLineDash([]); }
     if(chMuted) ctx.globalAlpha=1;
@@ -2964,6 +2983,23 @@
   function nearestCCPoint(lane,x,y){ const h=lane._canvas.height; let best=null,bd=1e9;
     for(const p of lane.points){ const px=tickToX(p.t), py=val2yForLane(h,p.v,lane); const d=Math.hypot(px-x,py-y); if(d<bd){ bd=d; best=p; } } return {p:best,d:bd}; }
   function removePoint(lane,p){ const i=lane.points.indexOf(p); if(i>=0) lane.points.splice(i,1); }
+  // Hit-test the LINE between two adjacent points (not the points themselves)
+  // — used by the "Shift" tool (see bindLane below) so a flat/near-flat run
+  // that's unchanged for several bars can be grabbed and moved vertically as
+  // one gesture, instead of moving both endpoint points individually.
+  const SEG_HIT_PX=7;
+  function nearestCCSegment(lane,x,y){ const h=lane._canvas.height; let best=null,bd=1e9;
+    for(let i=0;i<lane.points.length-1;i++){
+      const p0=lane.points[i], p1=lane.points[i+1];
+      const x0=tickToX(p0.t), x1=tickToX(p1.t);
+      if(x<x0-SEG_HIT_PX||x>x1+SEG_HIT_PX) continue;
+      const frac=x1===x0?0:clamp((x-x0)/(x1-x0),0,1);
+      const ey=val2yForLane(h,p0.v,lane)+(val2yForLane(h,p1.v,lane)-val2yForLane(h,p0.v,lane))*frac;
+      const d=Math.abs(y-ey);
+      if(d<bd){ bd=d; best={p0,p1}; }
+    }
+    return {seg:best,d:bd};
+  }
   let ccDrag=null, ccSel=new Set();
   function clearCcSel(lane){ if(typeof window._clearAdvPreview==='function') window._clearAdvPreview(lane); ccSel.clear(); }
   // "step 11/12" — which of the lane's Steps levels a value lands on. Empty
@@ -3032,6 +3068,13 @@
         requestDraw(); return; }
       if(tool==='erase'){ const near=nearestCCPoint(lane,x,y); if(near.p&&near.d<12) removePoint(lane,near.p); ccDrag={lane,mode:'erase'}; requestDraw(); return; }
       if(tool==='line'){ const st=(state.snap==='off'||e.shiftKey)?t:snapT(t); ccDrag={lane,mode:'line',t0:st,v0:v,t1:st,v1:v}; lane._preview={t0:st,v0:v,t1:st,v1:v}; requestDraw(); return; }
+      if(tool==='segShift'){ const near=nearestCCSegment(lane,x,y);
+        if(near.seg&&near.d<SEG_HIT_PX){
+          clearCcSel(lane); ccSel.add(near.seg.p0); ccSel.add(near.seg.p1); lane._activePt=null;
+          ccDrag={lane,mode:'segShift',p0:near.seg.p0,p1:near.seg.p1,startY:y,origV0:near.seg.p0.v,origV1:near.seg.p1.v};
+          updateLaneValInput(lane);
+        }
+        requestDraw(); return; }
       const near=nearestCCPoint(lane,x,y);
       if(near.p&&near.d<7){ lane._activePt=near.p; ccDrag={lane,mode:'movept',pt:near.p,origT:near.p.t,origV:near.p.v}; updateLaneValInput(lane); return; }
       ccDrag={lane,mode:'pencil',lastT:t,lastV:v}; upsertPoint(lane,t,v); requestDraw(); });
@@ -3078,8 +3121,19 @@
       // origin value regardless of vertical mouse position.
       const et=(state.snap==='off'||e.shiftKey)?t:snapT(t); const ev=e.ctrlKey?ccDrag.v0:v;
       ccDrag.t1=et; ccDrag.v1=ev; lane._preview={t0:ccDrag.t0,v0:ccDrag.v0,t1:et,v1:ev}; }
+    else if(ccDrag.mode==='segShift'){
+      // Vertical-only: both endpoints move by the same value delta, computed
+      // from the raw pixel offset (not from y2valForLane, which clamps at the
+      // lane's edges — clamping the delta itself keeps both points moving in
+      // lock-step right up to whichever one hits 0/127 first).
+      const rawDv=-(y-ccDrag.startY)*(r.max-r.min)/(cv.height-2*LANE_PAD);
+      const dv=clamp(rawDv, Math.max(r.min-ccDrag.origV0,r.min-ccDrag.origV1), Math.min(r.max-ccDrag.origV0,r.max-ccDrag.origV1));
+      const nv0=e.shiftKey?ccDrag.origV0+dv:snapToSteps(ccDrag.origV0+dv,r,lane.steps);
+      const nv1=e.shiftKey?ccDrag.origV1+dv:snapToSteps(ccDrag.origV1+dv,r,lane.steps);
+      ccDrag.p0.v=clamp(Math.round(nv0),r.min,r.max); ccDrag.p1.v=clamp(Math.round(nv1),r.min,r.max);
+      updateLaneValInput(lane); }
     if(ccDrag.mode!=='erase'&&ccDrag.mode!=='marquee'&&ccDrag.mode!=='movesel'){
-      const liveV = ccDrag.mode==='movept' ? ccDrag.pt.v : (ccDrag.mode==='line' ? ccDrag.v1 : v);
+      const liveV = ccDrag.mode==='movept' ? ccDrag.pt.v : (ccDrag.mode==='line' ? ccDrag.v1 : (ccDrag.mode==='segShift' ? ccDrag.p1.v : v));
       sendLaneVal(lane,liveV);
     }
     requestDraw(); });
@@ -5108,6 +5162,13 @@
   // after a mid-playback jump) — assumes the caller has already confirmed
   // state.playing is false.
   function beginPlayback(explicitT0){ const {a,b}=getLoop(); if(b<=a) return;
+    // Only loop indefinitely when the user has an explicit A/B loop range
+    // selected on the ruler. With nothing selected, getLoop() still returns
+    // the whole-track span (0..totalTicks()) so a single pass plays the
+    // whole project, but that pass should play once and stop at the end
+    // rather than wrap back to the start — see the `!s.loops` branch in
+    // schedulerTick() and the audioSrc.loop assignment below.
+    const loops=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
     let startTick=state.playhead; if(startTick<a||startTick>=b) startTick=a;
     state.lastPlayStart=startTick;
     state.playing=true; updateTransportBtns();
@@ -5119,7 +5180,7 @@
     // call: true variable-rate MIDI clock generation for hardware/MMV sync
     // is out of scope here, same as most DAWs' basic clock-out).
     const msPerClock=60000/(tempoSegAt(startTick).bpm*24);
-    sched={a,b,span,t0,startTick,evs,idx,passIndex:0,msPerClock,clockIdx:0};
+    sched={a,b,span,t0,startTick,evs,idx,passIndex:0,msPerClock,clockIdx:0,loops};
     if(state.midiOut){
       if(!state.syncFollow) mSend([0xFA], t0);
       // Chase: send Note On for any notes already in progress at startTick
@@ -5155,7 +5216,7 @@
       if(bufTickAtStart>=0?offset<audioBuf.duration:off<b){
         audioSrc=audioCtx.createBufferSource();
         audioSrc.buffer=audioBuf;
-        audioSrc.loop=true;
+        audioSrc.loop=loops;
         audioSrc.loopStart=loopStartSec;
         audioSrc.loopEnd=loopEndSec;
         audioGain=audioCtx.createGain();
@@ -5164,8 +5225,10 @@
         audioGain.gain.linearRampToValueAtTime(audioMuted?0:audioVolume,startAt+AUDIO_FADE);
         audioSrc.connect(audioGain); audioGain.connect(audioCtx.destination);
         audioSrc.start(startAt, offset);
-        audioLoopSched={loopStartSec,loopEndSec,startAt,offset};
-        scheduleAudioWrapDips();
+        // Wrap-dip anti-click automation only makes sense for an actual loop
+        // wrap; with no explicit range selected, audio just plays through and
+        // stops with everything else at the end (see finishPlaybackAtEnd()).
+        if(loops){ audioLoopSched={loopStartSec,loopEndSec,startAt,offset}; scheduleAudioWrapDips(); }
       }
     }
   }
@@ -5212,6 +5275,18 @@
     }
     while(guard++<5000){
       if(s.idx>=s.evs.length){
+        if(!s.loops){
+          // No explicit loop range: play the whole-track pass once and stop
+          // at the end instead of wrapping back to the start. All due events
+          // may already be dispatched (they're sent up to LOOKAHEAD ms early)
+          // well before the pass's real end time, so don't finish until wall
+          // time actually catches up — otherwise a project with sparse/no
+          // events near the end would cut off (or never start, if empty)
+          // long before the audio underneath it has actually finished.
+          const pass0Ms=(tickToSeconds(s.b)-tickToSeconds(s.startTick))*1000;
+          if(now-s.t0>=pass0Ms){ finishPlaybackAtEnd(); return; }
+          break;
+        }
         const rebuilt=buildPassEvents(s.a,s.b); s.idx=0;
         if(s.span<=0){ s.evs=rebuilt; break; }
         if(!rebuilt.length){
@@ -5239,6 +5314,13 @@
     }
   }
   function visualFrame(now){ if(!state.playing||!sched) return; const s=sched;
+    if(!s.loops){
+      // Mirrors schedulerTick's own finish condition so the playhead never
+      // visibly wraps back toward `a` for a stray frame while waiting for
+      // the next (slightly less frequent) scheduler tick to catch it.
+      const pass0Ms=(tickToSeconds(s.b)-tickToSeconds(s.startTick))*1000;
+      if(now-s.t0>=pass0Ms){ finishPlaybackAtEnd(); return; }
+    }
     state.playhead = (now<s.t0) ? s.startTick : schedTickAtElapsed(s,now-s.t0);
     applyScrollLock(); updatePlayheadEl(); updatePlayPos(); rafVisual=requestAnimationFrame(visualFrame);
   }
@@ -5258,6 +5340,14 @@
     audioGain=null; audioLoopSched=null; }
   function pause(){ if(!state.playing) return; if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); updateTransportBtns(); }
   function stop(){ if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); state.playhead=getLoop().a; updatePlayPos(); updatePlayheadEl(); updateTransportBtns(); }
+  // Reached the end of a non-looping (no explicit loop range) pass — stop in
+  // place at the end, same as the Stop button except the playhead is left
+  // where playback actually finished rather than rewound to the start.
+  function finishPlaybackAtEnd(){
+    const endTick=sched?sched.b:state.playhead;
+    if(state.recording||state.recArmed) endRecordingSession();
+    state.playing=false; stopTransport(); state.playhead=endTick; updatePlayPos(); updatePlayheadEl(); updateTransportBtns();
+  }
   function togglePlay(){ state.playing?pause():play(); }
   // Jumps the playhead to `tick`. If playback is running, restarts it in
   // place at the new position (no audible/visible pause); otherwise just
@@ -5294,7 +5384,22 @@
   function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn);
     if(state.playing) rescheduleCurrentPass(); }
   function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockHundredths(tickToSeconds(state.playhead)); }
-  function updateLoopStatus(){ if(state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart) $('stLoop').textContent=tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd); else $('stLoop').textContent='whole track'; }
+  function updateLoopStatus(){
+    const hasRange=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
+    $('stLoop').textContent=hasRange?(tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd)):'whole track';
+    updateGenLenEnabled(hasRange);
+  }
+  // Generate's Len field only sets the span when there's no loop range (see
+  // generate()'s a/b logic) — a selected range determines the span instead,
+  // so Len has no effect and is dimmed to say so, mirroring the curve-
+  // shaping rows' dim-when-irrelevant convention elsewhere in this panel.
+  function updateGenLenEnabled(hasRange){
+    [['genLenLbl','genLen'],['advLenLbl','advLen']].forEach(([lblId,selId])=>{
+      const lbl=$(lblId), sel=$(selId); const on=!hasRange;
+      if(lbl){ lbl.style.opacity=on?'1':'0.3'; }
+      if(sel){ sel.style.opacity=on?'1':'0.3'; sel.style.pointerEvents=on?'':'none'; }
+    });
+  }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
 
   function populateViewCh(){
@@ -5888,6 +5993,7 @@
     if(!ctrl && e.key.toLowerCase()==='s'){ e.preventDefault(); setTool('select'); return; }
     if(!ctrl && e.key.toLowerCase()==='e'){ e.preventDefault(); setTool('erase'); return; }
     if(!ctrl && e.key.toLowerCase()==='l'){ e.preventDefault(); setTool('line'); return; }
+    if(!ctrl && e.key.toLowerCase()==='v'){ e.preventDefault(); setTool('segShift'); return; }
     if(!ctrl && (e.key==='ArrowLeft'||e.key==='ArrowRight')){
       // Step the current single-point/note selection to the previous or next
       // one in time, on whichever pane (CC lane or piano roll) last had focus.
