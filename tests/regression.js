@@ -62,6 +62,10 @@ function buildTestHtml() {
       '  window._TEST_audioGainValue = () => (typeof audioGain !== "undefined" && audioGain) ? audioGain.gain.value : null;',
       '  window._TEST_fmtClockHundredths = (sec) => fmtClockHundredths(sec);',
       '  window._TEST_GUTTER = () => GUTTER;',
+      '  window._TEST_tsMarkerHits = () => tsMarkerHits.map(m => ({ tick: m.tick, isStart: m.isStart, cx: (m.x0 + m.x1) / 2, cy: (m.y0 + m.y1) / 2 }));',
+      '  window._TEST_tempoMarkerHits = () => tempoMarkerHits.map(m => ({ tick: m.tick, isStart: m.isStart, cx: (m.x0 + m.x1) / 2, cy: (m.y0 + m.y1) / 2 }));',
+      '  window._TEST_rulerScreenPos = (localX, localY) => { const r = document.getElementById("rulerScroll").getBoundingClientRect(); return { x: r.left + localX - state.scrollLeft + GUTTER, y: r.top + localY }; };',
+      '  window._TEST_moveTsMapChange = (oldTick, newTick) => moveTsMapChange(oldTick, newTick);',
       '  window._TEST_requestDraw = () => { drawAll(); };',
       '  window._TEST_laneClientPos = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); const rect = l._scroll.getBoundingClientRect(); return { x: tickToX(t) + rect.left - state.scrollLeft + GUTTER, y: val2yForLane(l._canvas.height, v, l) + rect.top }; };',
       '  window._TEST_pushUndo = pushUndo;',
@@ -4974,7 +4978,7 @@ async function run() {
     // formula) to prove a tick-0 note is inset from the border by ~GUTTER
     // px, and that the border itself (x=0) is still plain background.
     const gutter = await page.evaluate(() => window._TEST_GUTTER());
-    check('GUTTER is a small positive inset (a few px, not zero and not huge)', gutter > 0 && gutter <= 12, gutter);
+    check('GUTTER is a small positive inset (a few px, not zero and not huge)', gutter > 0 && gutter <= 40, gutter);
 
     const note = await page.evaluate(() => {
       const n = { id: window._TEST_state.nextId++, pitch: 70, start: 0, length: 480, vel: 100, ch: 0 };
@@ -5039,9 +5043,15 @@ async function run() {
         const r = document.getElementById('rulerScroll').getBoundingClientRect();
         return r.left + T * window._TEST_state.pxPerTick - window._TEST_state.scrollLeft + window._TEST_GUTTER();
       }, T);
+      // Clicks near the TOP of the ruler (the tick-mark band), not dead
+      // center — bar 1 (and any bar with a tempo/time-sig change) now has a
+      // selectable marker sitting at vertical-center (v0.9.30), which is a
+      // deliberate, separate click target from plain click-to-seek. Testing
+      // the gutter round-trip from a Y that can never collide with a marker
+      // keeps this test about the gutter math, not the marker feature.
       const clientY = await page.evaluate(() => {
         const r = document.getElementById('rulerScroll').getBoundingClientRect();
-        return r.top + r.height / 2;
+        return r.top + 4;
       });
       await page.evaluate(() => { window._TEST_state.playhead = -1; });
       await page.mouse.click(clientX, clientY);
@@ -6117,7 +6127,7 @@ async function run() {
   // ---------- Tempo Map popover UI: add + remove a breakpoint via the same list convention as the Time Sig map ----------
   await withPage(browser, async (page) => {
     await page.evaluate(() => { window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }]; window._TEST_state.bars = 8; });
-    await page.click('#tsBtn');
+    await page.click('#tempoBtn');
     await page.fill('#tempoMapBar', '3');
     await page.fill('#tempoMapBpm', '140');
     await page.click('#tempoMapAddBtn');
@@ -6134,6 +6144,164 @@ async function run() {
     const afterRemove = await page.evaluate(() => window._TEST_state.tempoMap.slice());
     check('Tempo Map popover: × removes a breakpoint (tick-0 entry always remains)',
       afterRemove.length === 1 && afterRemove[0].tick === 0, afterRemove);
+  });
+
+  // ---------- Split Sig / Tempo buttons + selectable ruler markers (v0.9.30) ----------
+
+  await withPage(browser, async (page) => {
+    const info = await page.evaluate(() => ({
+      tsWrapperHasTempo: document.getElementById('tsWrapper').contains(document.getElementById('tempoMapList')),
+      tempoWrapperHasTempo: document.getElementById('tempoWrapper').contains(document.getElementById('tempoMapList')),
+      tsWrapperHasTs: document.getElementById('tsWrapper').contains(document.getElementById('tsMapList')),
+      distinctButtons: document.getElementById('tsBtn') !== document.getElementById('tempoBtn'),
+    }));
+    check('Time Sig and Tempo Map are two separate buttons/panels (not one combined popover)',
+      info.distinctButtons && info.tsWrapperHasTs && info.tempoWrapperHasTempo && !info.tsWrapperHasTempo, info);
+
+    // Opening one does not open the other.
+    await page.click('#tsBtn');
+    const afterTs = await page.evaluate(() => ({ ts: document.getElementById('tsPanel').classList.contains('open'), tempo: document.getElementById('tempoPanel').classList.contains('open') }));
+    check('opening the Sig panel does not also open the Tempo Map panel', afterTs.ts && !afterTs.tempo, afterTs);
+    await page.click('#tsBtn'); // close
+    await page.click('#tempoBtn');
+    const afterTempo = await page.evaluate(() => ({ ts: document.getElementById('tsPanel').classList.contains('open'), tempo: document.getElementById('tempoPanel').classList.contains('open') }));
+    check('opening the Tempo Map panel does not also open the Sig panel', !afterTempo.ts && afterTempo.tempo, afterTempo);
+    await page.click('#tempoBtn'); // close
+
+    // Dynamic button labels: starting value, "…" once variable.
+    const single = await page.evaluate(() => ({ ts: document.getElementById('tsBtnLabel').textContent, tempo: document.getElementById('tempoBtnLabel').textContent }));
+    check('with one entry each, the Sig/Tempo buttons show the plain starting value (no "…")',
+      single.ts === '4/4' && single.tempo === '120 BPM' && !single.ts.includes('…') && !single.tempo.includes('…'), single);
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 3, den: 4 }];
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 100 }, { tick: 1920, bpm: 140 }];
+      window._TEST_state.bpm = 100;
+    });
+    await page.evaluate(() => window._TEST_state); // no-op to flush microtask ordering
+    await page.click('#tsBtn'); await page.click('#tsBtn'); // open+close forces a re-render via renderTsMapUI
+    const variable = await page.evaluate(() => ({ ts: document.getElementById('tsBtnLabel').textContent, tempo: document.getElementById('tempoBtnLabel').textContent }));
+    check('once either map has 2+ entries, its button label appends "…" after the starting value',
+      variable.ts === '4/4…' && variable.tempo === '100 BPM…', variable);
+  });
+
+  await withPage(browser, async (page) => {
+    // Bar-1 always has a selectable "start" marker for BOTH facets, even
+    // with no explicit changes anywhere in the project.
+    await page.evaluate(() => { window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }]; window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }]; window._TEST_requestDraw(); });
+    await page.waitForTimeout(80);
+    const hits = await page.evaluate(() => ({ ts: window._TEST_tsMarkerHits(), tempo: window._TEST_tempoMarkerHits() }));
+    check('bar 1 always has a selectable time-signature "start" marker, even with no TS changes',
+      hits.ts.some(m => m.tick === 0 && m.isStart), hits.ts);
+    check('bar 1 always has a selectable tempo "start" marker, even with no tempo changes',
+      hits.tempo.some(m => m.tick === 0 && m.isStart), hits.tempo);
+  });
+
+  await withPage(browser, async (page) => {
+    // Clicking the bar-1 TS "start" marker opens its edit popover (pre-filled
+    // with the project's starting signature), with NO Remove button (it's
+    // never removable) — and Update writes back into tsMap[0]/state.tsNum.
+    await page.evaluate(() => { window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }]; window._TEST_requestDraw(); });
+    await page.waitForTimeout(80);
+    const hit = await page.evaluate(() => window._TEST_tsMarkerHits().find(m => m.isStart));
+    const pos = await page.evaluate((h) => window._TEST_rulerScreenPos(h.cx, h.cy), hit);
+    await page.mouse.click(pos.x, pos.y);
+    await page.waitForTimeout(80);
+    const opened = await page.evaluate(() => ({
+      open: document.getElementById('tsMarkerPopover').classList.contains('open'),
+      hasRemove: !!document.getElementById('tsMarkerPopover').querySelector('.danger'),
+      numVal: document.getElementById('tsMarkerPopover').querySelector('input[type=number]').value,
+    }));
+    check('clicking the bar-1 TS marker opens its edit popover pre-filled with the current signature, no Remove button',
+      opened.open && !opened.hasRemove && opened.numVal === '4', opened);
+    await page.fill('#tsMarkerPopover input[type=number]', '7');
+    await page.selectOption('#tsMarkerPopover select', '8');
+    await page.click('#tsMarkerPopover button:not(.danger)');
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => ({ map: window._TEST_state.tsMap.slice(), tsNum: window._TEST_state.tsNum, tsDen: window._TEST_state.tsDen }));
+    check('updating the bar-1 TS marker popover writes the new starting signature into tsMap[0] and state.tsNum/tsDen',
+      after.map.length === 1 && after.map[0].num === 7 && after.map[0].den === 8 && after.tsNum === 7 && after.tsDen === 8, after);
+  });
+
+  await withPage(browser, async (page) => {
+    // Clicking an existing (non-start) TS marker offers Remove; Remove deletes it.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 3, den: 4 }];
+      window._TEST_state.bars = 8;
+      window._TEST_requestDraw();
+    });
+    await page.waitForTimeout(80);
+    const hit = await page.evaluate(() => window._TEST_tsMarkerHits().find(m => m.tick === 1920));
+    const pos = await page.evaluate((h) => window._TEST_rulerScreenPos(h.cx, h.cy), hit);
+    await page.mouse.click(pos.x, pos.y);
+    await page.waitForTimeout(80);
+    const opened = await page.evaluate(() => ({
+      open: document.getElementById('tsMarkerPopover').classList.contains('open'),
+      hasRemove: !!document.getElementById('tsMarkerPopover').querySelector('.danger'),
+    }));
+    check('clicking an existing (non-start) TS marker opens its popover WITH a Remove button', opened.open && opened.hasRemove, opened);
+    await page.click('#tsMarkerPopover .danger');
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_state.tsMap.slice());
+    check('Remove in the TS marker popover deletes that breakpoint', after.length === 1 && after[0].tick === 0, after);
+  });
+
+  await withPage(browser, async (page) => {
+    // Dragging an existing TS marker moves it to a different (snapped) bar,
+    // keeping its num/den — exercised directly via the same commit function
+    // the ruler's mouseup handler calls (mirrors how commitTempoDrag is
+    // tested elsewhere in this suite), since simulating a full drag gesture
+    // pixel-by-pixel adds little over testing the commit logic itself.
+    await page.evaluate(() => {
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 3, den: 4 }];
+      window._TEST_state.bars = 8;
+    });
+    const ppq = await page.evaluate(() => window._TEST_state.ppq);
+    const bar4Tick = ppq * 4 * 3; // 4/4 bars, bar index 3 (4th bar)
+    await page.evaluate((t) => window._TEST_moveTsMapChange(1920, t), bar4Tick);
+    const after = await page.evaluate(() => window._TEST_state.tsMap.slice());
+    check('moveTsMapChange relocates an existing breakpoint to the new tick, keeping its num/den',
+      after.length === 2 && after.some(s => s.tick === bar4Tick && s.num === 3 && s.den === 4) && !after.some(s => s.tick === 1920), { after, bar4Tick });
+  });
+
+  await withPage(browser, async (page) => {
+    // moveTsMapChange refuses to move the bar-1 start entry, or to move
+    // anything onto tick 0.
+    await page.evaluate(() => { window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 3, den: 4 }]; });
+    await page.evaluate(() => window._TEST_moveTsMapChange(0, 3840));
+    const afterMoveStart = await page.evaluate(() => window._TEST_state.tsMap.slice());
+    check('moveTsMapChange refuses to move the bar-1 "start" entry', afterMoveStart.some(s => s.tick === 0), afterMoveStart);
+    await page.evaluate(() => window._TEST_moveTsMapChange(1920, 0));
+    const afterMoveToZero = await page.evaluate(() => window._TEST_state.tsMap.slice());
+    check('moveTsMapChange refuses to move an entry onto tick 0', afterMoveToZero.some(s => s.tick === 1920), afterMoveToZero);
+  });
+
+  await withPage(browser, async (page) => {
+    // Clicking an existing tempo marker (not just Alt+dragging a bare bar
+    // line) opens its edit popover — the fix for "I can't select a marker
+    // after placing it."
+    await page.evaluate(() => {
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 145 }];
+      window._TEST_state.bars = 8;
+      window._TEST_requestDraw();
+    });
+    await page.waitForTimeout(80);
+    const hit = await page.evaluate(() => window._TEST_tempoMarkerHits().find(m => m.tick === 1920));
+    const pos = await page.evaluate((h) => window._TEST_rulerScreenPos(h.cx, h.cy), hit);
+    await page.mouse.click(pos.x, pos.y);
+    await page.waitForTimeout(80);
+    const opened = await page.evaluate(() => ({
+      open: document.getElementById('tempoMarkerPopover').classList.contains('open'),
+      hasRemove: !!document.getElementById('tempoMarkerPopover').querySelector('.danger'),
+      bpmVal: document.getElementById('tempoMarkerPopover').querySelector('input[type=number]').value,
+    }));
+    check('clicking an existing tempo marker opens its edit popover pre-filled with its BPM and a Remove button',
+      opened.open && opened.hasRemove && opened.bpmVal === '145', opened);
+    await page.fill('#tempoMarkerPopover input[type=number]', '160');
+    await page.click('#tempoMarkerPopover button:not(.danger)');
+    await page.waitForTimeout(50);
+    const after = await page.evaluate(() => window._TEST_state.tempoMap.slice());
+    check('updating the tempo marker popover changes that breakpoint\'s BPM in place',
+      after.length === 2 && after.some(s => s.tick === 1920 && Math.abs(s.bpm - 160) < 0.01), after);
   });
 
   await browser.close();

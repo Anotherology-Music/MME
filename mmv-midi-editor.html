@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.29
+  MMV MIDI & CC Curve Editor v0.9.30
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -623,7 +623,28 @@
   measures in quarter-notes-per-minute regardless of tsDen. They're now
   quarter-note-based, matching buildMidi() exactly; this only changes
   displayed/scheduled timing for projects using a non-4 denominator.
+  v0.9.30 Tempo/time-signature markers become genuinely selectable, not just
+  add-then-delete. Every TS and tempo breakpoint on the ruler — including a
+  new always-present bar-1 "start" marker for each, shown in neutral white/
+  grey rather than orange/purple since there's no "before" to contrast
+  against — can now be clicked directly to open a small popover that edits
+  its value in place or removes it (the un-removable bar-1 entries only get
+  Update). Existing markers are also directly draggable: grab a tempo marker
+  and drag it to re-align with a new point in the audio waveform (the same
+  align algorithm as before, just no longer requiring Alt once the marker
+  already exists), or grab a time-signature marker and drag it to a different
+  bar. Alt+click (no drag) on a bare bar line now adds a new time-signature
+  change there, pairing with Alt+drag's existing "add a tempo change" —
+  drag-to-set for tempo (dragging to a time position is natural), click-to-
+  set for time signature (a numerator/denominator has no natural drag
+  distance). The combined "Time Sig ▾" popover is now two separate toolbar
+  buttons/panels — Sig and a new metronome-variant Tempo Map icon, sitting
+  as a matched pair — each showing the project's starting value live, with
+  "…" appended once that map has more than one entry. The ruler's left
+  margin (GUTTER) widened from 6 to 30px so the bar-1 time-signature label
+  has room to render without clipping against the pane edge.
 -->
+
 
 <style>
   * { box-sizing: border-box; }
@@ -684,11 +705,20 @@
   .setup-section button{font-size:11px;padding:3px 8px;}
   .setup-section select,.setup-section input[type=number]{font-size:11px;padding:2px 5px;}
   #setupBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
-  /* ── Time Signature dropdown ── */
-  #tsWrapper{position:relative;}
-  #tsPanel{position:absolute;top:calc(100% + 3px);left:0;width:320px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;padding:9px 14px;flex-direction:column;gap:6px;}
-  #tsPanel.open{display:flex;}
+  /* ── Time Signature / Tempo Map dropdowns — a matched pair of buttons (see
+     .map-btn-grp) that split what used to be one combined "Time Sig" popover.
+     Same shape/behavior, coloured to match their own ruler-marker colour
+     (orange for Sig, purple for Tempo) so the toolbar buttons and the ruler
+     markers read as the same system. ── */
+  .map-btn-grp{display:flex;gap:1px;}
+  #tsWrapper,#tempoWrapper{position:relative;}
+  #tsPanel,#tempoPanel{position:absolute;top:calc(100% + 3px);left:0;width:320px;background:var(--panel);border:1px solid var(--line);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;padding:9px 14px;flex-direction:column;gap:6px;}
+  #tsPanel{border-top:2px solid var(--accent2);}
+  #tempoPanel{border-top:2px solid var(--tempoVar);}
+  #tsPanel.open,#tempoPanel.open{display:flex;}
   #tsBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
+  #tempoBtn.open{background:var(--tempoVar);color:#1a1030;border-color:var(--tempoVar);font-weight:600;}
+  .map-btn{display:inline-flex;align-items:center;}
   /* ── Note Info: true one-row layout (v0.9.13) ── replaces the old two-row
      header+4-column-grid structure. There is now exactly ONE row at all
      times — minimized, expanded-with-nothing-selected, and expanded-with-a-
@@ -1049,6 +1079,23 @@
      see at a glance which CC#s are free vs. already in use on this channel.
      Same amber (#ffb454) already used for the Channel-16 warning above. */
   #ccPopover .cc-opt.used{color:#ffb454;}
+
+  /* Marker-edit popovers — one shared DOM instance each for every ruler
+     TS/tempo marker (mirrors #chPopover/#ccPopover's one-instance-
+     repositioned-via-JS pattern), opened by clicking a marker directly (see
+     the ruler mousedown/mousemove/mouseup handlers). Small form: a couple of
+     fields, Remove (hidden for the un-removable bar-1 "start" marker),
+     Update. */
+  #tsMarkerPopover,#tempoMarkerPopover{position:fixed;width:200px;background:var(--panel);
+    border:1px solid var(--line);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);
+    z-index:700;display:none;flex-direction:column;gap:7px;padding:10px 12px;font-size:11px;}
+  #tsMarkerPopover{border-top:2px solid var(--accent2);}
+  #tempoMarkerPopover{border-top:2px solid var(--tempoVar);}
+  #tsMarkerPopover.open,#tempoMarkerPopover.open{display:flex;}
+  .marker-pop-title{font-weight:700;color:var(--txt);}
+  .marker-pop-row{display:flex;align-items:center;gap:6px;}
+  .marker-pop-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:2px;}
+  .marker-pop-actions .danger{color:#ff8a8a;border-color:#ff8a8a55;}
 
   /* Lane leftcol — now 2 rows (row 1 lives outside it, see above): row 2
      (× on the left; Val/Pos/Steps/Mute/Solo on the right) is the protected
@@ -1451,28 +1498,37 @@
       </select>
     </div>
     <div class="sep"></div>
-    <div id="tsWrapper">
-      <button id="tsBtn" title="Add, move or remove time signature changes anywhere in the project">𝄐 Time Sig ▾</button>
-      <div id="tsPanel">
-        <div class="setup-title">Time Signature Changes</div>
-        <div style="font-size:11px;color:var(--txt2);">Notes keep their real-world timing (mm:ss) — only bar/beat numbering shifts.</div>
-        <div id="tsMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
-        <div class="setup-row">
-          <span class="lbl">At bar</span><input type="number" id="tsMapBar" value="1" min="1" style="width:56px;">
-          <span class="lbl">Sig</span>
-          <input type="number" id="tsMapNum" value="4" min="1" max="32" style="width:44px;">
-          <span class="pill">/</span>
-          <select id="tsMapDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
-          <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
+    <div class="map-btn-grp">
+      <div id="tsWrapper">
+        <button id="tsBtn" class="map-btn" title="Add, move or remove time signature changes anywhere in the project. Click a marker on the ruler to edit it in place, or drag it to a different bar.">𝄐 <span id="tsBtnLabel">4/4</span> <span id="tsBtnCaret">▾</span></button>
+        <div id="tsPanel">
+          <div class="setup-title">Time Signature Changes</div>
+          <div style="font-size:11px;color:var(--txt2);">Notes keep their real-world timing (mm:ss) — only bar/beat numbering shifts. Click a marker on the ruler (left of its bar line) to edit or remove it; Alt+click an empty bar line to add one there.</div>
+          <div id="tsMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
+          <div class="setup-row">
+            <span class="lbl">At bar</span><input type="number" id="tsMapBar" value="1" min="1" style="width:56px;">
+            <span class="lbl">Sig</span>
+            <input type="number" id="tsMapNum" value="4" min="1" max="32" style="width:44px;">
+            <span class="pill">/</span>
+            <select id="tsMapDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
+            <button id="tsMapAddBtn" title="Add or replace the time signature change at this bar">+ Add</button>
+          </div>
         </div>
-        <div class="setup-title" style="margin-top:6px;border-top:1px solid var(--line);padding-top:8px;">Tempo Map</div>
-        <div style="font-size:11px;color:var(--txt2);">Alt+drag a bar line on the ruler to align it with the audio waveform — tempo bends to fit, audio is never time-stretched.</div>
-        <div id="tempoMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
-        <div class="setup-row">
-          <span class="lbl">At bar</span><input type="number" id="tempoMapBar" value="1" min="1" style="width:56px;">
-          <span class="lbl">BPM</span>
-          <input type="number" id="tempoMapBpm" value="120" min="20" max="400" style="width:56px;">
-          <button id="tempoMapAddBtn" title="Add or replace the tempo change at this bar">+ Add</button>
+      </div>
+      <div id="tempoWrapper">
+        <button id="tempoBtn" class="map-btn" title="Add, move or remove tempo changes anywhere in the project. Click a marker on the ruler to edit it in place, or drag it to align with a point in the audio waveform.">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:2px;"><path d="M9 3h6l5 18H4L9 3z"/><path d="M12 19 17 6" stroke-dasharray="1 2.4"/><circle cx="17" cy="6" r="1.3" fill="currentColor" stroke="none"/></svg><span id="tempoBtnLabel">120 BPM</span> <span id="tempoBtnCaret">▾</span>
+        </button>
+        <div id="tempoPanel">
+          <div class="setup-title">Tempo Map</div>
+          <div style="font-size:11px;color:var(--txt2);">Alt+drag a bar line on the ruler to align it with the audio waveform — tempo bends to fit, audio is never time-stretched. Click a marker (right of its bar line) to edit or remove it, or drag it to re-align.</div>
+          <div id="tempoMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
+          <div class="setup-row">
+            <span class="lbl">At bar</span><input type="number" id="tempoMapBar" value="1" min="1" style="width:56px;">
+            <span class="lbl">BPM</span>
+            <input type="number" id="tempoMapBpm" value="120" min="20" max="400" style="width:56px;">
+            <button id="tempoMapAddBtn" title="Add or replace the tempo change at this bar">+ Add</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1889,7 +1945,11 @@
   // (see beginPane's callers), and every screen->tick coordinate conversion
   // (rulerX/prCoords/velCoords/laneCoords/zoomHAt) subtracts it back out, so
   // clicks/drags still land on the tick that's visually under the cursor.
-  const GUTTER=6;
+  // v0.9.30: widened from 6 to 30 so the bar-1 time-signature marker (which
+  // renders to the LEFT of the bar-1 line, same as every other TS marker)
+  // has room to draw its label without clipping against the pane edge, even
+  // for a wide signature like "32/16" (num/den's own input limits).
+  const GUTTER=30;
   function pitchToY(p){ return (PITCH_MAX-p)*state.noteHeight; }
   function yToPitch(y){ return clamp(PITCH_MAX - Math.floor(y/state.noteHeight), PITCH_MIN, PITCH_MAX); }
   function fracTicks(s){ if(typeof s!=='string') return ticksPerBeat();
@@ -2202,8 +2262,13 @@
     ctx.stroke();
     ctx.fillStyle=getCss('--txt'); ctx.font='11px system-ui'; ctx.textBaseline='middle'; ctx.textAlign='left';
     const barPx=(bars[0]?bars[0].tpb:ticksPerBar())*state.pxPerTick, every=Math.max(1,Math.ceil(36/Math.max(1,barPx)));
-    const tsColor=getCss('--accent2'), tempoColor=getCss('--tempoVar');
+    const tsColor=getCss('--accent2'), tempoColor=getCss('--tempoVar'), startTsColor=getCss('--txt'), startTempoColor=getCss('--txt2');
+    // Rebuilt every draw — the ruler's own mousedown/mousemove/mouseup
+    // handlers (below) hit-test the mouse against whichever regions were
+    // drawn most recently, so these only ever need to reflect "right now".
+    tsMarkerHits=[]; tempoMarkerHits=[];
     bars.forEach(b=>{ const t=b.startTick, x=tickToX(t), change=changeAt.get(t), tempoChange=tempoChangeAt.get(t);
+      const isStart=(t===0);
       ctx.lineWidth=(change||tempoChange)?2:1;
       ctx.strokeStyle=change?tsColor:(tempoChange?tempoColor:getCss('--gridBar'));
       ctx.beginPath(); ctx.moveTo(Math.round(x)+0.5,0); ctx.lineTo(Math.round(x)+0.5,h); ctx.stroke();
@@ -2211,25 +2276,34 @@
       let barLbl=null;
       if(b.barIdx%every===0){ barLbl=state.rulerMode==='bars'?String(b.barIdx+1):formatRulerTime(tickToSeconds(t));
         ctx.fillStyle=getCss('--txt'); ctx.fillText(barLbl,x+4,h/2); }
-      // Time-signature change marker: the bar line itself turns orange (visible
-      // at any zoom), and once bars are wide enough for per-bar labels, the new
-      // signature is also spelled out to the LEFT of the line — the opposite
-      // side from the bar number, so the two never collide.
-      if(change && b.tpb*state.pxPerTick>40 && every===1){
-        ctx.fillStyle=tsColor; ctx.textAlign='right';
-        ctx.fillText(change.num+'/'+change.den, x-4, h/2);
+      // Time-signature marker — every bar carrying an explicit change (orange),
+      // PLUS bar 1 always (the project's STARTING signature, in neutral white
+      // rather than orange — there's no "before" to contrast against there).
+      // Both kinds are selectable/draggable (see the mousedown/mousemove/
+      // mouseup handlers below), so this also records each one's on-screen
+      // hit region in tsMarkerHits. Sits to the LEFT of the line — the
+      // opposite side from the bar number, so the two never collide.
+      const tsMark = change || (isStart ? {tick:0,num:state.tsMap[0].num,den:state.tsMap[0].den} : null);
+      if(tsMark && b.tpb*state.pxPerTick>40 && every===1){
+        const label=tsMark.num+'/'+tsMark.den;
+        ctx.fillStyle=isStart?startTsColor:tsColor; ctx.textAlign='right';
+        ctx.fillText(label, x-4, h/2);
+        const tw=ctx.measureText(label).width;
         ctx.textAlign='left';
+        tsMarkerHits.push({tick:t, isStart, x0:x-4-tw-3, y0:h/2-9, x1:x+2, y1:h/2+9});
       }
-      // Tempo change marker: distinct purple so it never reads as identical to
-      // a time-sig change, labeled to the RIGHT of the line (opposite the
-      // time-sig label, which sits to the left) so a bar carrying both never
-      // collides. Set low near the bottom edge in a smaller font so it also
-      // clears the bar-number label, which shares the same (right) side at
-      // the ruler's vertical center.
-      if(tempoChange && b.tpb*state.pxPerTick>40 && every===1){
-        ctx.fillStyle=tempoColor; ctx.textAlign='left'; ctx.font='9px system-ui'; ctx.textBaseline='bottom';
-        ctx.fillText(Math.round(tempoChange.bpm)+' BPM', x+4, h-2);
+      // Tempo marker — mirror image on the RIGHT of the line (opposite the
+      // time-sig label), purple for a change / grey for the bar-1 starting
+      // tempo. Set low near the bottom edge in a smaller font so it also
+      // clears the bar-number label sharing that same side.
+      const tempoMark = tempoChange || (isStart ? {tick:0,bpm:state.tempoMap[0].bpm} : null);
+      if(tempoMark && b.tpb*state.pxPerTick>40 && every===1){
+        const label=Math.round(tempoMark.bpm)+' BPM';
+        ctx.fillStyle=isStart?startTempoColor:tempoColor; ctx.textAlign='left'; ctx.font='9px system-ui'; ctx.textBaseline='bottom';
+        ctx.fillText(label, x+4, h-2);
+        const tw=ctx.measureText(label).width;
         ctx.font='11px system-ui'; ctx.textBaseline='middle';
+        tempoMarkerHits.push({tick:t, isStart, x0:x-2, y0:h-2-11, x1:x+4+tw+3, y1:h});
       }
       // Intra-bar subdivision labels fill in once there's enough room per
       // beat, giving more populated position markers as you zoom further in.
@@ -2257,6 +2331,7 @@
       }
     });
     drawTempoDragGhost(ctx,h);
+    drawTsDragGhost(ctx,h);
   }
   // Live-preview line for an in-progress Alt+drag tempo-align gesture (see
   // the rulerCanvas mousedown handler below) — a dashed purple vertical line
@@ -2264,10 +2339,23 @@
   // (which share the same tick<->pixel mapping) so the user can see it line
   // up with a transient in the waveform before releasing.
   function drawTempoDragGhost(ctx,h){
-    if(!tempoDrag) return;
+    if(!tempoDrag||!tempoDrag.moved) return;
     const x=Math.round(tempoDrag.curLocalX)+0.5;
     ctx.save();
     ctx.strokeStyle=getCss('--tempoVar'); ctx.lineWidth=2; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+    ctx.restore();
+  }
+  // Live-preview line for dragging an EXISTING time-signature marker to a
+  // different bar — unlike the tempo ghost (a free pixel position, since
+  // tempo aligns to any point in the waveform), this snaps to the nearest
+  // bar line, since a time signature can only change at a bar boundary.
+  function drawTsDragGhost(ctx,h){
+    if(!tsMarkerDrag||!tsMarkerDrag.moved) return;
+    const snapTick=nearestBarLineTick(tsMarkerDrag.curLocalX);
+    const x=Math.round(tickToX(snapTick))+0.5;
+    ctx.save();
+    ctx.strokeStyle=getCss('--accent2'); ctx.lineWidth=2; ctx.setLineDash([4,3]);
     ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
     ctx.restore();
   }
@@ -2483,14 +2571,40 @@
 
   // ---------- Ruler: scrub + locators ----------
   function rulerX(e){ const r=rulerScroll.getBoundingClientRect(); return e.clientX-r.left+state.scrollLeft-GUTTER; }
+  function rulerY(e){ const r=rulerScroll.getBoundingClientRect(); return e.clientY-r.top; }
   function snapLoc(t){ if(state.snap==='off') return Math.round(t); return Math.round(snapT(t)); }
   let rulerDrag=null;
+
+  // ---------- Ruler markers: TS/tempo markers are directly selectable —
+  // click one to edit its value (or remove it) in a small popover, or drag
+  // it (tempo: to a new point in the waveform, re-aligning like Alt+drag on
+  // a bare bar line; TS: to a different bar). tsMarkerHits/tempoMarkerHits
+  // are the on-screen hit regions drawRuler() rebuilds every frame.
+  let tsMarkerHits=[], tempoMarkerHits=[];
+  function hitTestMarkerList(list,localX,localY){
+    for(const m of list){ if(localX>=m.x0&&localX<=m.x1&&localY>=m.y0&&localY<=m.y1) return m; }
+    return null;
+  }
 
   // ---------- Ruler: Alt+drag a bar line to align it with the waveform
   // below (tempo-track-from-beat-markers, Logic/Cubase-style). Only the tick
   // <-> time mapping bends to fit — the audio itself is never time-stretched.
   // See commitTempoDrag() (Tempo Map section, below) for the actual algorithm.
+  // Also reused (via the SAME tempoDrag object/commit function) when you grab
+  // an EXISTING tempo marker directly — no Alt needed there, since the marker
+  // itself is an unambiguous target. tempoDrag.isExistingMarker distinguishes
+  // the two on mouseup: a non-moved click on an existing marker opens its
+  // edit popover, whereas a non-moved Alt+click on a bare bar line is the
+  // create-a-TIME-SIGNATURE gesture instead (see tsMarkerDrag below) — Alt+
+  // drag = tempo (drag-to-set, since a time position is naturally something
+  // you drag to), Alt+click = time signature (type-to-set, since a numerator/
+  // denominator has no natural "drag distance").
   let tempoDrag=null;
+  // Dragging an EXISTING time-signature marker to a different bar. The
+  // un-removable bar-1 "start" marker can be clicked (to edit the project's
+  // starting signature) but never dragged — moving bar 1 doesn't mean
+  // anything, so tsMarkerDrag.isStart short-circuits movement tracking.
+  let tsMarkerDrag=null;
   const BAR_HIT_PX=8;
   function nearestBarLineTick(localX){
     const t=clamp(xToTick(localX),0,totalTicks());
@@ -2502,30 +2616,53 @@
     return Math.abs(tickToX(tick)-localX)<=BAR_HIT_PX ? tick : null;
   }
   rulerCanvas.addEventListener('mousedown',e=>{
+    const lx=rulerX(e), ly=rulerY(e);
+    const tsHit=hitTestMarkerList(tsMarkerHits,lx,ly);
+    if(tsHit){ tsMarkerDrag={tick0:tsHit.tick, isStart:tsHit.isStart, curLocalX:lx, moved:false}; requestDraw(); return; }
+    const tempoHit=hitTestMarkerList(tempoMarkerHits,lx,ly);
+    if(tempoHit){ tempoDrag={tick0:tempoHit.tick, isStart:tempoHit.isStart, curLocalX:lx, moved:false, isExistingMarker:true}; requestDraw(); return; }
     if(e.altKey){
-      const hit=barLineHitTest(rulerX(e));
-      if(hit!=null){ tempoDrag={tick0:hit, curLocalX:rulerX(e), moved:false}; requestDraw(); }
-      return; // Alt held: either started a tempo drag, or a deliberate no-op near no bar line
+      const hit=barLineHitTest(lx);
+      if(hit!=null){ tempoDrag={tick0:hit, curLocalX:lx, moved:false, isExistingMarker:false}; requestDraw(); }
+      return; // Alt held: either started a tempo drag / TS-create click, or a deliberate no-op near no bar line
     }
-    const x=rulerX(e); rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false};
+    const x=lx; rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false};
   });
   window.addEventListener('mousemove',e=>{
+    if(tsMarkerDrag){ tsMarkerDrag.curLocalX=rulerX(e); if(!tsMarkerDrag.isStart) tsMarkerDrag.moved=true; requestDraw(); return; }
     if(tempoDrag){ tempoDrag.curLocalX=rulerX(e); tempoDrag.moved=true; requestDraw(); return; }
     if(!rulerDrag) return;
     if(Math.abs(e.clientX-rulerDrag.startX)>4) rulerDrag.moved=true;
     if(rulerDrag.moved){ const t=clamp(snapLoc(xToTick(rulerX(e))),0,totalTicks());
       state.locStart=Math.min(rulerDrag.startT,t); state.locEnd=Math.max(rulerDrag.startT,t); updateLoopStatus(); requestDraw(); } });
   window.addEventListener('mouseup',()=>{
-    if(tempoDrag){ const d=tempoDrag; tempoDrag=null; if(d.moved) commitTempoDrag(d.tick0,d.curLocalX); requestDraw(); return; }
+    if(tsMarkerDrag){
+      const d=tsMarkerDrag; tsMarkerDrag=null;
+      if(d.isStart){ openTsMarkerPopover(0,true); requestDraw(); return; }
+      if(d.moved) moveTsMapChange(d.tick0,nearestBarLineTick(d.curLocalX));
+      else openTsMarkerPopover(d.tick0,false);
+      requestDraw(); return;
+    }
+    if(tempoDrag){
+      const d=tempoDrag; tempoDrag=null;
+      if(d.moved) commitTempoDrag(d.tick0,d.curLocalX);
+      else if(d.isExistingMarker) openTempoMarkerPopover(d.tick0,!!d.isStart);
+      else openTsMarkerPopover(d.tick0,false); // Alt+click (no drag) on a bare bar line: create a TS marker there
+      requestDraw(); return;
+    }
     if(!rulerDrag) return;
     if(!rulerDrag.moved){ state.playhead=clamp(rulerDrag.startT,0,totalTicks()); updatePlayPos(); updatePlayheadEl(); }
     rulerDrag=null; });
   rulerCanvas.addEventListener('mousemove',e=>{
     updateStatusPos(rulerX(e));
-    if(!rulerDrag&&!tempoDrag){
-      const overBar=e.altKey?barLineHitTest(rulerX(e)):null;
-      rulerCanvas.style.cursor=overBar!=null?'ew-resize':'';
-      rulerCanvas.title=overBar!=null?'Alt+drag to align this bar with a point in the audio waveform below (tempo bends to fit — audio is not time-stretched)':'';
+    if(!rulerDrag&&!tempoDrag&&!tsMarkerDrag){
+      const lx=rulerX(e), ly=rulerY(e);
+      const tsHit=hitTestMarkerList(tsMarkerHits,lx,ly), tempoHit=hitTestMarkerList(tempoMarkerHits,lx,ly);
+      const overBar=e.altKey?barLineHitTest(lx):null;
+      if(tsHit){ rulerCanvas.style.cursor=tsHit.isStart?'pointer':'grab'; rulerCanvas.title=tsHit.isStart?'Click to edit the project\'s starting time signature':'Click to edit or remove this time signature change — drag to move it to a different bar'; }
+      else if(tempoHit){ rulerCanvas.style.cursor=tempoHit.isStart?'pointer':'grab'; rulerCanvas.title=tempoHit.isStart?'Click to edit the project\'s starting tempo':'Click to edit or remove this tempo change — drag to re-align it with a point in the audio waveform'; }
+      else if(overBar!=null){ rulerCanvas.style.cursor='ew-resize'; rulerCanvas.title='Alt+drag to align this bar with a point in the audio waveform below (tempo bends to fit — audio is not time-stretched)\nAlt+click (no drag) to add a time-signature change at this bar'; }
+      else { rulerCanvas.style.cursor=''; rulerCanvas.title=''; }
     }
   });
   rulerCanvas.addEventListener('dblclick',()=>{ state.locStart=state.locEnd=null; updateLoopStatus(); requestDraw(); });
@@ -5220,10 +5357,13 @@
     renderTempoMapUI();
     updateVariabilityIndicators();
   }
-  function addTsMapChange(){
-    const bar=Math.max(1,Math.round(+$('tsMapBar').value||1))-1;
-    const num=clamp(Math.round(+$('tsMapNum').value||4),1,32);
-    const den=+$('tsMapDen').value||4;
+  // bar/num/den default to reading the Time Sig popover's own fields (the
+  // toolbar "+ Add" button's original behavior) — callers with their own
+  // values (the ruler marker popovers) pass them explicitly instead.
+  function addTsMapChange(bar,num,den){
+    if(bar==null) bar=Math.max(1,Math.round(+$('tsMapBar').value||1))-1;
+    if(num==null) num=clamp(Math.round(+$('tsMapNum').value||4),1,32);
+    if(den==null) den=+$('tsMapDen').value||4;
     pushUndo();
     const tick=bar===0?0:Math.round(barToTick(bar));
     const idx=state.tsMap.findIndex(s=>s.tick===tick);
@@ -5237,6 +5377,23 @@
     pushUndo();
     state.tsMap=state.tsMap.filter(s=>s.tick!==tick);
     updateDuration(); resizeCanvases(); renderTsMapUI(); requestDraw();
+  }
+  // Moves an existing time-signature breakpoint to a different (bar-aligned)
+  // tick, keeping its num/den — used when dragging a TS marker on the ruler.
+  // The un-removable bar-1 "start" entry can never be the source or the
+  // destination of a move.
+  function moveTsMapChange(oldTick,newTick){
+    if(oldTick<=0||newTick<=0||oldTick===newTick) return;
+    const idx=state.tsMap.findIndex(s=>s.tick===oldTick); if(idx<0) return;
+    pushUndo();
+    const entry={...state.tsMap[idx],tick:newTick};
+    state.tsMap.splice(idx,1);
+    const dupIdx=state.tsMap.findIndex(s=>s.tick===newTick);
+    if(dupIdx>=0) state.tsMap[dupIdx]=entry; else state.tsMap.push(entry);
+    state.tsMap.sort((a,b)=>a.tick-b.tick);
+    updateDuration(); resizeCanvases(); renderTsMapUI(); requestDraw();
+    const {bar}=walkToTick(newTick);
+    flash('Time signature moved to bar '+(bar+1));
   }
 
   // ---------- Tempo map UI (mirrors the Time Sig map UI above) ----------
@@ -5258,9 +5415,11 @@
       list.appendChild(row);
     });
   }
-  function addTempoMapChange(){
-    const bar=Math.max(1,Math.round(+$('tempoMapBar').value||1))-1;
-    const bpm=clamp(Math.round((+$('tempoMapBpm').value||120)*100)/100,20,400);
+  // bar/bpm default to reading the Tempo Map popover's own fields — callers
+  // with their own values (the ruler marker popovers) pass them explicitly.
+  function addTempoMapChange(bar,bpm){
+    if(bar==null) bar=Math.max(1,Math.round(+$('tempoMapBar').value||1))-1;
+    if(bpm==null) bpm=clamp(Math.round((+$('tempoMapBpm').value||120)*100)/100,20,400);
     pushUndo();
     const tick=bar===0?0:Math.round(barToTick(bar));
     const idx=state.tempoMap.findIndex(s=>s.tick===tick);
@@ -5275,6 +5434,92 @@
     state.tempoMap=state.tempoMap.filter(s=>s.tick!==tick);
     if(!state.tempoMap.length) state.tempoMap=[{tick:0,bpm:state.bpm}];
     updateDuration(); renderTsMapUI(); requestDraw();
+  }
+
+  // ---------- Marker-edit popovers (click a ruler TS/tempo marker) ----------
+  // Screen position for a floating popover anchored at a given tick, on the
+  // ruler's own vertical band — shared by both popovers below.
+  function markerPopoverPos(tick){
+    const r=rulerScroll.getBoundingClientRect();
+    return { left: r.left+tickToX(tick)-state.scrollLeft+GUTTER, top: r.bottom+3 };
+  }
+  function ensureTsMarkerPopover(){
+    let pop=$('tsMarkerPopover');
+    if(!pop){ pop=document.createElement('div'); pop.id='tsMarkerPopover'; document.body.appendChild(pop); }
+    return pop;
+  }
+  function closeTsMarkerPopover(){ const pop=$('tsMarkerPopover'); if(pop) pop.classList.remove('open'); }
+  // tick: the breakpoint's own tick if editing an existing one; for the Alt+
+  // click "create at this bare bar line" gesture, tick is where the NEW
+  // breakpoint would land (no existing entry there yet). isStart: the bar-1
+  // "start" marker — always editable, never removable.
+  function openTsMarkerPopover(tick,isStart){
+    const pop=ensureTsMarkerPopover(); pop.innerHTML='';
+    const existing=state.tsMap.find(s=>s.tick===tick);
+    const eff=existing||tsSegAt(tick); // no exact entry yet (Alt+click-create): prefill with the currently effective signature
+    const {bar}=walkToTick(tick);
+    const title=document.createElement('div'); title.className='marker-pop-title';
+    title.textContent=isStart?'Starting Time Signature':('Bar '+(bar+1)+' Time Signature');
+    pop.appendChild(title);
+    const row=document.createElement('div'); row.className='marker-pop-row';
+    const numI=document.createElement('input'); numI.type='number'; numI.min=1; numI.max=32; numI.value=eff.num; numI.style.width='48px';
+    const slash=document.createElement('span'); slash.textContent='/';
+    const denS=document.createElement('select'); denS.style.width='56px';
+    [2,4,8,16].forEach(d=>{ const o=document.createElement('option'); o.value=d; o.textContent=d; if(d===eff.den) o.selected=true; denS.appendChild(o); });
+    row.appendChild(numI); row.appendChild(slash); row.appendChild(denS);
+    pop.appendChild(row);
+    const actions=document.createElement('div'); actions.className='marker-pop-actions';
+    if(!isStart&&existing){ const rm=document.createElement('button'); rm.className='danger'; rm.textContent='Remove'; rm.title='Remove this time signature change';
+      rm.addEventListener('click',()=>{ removeTsMapChange(tick); closeTsMarkerPopover(); }); actions.appendChild(rm); }
+    const ok=document.createElement('button'); ok.textContent=existing?'Update':'Add';
+    ok.addEventListener('click',()=>{
+      const num=clamp(Math.round(+numI.value||4),1,32), den=+denS.value||4;
+      addTsMapChange(bar,num,den); closeTsMarkerPopover();
+    });
+    actions.appendChild(ok);
+    pop.appendChild(actions);
+    pop.classList.add('open');
+    const {left,top}=markerPopoverPos(tick);
+    const popW=pop.offsetWidth;
+    pop.style.left=Math.round(clamp(left,8,window.innerWidth-popW-8))+'px';
+    pop.style.top=Math.round(top)+'px';
+    numI.focus(); numI.select();
+  }
+  function ensureTempoMarkerPopover(){
+    let pop=$('tempoMarkerPopover');
+    if(!pop){ pop=document.createElement('div'); pop.id='tempoMarkerPopover'; document.body.appendChild(pop); }
+    return pop;
+  }
+  function closeTempoMarkerPopover(){ const pop=$('tempoMarkerPopover'); if(pop) pop.classList.remove('open'); }
+  function openTempoMarkerPopover(tick,isStart){
+    const pop=ensureTempoMarkerPopover(); pop.innerHTML='';
+    const existing=state.tempoMap.find(s=>s.tick===tick);
+    const eff=existing||tempoSegAt(tick);
+    const {bar}=walkToTick(tick);
+    const title=document.createElement('div'); title.className='marker-pop-title';
+    title.textContent=isStart?'Starting Tempo':('Bar '+(bar+1)+' Tempo');
+    pop.appendChild(title);
+    const row=document.createElement('div'); row.className='marker-pop-row';
+    const bpmI=document.createElement('input'); bpmI.type='number'; bpmI.min=20; bpmI.max=400; bpmI.step='0.01'; bpmI.value=Math.round(eff.bpm*100)/100; bpmI.style.width='72px';
+    const lbl=document.createElement('span'); lbl.textContent='BPM'; lbl.style.color='var(--txt2)';
+    row.appendChild(bpmI); row.appendChild(lbl);
+    pop.appendChild(row);
+    const actions=document.createElement('div'); actions.className='marker-pop-actions';
+    if(!isStart&&existing){ const rm=document.createElement('button'); rm.className='danger'; rm.textContent='Remove'; rm.title='Remove this tempo change';
+      rm.addEventListener('click',()=>{ removeTempoMapChange(tick); closeTempoMarkerPopover(); }); actions.appendChild(rm); }
+    const ok=document.createElement('button'); ok.textContent=existing?'Update':'Add';
+    ok.addEventListener('click',()=>{
+      const bpm=clamp(Math.round((+bpmI.value||120)*100)/100,20,400);
+      addTempoMapChange(bar,bpm); closeTempoMarkerPopover();
+    });
+    actions.appendChild(ok);
+    pop.appendChild(actions);
+    pop.classList.add('open');
+    const {left,top}=markerPopoverPos(tick);
+    const popW=pop.offsetWidth;
+    pop.style.left=Math.round(clamp(left,8,window.innerWidth-popW-8))+'px';
+    pop.style.top=Math.round(top)+'px';
+    bpmI.focus(); bpmI.select();
   }
   // Commits an Alt+drag-a-bar-line tempo-align gesture (see the rulerCanvas
   // mousedown handler above). tick0 is the ORIGINAL, unmoved tick of the bar
@@ -5336,6 +5581,16 @@
         tsNumEl.classList.remove('field-variable'); tsDenEl.classList.remove('field-variable'); sigBadge.classList.remove('show'); sigBadge.title='';
       }
     }
+    updateMapButtonLabels();
+  }
+  // Live labels on the Sig / Tempo Map toolbar buttons — always show the
+  // project's STARTING value (bar 1), with a trailing "…" once that map has
+  // more than one entry, so the button itself hints at variability even
+  // before you open the panel (the purple field/badge treatment above gives
+  // the full detail on hover).
+  function updateMapButtonLabels(){
+    const tsLbl=$('tsBtnLabel'); if(tsLbl){ const tm=tsMapSorted(); tsLbl.textContent=tm[0].num+'/'+tm[0].den+(tm.length>1?'…':''); }
+    const tempoLbl=$('tempoBtnLabel'); if(tempoLbl){ const tm=tempoMapSorted(); tempoLbl.textContent=Math.round(tm[0].bpm)+' BPM'+(tm.length>1?'…':''); }
   }
 
   // ---------- Inputs ----------
@@ -5587,8 +5842,8 @@
   $('recordBtn').onclick=toggleRecord;
   $('metroBtn').onclick=toggleMetronome;
   $('recCh').addEventListener('change',e=>{ state.recCh=e.target.value===''?null:+e.target.value; updateRecordBadge(); });
-  $('tsMapAddBtn').addEventListener('click',addTsMapChange);
-  $('tempoMapAddBtn').addEventListener('click',addTempoMapChange);
+  $('tsMapAddBtn').addEventListener('click',()=>addTsMapChange());
+  $('tempoMapAddBtn').addEventListener('click',()=>addTempoMapChange());
   $('recOffsetMs').addEventListener('input',e=>{ state.recOffsetMs=+e.target.value||0; });
   $('recordBtn').addEventListener('contextmenu',e=>{
     e.preventDefault(); e.stopPropagation();
@@ -7071,7 +7326,8 @@
     schedWorker=makeWorker();
     // Setup panel toggle
     $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
-    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtn').textContent=open?'𝄐 Time Sig ▴':'𝄐 Time Sig ▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); $('tempoMapBar').value=nearestBarAt(state.playhead); } });
+    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); } });
+    $('tempoBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tempoPanel'); const open=p.classList.toggle('open'); $('tempoBtn').classList.toggle('open',open); $('tempoBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTempoMapUI(); $('tempoMapBar').value=nearestBarAt(state.playhead); } });
     // Note Info manual minimize/maximize — same ▾/▸ two-state convention as
     // the CC lane toggle, independent of the existing auto-collapse (see
     // updateNoteInfo()); a UI-only in-memory preference, not persisted.
@@ -7538,14 +7794,17 @@
       el.addEventListener('input',e=>{ state[key]=clamp(+e.target.value||0,0,127); drawAbPreview(); });
     });
 
-    ensureChPopover(); ensureCcPopover();
+    ensureChPopover(); ensureCcPopover(); ensureTsMarkerPopover(); ensureTempoMarkerPopover();
     document.addEventListener('mousedown',e=>{ if(!$('setupWrapper').contains(e.target)){ $('setupPanel').classList.remove('open'); $('setupBtn').classList.remove('open'); $('setupBtn').textContent='⚙ Setup ▾'; }
-      if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtn').textContent='𝄐 Time Sig ▾'; }
+      if(!$('tsWrapper').contains(e.target)){ $('tsPanel').classList.remove('open'); $('tsBtn').classList.remove('open'); $('tsBtnCaret').textContent='▾'; }
+      if(!$('tempoWrapper').contains(e.target)){ $('tempoPanel').classList.remove('open'); $('tempoBtn').classList.remove('open'); $('tempoBtnCaret').textContent='▾'; }
       if(!$('recWrapper').contains(e.target)){ $('recPopover').classList.remove('open'); }
       if(!$('projWrapper').contains(e.target)){ $('projPopover').classList.remove('open'); }
       if(!$('chPopover').contains(e.target)){ closeChPopover(); }
-      if(!$('ccPopover').contains(e.target)){ closeCcPopover(); } });
-    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); closeChPopover(); closeCcPopover(); } });
+      if(!$('ccPopover').contains(e.target)){ closeCcPopover(); }
+      if(!$('tsMarkerPopover').contains(e.target)){ closeTsMarkerPopover(); }
+      if(!$('tempoMarkerPopover').contains(e.target)){ closeTempoMarkerPopover(); } });
+    document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ $('recPopover').classList.remove('open'); $('projPopover').classList.remove('open'); closeChPopover(); closeCcPopover(); closeTsMarkerPopover(); closeTempoMarkerPopover(); } });
     window.addEventListener('resize',resizeCanvases); resizeCanvases();
     attachGrip($('gripVel'), $('velRow'), ()=>velCanvas, ()=>velScroll, 'down');
     (()=>{ const sp=$('prSplitter'),pr=document.querySelector('.piano-row'); let spd=null;
@@ -7578,6 +7837,7 @@
     prScroll.scrollTop=pitchToY(84); state.scrollTop=prScroll.scrollTop;
     keysCanvas.style.transform='translateY('+(-state.scrollTop)+'px)'; prCanvas.style.transform='translate(0px,'+state.scrollTop+'px)';
     updatePlayheadEl(); updateUndoBtns(); updateLoopStatus(); updatePlayPos(); updateTransportBtns(); updateDuration();
+    updateMapButtonLabels();
     requestDraw();
     setupPWA();
     // Crash recovery: offer to restore a previous session's unsaved work,
