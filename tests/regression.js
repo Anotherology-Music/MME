@@ -6820,6 +6820,141 @@ async function run() {
       Math.abs(after.sec - 6) < 0.02 && Math.abs(after.map[0].bpm - 40) < 0.02, after);
   });
 
+  // ---------------- v0.9.34: undo holds the viewport; Alt+click pins tempo ----------------
+
+  await withPage(browser, async (page) => {
+    // applyState() destroys and rebuilds every lane row, which collapses
+    // #lanes' scrollHeight and so clamps its scrollTop to 0. Undoing an edit
+    // made at the bottom of a long lane stack used to fling the view back to
+    // the top of the list.
+    const ids = await page.evaluate(() => {
+      const out = [];
+      for (let i = 0; i < 12; i++) out.push(window._TEST_addLane(20 + i, 0));
+      return out;
+    });
+    await page.waitForTimeout(250);
+    const geo = await page.evaluate(() => {
+      const el = document.getElementById('lanes');
+      el.scrollTop = el.scrollHeight;
+      return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+    });
+    check('the lane pane genuinely overflows, so the scroll-preservation check below means something',
+      geo.scrollTop > 0 && geo.scrollHeight > geo.clientHeight, geo);
+    await page.evaluate((id) => {
+      window._TEST_pushUndo();
+      window._TEST_state.ccLanes.find(x => x.id === id).points.push({ t: 960, v: 100 });
+      window._TEST_requestDraw();
+    }, ids[ids.length - 1]);
+    await page.waitForTimeout(120);
+    const before = await page.evaluate(() => document.getElementById('lanes').scrollTop);
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(200);
+    const after = await page.evaluate(() => document.getElementById('lanes').scrollTop);
+    check('undoing an edit made at the bottom of a long lane stack leaves the lane pane scrolled where it was',
+      after === before && before > 0, { before, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // The beat-mapping workflow, end to end, exactly as a user performs it:
+    // Alt+click to pin the point where the tempo change should begin, then
+    // Alt+drag a later beat onto the waveform, then set that beat's marker
+    // back to the original tempo so the piece resumes at speed.
+    const setup = await page.evaluate(() => {
+      const S = window._TEST_state;
+      S.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      S.tempoMap = [{ tick: 0, bpm: 70 }];
+      S.bpm = 70; S.bars = 16; S.scrollLeft = 0; S.pxPerTick = 0.06;
+      window._TEST_requestDraw();
+      const ppq = S.ppq, bar4 = 3 * ppq * 4, bar5 = 4 * ppq * 4;
+      return { ppq, bar4, bar5, bar5X: window._TEST_tickToX(bar5),
+        dropX: window._TEST_tickToX(window._TEST_secondsToTicks(15.42)) };
+    });
+    const altClickAt = async (localX) => {
+      const p = await page.evaluate((x) => window._TEST_rulerScreenPos(x, 20), localX);
+      await page.keyboard.down('Alt');
+      await page.mouse.move(p.x, p.y); await page.mouse.down(); await page.mouse.up();
+      await page.keyboard.up('Alt');
+      await page.waitForTimeout(120);
+    };
+    // Step 1: pin bar 4. It must inherit 70 BPM and move nothing.
+    const bar4X = await page.evaluate((t) => window._TEST_tickToX(t), setup.bar4);
+    await altClickAt(bar4X);
+    const pinned = await page.evaluate((s) => ({
+      map: JSON.parse(JSON.stringify(window._TEST_state.tempoMap)),
+      bar4sec: window._TEST_tickToSeconds(s.bar4),
+      bar5sec: window._TEST_tickToSeconds(s.bar5),
+      tsPopover: !!document.querySelector('#tsMarkerPopover.open'),
+    }), setup);
+    check('Alt+click on a beat line pins a TEMPO point there (not a time-signature change)',
+      pinned.map.some(s => s.tick === setup.bar4) && !pinned.tsPopover, pinned);
+    check('the pinned point inherits the governing tempo, so pinning on its own retimes nothing',
+      Math.abs(pinned.map.find(s => s.tick === setup.bar4).bpm - 70) < 0.01 &&
+      Math.abs(pinned.bar4sec - 10.2857) < 0.01 && Math.abs(pinned.bar5sec - 13.7143) < 0.01, pinned);
+
+    // Step 2: Alt+drag bar 5 onto the 15.42s point in the waveform.
+    const from = await page.evaluate((x) => window._TEST_rulerScreenPos(x, 20), setup.bar5X);
+    const to = await page.evaluate((x) => window._TEST_rulerScreenPos(x, 20), setup.dropX);
+    await page.keyboard.down('Alt');
+    await page.mouse.move(from.x, from.y); await page.mouse.down();
+    await page.mouse.move((from.x + to.x) / 2, from.y, { steps: 5 });
+    await page.mouse.move(to.x, from.y, { steps: 5 });
+    await page.mouse.up();
+    await page.keyboard.up('Alt');
+    await page.waitForTimeout(200);
+    const dragged = await page.evaluate((s) => ({
+      map: JSON.parse(JSON.stringify(window._TEST_state.tempoMap)),
+      bar4sec: window._TEST_tickToSeconds(s.bar4),
+      bar5sec: window._TEST_tickToSeconds(s.bar5),
+      // where the 15.42s moment now sits on screen vs bar 5's line
+      momentX: window._TEST_tickToX(window._TEST_secondsToTicks(15.42)),
+      bar5X: window._TEST_tickToX(s.bar5),
+    }), setup);
+    // 1px at this zoom is ~0.09s, so the drop lands within a pixel of 15.42.
+    check('Alt+dragging bar 5 onto the waveform lands it at that wall-clock time',
+      Math.abs(dragged.bar5sec - 15.42) < 0.1, dragged);
+    check('the drag re-tempos only the stretch since the pin — everything before the pin is untouched',
+      Math.abs(dragged.bar4sec - 10.2857) < 0.01 &&
+      Math.abs(dragged.map.find(s => s.tick === 0).bpm - 70) < 0.01, dragged);
+    check('after the drag, the audio moment and bar 5\'s line sit on the same pixel',
+      Math.abs(dragged.momentX - dragged.bar5X) < 1.5, dragged);
+
+    // Step 3: set bar 5's marker back to 70 BPM — the piece resumes at speed
+    // without bar 5 itself moving.
+    await page.evaluate((b5) => window._TEST_setTempoAtTick(b5, 70), setup.bar5);
+    await page.waitForTimeout(120);
+    const resumed = await page.evaluate((s) => ({
+      bar5sec: window._TEST_tickToSeconds(s.bar5),
+      bar6sec: window._TEST_tickToSeconds(5 * s.ppq * 4),
+    }), setup);
+    check('setting the landed beat back to the original BPM resumes tempo without moving that beat',
+      Math.abs(resumed.bar5sec - 15.42) < 0.1 &&
+      Math.abs((resumed.bar6sec - resumed.bar5sec) - (4 * 60 / 70)) < 0.02, resumed);
+  });
+
+  await withPage(browser, async (page) => {
+    // Pinning twice in a row is the "loose orchestral performance" case: each
+    // new pin bounds the next drag, so drags never reach back past the last pin.
+    await page.evaluate(() => {
+      const S = window._TEST_state;
+      S.tempoMap = [{ tick: 0, bpm: 70 }]; S.bpm = 70; S.bars = 16;
+      S.scrollLeft = 0; S.pxPerTick = 0.06;
+      window._TEST_requestDraw();
+    });
+    const ppq = await page.evaluate(() => window._TEST_state.ppq);
+    for (const bar of [2, 3]) {
+      const x = await page.evaluate((t) => window._TEST_tickToX(t), bar * ppq * 4);
+      const p = await page.evaluate((lx) => window._TEST_rulerScreenPos(lx, 20), x);
+      await page.keyboard.down('Alt');
+      await page.mouse.move(p.x, p.y); await page.mouse.down(); await page.mouse.up();
+      await page.keyboard.up('Alt');
+      await page.waitForTimeout(120);
+    }
+    const map = await page.evaluate(() => JSON.parse(JSON.stringify(window._TEST_state.tempoMap)));
+    check('repeated Alt+clicks accumulate independent tempo pins, all at the inherited BPM',
+      map.length === 3 && map.every(s => Math.abs(s.bpm - 70) < 0.01) &&
+      map.some(s => s.tick === 2 * ppq * 4) && map.some(s => s.tick === 3 * ppq * 4), map);
+  });
+
   // ---------------- Drum Map (.drm) import ----------------
 
   // A minimal Cubase-shaped drum map: one generic "Sound N" placeholder, one

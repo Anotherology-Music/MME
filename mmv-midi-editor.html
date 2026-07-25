@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.33
+  MMV MIDI & CC Curve Editor v0.9.34
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -713,6 +713,29 @@
   Align, and MME re-tempos the stretch since the previous tempo marker to get
   it there. The audio is never moved or time-stretched, and material after
   the aligned beat keeps its original tempo.
+
+  v0.9.34 — Beat-mapping: Alt+click now pins a TEMPO point, and undo holds
+  the viewport.
+
+  Alt+click on a ruler beat line used to open the time-SIGNATURE popover.
+  That left no cheap way to place the tempo point that bounds a subsequent
+  Alt+drag, and without such a bound alignTempoToTime() reaches all the way
+  back to bar 1 — so aligning, say, bar 5 to the audio silently re-tempoed
+  bars 1-4 as well and pulled the earlier material out of sync. Alt+click now
+  pins a tempo breakpoint at the beat under the cursor, inheriting whatever
+  tempo already governs that tick: the click retimes nothing on its own, it
+  just marks where the next drag is allowed to start bending. The beat-mapping
+  loop is then pin, drag, pin, drag — which is what matching a loose
+  orchestral performance actually requires. Time-signature changes are added
+  from the Time Sig panel's "At bar / + Add" row, which already existed.
+
+  Undo/redo no longer moves the viewport. applyState() rebuilds every lane
+  row, which collapses the lane pane's scroll height and so clamped its
+  scrollTop to 0 — undoing an edit made at the bottom of a long lane stack
+  threw the view back to the top. captureViewState()/restoreViewState() now
+  carry the lane pane's and piano roll's vertical scroll across the rebuild,
+  and focus is restored with preventScroll so re-focusing a field inside the
+  lane pane cannot scroll it into view either.
 -->
 
 
@@ -1578,7 +1601,7 @@
         <button id="tsBtn" class="map-btn" title="Add, move or remove time signature changes anywhere in the project. Click a marker on the ruler to edit it in place, or drag it to a different bar.">𝄐 <span id="tsBtnLabel">4/4</span> <span id="tsBtnCaret">▾</span></button>
         <div id="tsPanel">
           <div class="setup-title">Time Signature Changes</div>
-          <div style="font-size:11px;color:var(--txt2);">Notes keep their real-world timing (mm:ss) — only bar/beat numbering shifts. Click a marker on the ruler (left of its bar line) to edit or remove it; Alt+click an empty bar line to add one there.</div>
+          <div style="font-size:11px;color:var(--txt2);">Notes keep their real-world timing (mm:ss) — only bar/beat numbering shifts. Click a marker on the ruler (left of its bar line) to edit or remove it; add a new one with the At bar / + Add row below.</div>
           <div id="tsMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
           <div class="setup-row">
             <span class="lbl">At bar</span><input type="number" id="tsMapBar" value="1" min="1" style="width:56px;">
@@ -1596,7 +1619,7 @@
         </button>
         <div id="tempoPanel">
           <div class="setup-title">Tempo Map</div>
-          <div style="font-size:11px;color:var(--txt2);">Alt+drag a bar line on the ruler to align it with the audio waveform — tempo bends to fit, audio is never time-stretched. Click a marker (right of its bar line) to edit or remove it, or drag it to re-align.</div>
+          <div style="font-size:11px;color:var(--txt2);">Beat-map to audio: <b>Alt+click</b> a beat line to pin a tempo point there (BPM unchanged), then <b>Alt+drag</b> a later beat onto the waveform where it belongs — only the stretch between the two is re-tempoed. Audio is never moved or time-stretched. Click a marker to edit or remove it.</div>
           <div id="tempoMapList" style="display:flex;flex-direction:column;gap:3px;font-size:11px;"></div>
           <div class="setup-row">
             <span class="lbl">At bar</span><input type="number" id="tempoMapBar" value="1" min="1" style="width:56px;">
@@ -2306,7 +2329,13 @@
     });
     const activeLane=state.ccLanes.find(l=>l.id===state.activeLaneId);
     const activePtT=activeLane&&activeLane._activePt?activeLane._activePt.t:null;
-    return {focus,ccSelByLane,activeLaneId:state.activeLaneId,activePtT};
+    // Scroll positions of the two vertically-scrollable panes. applyState()
+    // destroys and rebuilds every lane row, which collapses #lanes' content
+    // height and so clamps its scrollTop to 0 — undoing an edit made at the
+    // bottom of a long lane stack would otherwise fling the view back to the
+    // top. Restored in restoreViewState() after the rebuild.
+    return {focus,ccSelByLane,activeLaneId:state.activeLaneId,activePtT,
+      lanesScrollTop:$('lanes')?$('lanes').scrollTop:0, prScrollTop:prScroll?prScroll.scrollTop:0};
   }
   function restoreViewState(v){
     if(!v) return;
@@ -2336,11 +2365,23 @@
         }
       }
       if(el){
-        el.focus();
+        // preventScroll: focusing an input inside #lanes otherwise scrolls it
+        // into view, which is a second, independent way undo/redo used to
+        // move the viewport out from under you.
+        try{ el.focus({preventScroll:true}); }catch(e){ el.focus(); }
         if(typeof el.setSelectionRange==='function' && v.focus.selStart!=null){
           try{ el.setSelectionRange(v.focus.selStart,v.focus.selEnd); }catch(e){}
         }
       }
+    }
+    // After the lane DOM rebuild, put both scrollers back where they were.
+    // Assigning past the current scrollHeight is harmless (the browser clamps),
+    // so no need to guard against a now-shorter lane stack.
+    const lanesEl=$('lanes');
+    if(lanesEl && v.lanesScrollTop!=null) lanesEl.scrollTop=v.lanesScrollTop;
+    if(prScroll && v.prScrollTop!=null && prScroll.scrollTop!==v.prScrollTop){
+      prScroll.scrollTop=v.prScrollTop; state.scrollTop=prScroll.scrollTop;
+      keysCanvas.style.transform='translateY('+(-state.scrollTop)+'px)';
     }
     requestDraw();
   }
@@ -2899,10 +2940,7 @@
     if(tempoHit){ tempoDrag={tick0:tempoHit.tick, isStart:tempoHit.isStart, curLocalX:lx, moved:false, isExistingMarker:true}; requestDraw(); return; }
     if(e.altKey){
       const hit=beatLineHitTest(lx);
-      // barTick: where a no-drag Alt+CLICK would create a time-signature
-      // change instead — always the nearest bar line, even when the beat line
-      // actually grabbed is mid-bar.
-      if(hit!=null){ tempoDrag={tick0:hit, barTick:nearestBarLineTick(lx), curLocalX:lx, moved:false, isExistingMarker:false}; altBeatHint=null; requestDraw(); }
+      if(hit!=null){ tempoDrag={tick0:hit, curLocalX:lx, moved:false, isExistingMarker:false}; altBeatHint=null; requestDraw(); }
       return; // Alt held: either started a tempo drag / TS-create click, or a deliberate no-op near no beat line
     }
     const x=lx; rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false};
@@ -2926,7 +2964,16 @@
       const d=tempoDrag; tempoDrag=null;
       if(d.moved) commitTempoDrag(d.tick0,d.curLocalX);
       else if(d.isExistingMarker) openTempoMarkerPopover(d.tick0,!!d.isStart);
-      else openTsMarkerPopover(d.barTick!=null?d.barTick:d.tick0,false); // Alt+click (no drag) on a bare beat line: create a TS marker at that bar
+      // Alt+click (no drag) on a bare beat line: drop a tempo breakpoint there
+      // that INHERITS the tempo currently governing that tick, so the click on
+      // its own changes nothing you can hear — it only pins the point, which is
+      // what makes the next Alt+drag affect just the stretch since this pin
+      // rather than reaching all the way back to bar 1. That pin-then-drag pair
+      // is the whole beat-mapping workflow, so it gets the cheap gesture; time
+      // -signature changes are added from the Time Sig panel's "At bar / + Add"
+      // row instead (they are far rarer, and a numerator/denominator has to be
+      // typed anyway).
+      else if(d.tick0>0) addTempoPinAt(d.tick0);
       requestDraw(); return;
     }
     if(!rulerDrag) return;
@@ -2937,7 +2984,7 @@
   // was down, so there was no way to find out the gesture existed). Holding
   // Alt additionally switches the cursor and highlights the beat line that
   // would be grabbed, so the target is unambiguous before the drag starts.
-  const TEMPO_DRAG_TIP='Alt+drag this beat line onto the point in the audio waveform where it belongs — MME works out the BPM needed to get there, for the stretch since the previous tempo marker. The audio is never moved or time-stretched.\nAlt+click (no drag) to add a time-signature change at this bar.';
+  const TEMPO_DRAG_TIP='Alt+drag this beat line onto the point in the audio waveform where it belongs — MME works out the BPM needed to get there, for the stretch since the previous tempo point. The audio is never moved or time-stretched; the bars bend to meet it.\nAlt+click (no drag) to pin a tempo point here at the current BPM, so a later drag only bends the stretch after this pin.';
   rulerCanvas.addEventListener('mousemove',e=>{
     updateStatusPos(rulerX(e));
     if(!rulerDrag&&!tempoDrag&&!tsMarkerDrag){
@@ -6074,6 +6121,20 @@
   // was released at, resolved against the CURRENT (pre-edit) tick<->time
   // mapping to get the wall-clock instant it should land on.
   function commitTempoDrag(tick0,dropLocalX){ return alignTempoToTime(tick0,tickToSeconds(xToTick(dropLocalX))); }
+  // Alt+click on a beat line: pin a tempo breakpoint there WITHOUT changing
+  // any timing. It inherits whatever tempo already governs that tick, so the
+  // click is audibly a no-op; what it buys you is a boundary. alignTempoToTime()
+  // only re-tempos the stretch back to the nearest preceding breakpoint, so
+  // pinning the beat where you want the tempo change to begin is what stops a
+  // later drag from rewriting the whole piece from bar 1. Beat-mapping a loose
+  // performance is then just: pin, drag, pin, drag, ...
+  function addTempoPinAt(tick){
+    tick=Math.max(0,Math.round(tick));
+    if(state.tempoMap.some(s=>s.tick===tick)){ openTempoMarkerPopover(tick,tick===0); return; }
+    const bpm=tempoSegAt(tick).bpm;
+    setTempoAtTick(tick,bpm);
+    flash('Tempo point pinned at '+tickToBarBeat(tick)+' ('+bpm+' BPM — unchanged). Alt+drag a later beat onto the waveform to bend just this stretch.');
+  }
   // The tempo-matching primitive both the ruler drag and the tempo popover's
   // "Align to" field go through: make `tick0` fall at `newSeconds` on the
   // clock. Only the segment immediately before tick0 changes tempo —
