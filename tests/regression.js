@@ -7364,6 +7364,102 @@ async function run() {
     await page.evaluate(() => { const d = document.getElementById('isfDialog'); d.close(); d.remove(); });
   });
 
+  // ---------------- v0.9.38: three reported cosmetic defects ----------------
+  await withPage(browser, async (page) => {
+    // (a) The piano keys sit in a left column OUTSIDE #prScroll, kept aligned
+    // by a transform, so a plain wheel over them had no scroll container to
+    // act on and did nothing. Ctrl/Alt gestures worked because they drive the
+    // app's own zoom state instead.
+    const wheel = await page.evaluate(async () => {
+      const pr = document.getElementById('prScroll');
+      pr.scrollTop = 400;
+      const before = pr.scrollTop;
+      const keys = document.getElementById('keysCol');
+      const r = keys.getBoundingClientRect();
+      keys.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: 120, bubbles: true, cancelable: true,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+      }));
+      await new Promise(res => setTimeout(res, 60));
+      return { before, after: pr.scrollTop };
+    });
+    check('a plain mouse wheel over the piano keys scrolls the piano roll, as it does over the grid',
+      wheel.after > wheel.before, wheel);
+
+    // Still no hijacking of the modifier gestures, which already worked.
+    const wheelZoom = await page.evaluate(async () => {
+      const before = window._TEST_state.noteHeight;
+      const keys = document.getElementById('keysCol');
+      const r = keys.getBoundingClientRect();
+      keys.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: -120, altKey: true, bubbles: true, cancelable: true,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+      }));
+      await new Promise(res => setTimeout(res, 60));
+      return { before, after: window._TEST_state.noteHeight };
+    });
+    check('Alt+wheel over the piano keys still zooms vertically rather than scrolling',
+      wheelZoom.after !== wheelZoom.before, wheelZoom);
+
+    // (b) A three-digit CC value was clipping the last glyph.
+    const val = await page.evaluate(() => {
+      const id = window._TEST_addLane(21, 0);
+      const lane = window._TEST_state.ccLanes.find(l => l.id === id);
+      const inp = lane._row.querySelector('.val-input');
+      inp.value = '125';
+      return { w: Math.round(inp.getBoundingClientRect().width),
+        clipped: inp.scrollWidth > inp.clientWidth + 1 };
+    });
+    check('a three-digit CC value is not clipped in the lane V field', !val.clipped, val);
+
+    // (c) #midiInsertAt is type=text, and the shared input rule only covered
+    // number and select — so green --pos text landed on the browser's default
+    // white background.
+    const ins = await page.evaluate(() => {
+      const el = document.getElementById('midiInsertAt');
+      const cs = getComputedStyle(el);
+      const m = cs.backgroundColor.match(/\d+/g).map(Number);
+      return { bg: cs.backgroundColor, luma: (m[0] * 299 + m[1] * 587 + m[2] * 114) / 1000 };
+    });
+    check('the Insert at field uses the app\'s dark input styling, not green on white',
+      ins.luma < 90, ins);
+
+    // The option named an abstraction ("the View CH channel") that forced you
+    // back to the main window to find out what it meant.
+    const named = await page.evaluate(() => {
+      window._TEST_state.channelNames[9] = 'Drums';
+      window._TEST_state.viewCh = 9;
+      window._TEST_refreshSetupPanelDynamics();
+      return { opt: document.getElementById('midiInsertChMode').options[0].textContent,
+        lbl: document.getElementById('midiInsertChLbl').textContent };
+    });
+    check('the insert-channel option names the channel in focus instead of saying "the View CH channel"',
+      /Ch10/.test(named.opt) && /Drums/.test(named.opt), named);
+
+    // View CH = All has no single channel to mean. It resolves to the default
+    // channel and says so, rather than silently picking one.
+    const allCase = await page.evaluate(() => {
+      window._TEST_state.viewCh = null;
+      window._TEST_refreshSetupPanelDynamics();
+      return { opt: document.getElementById('midiInsertChMode').options[0].textContent,
+        lbl: document.getElementById('midiInsertChLbl').textContent,
+        title: document.getElementById('midiInsertChLbl').title };
+    });
+    check('with View CH set to All the option says which channel it resolves to, and why',
+      /All/.test(allCase.opt) && /Ch1\b/.test(allCase.opt) && /All/.test(allCase.lbl)
+      && /default channel/i.test(allCase.title), allCase);
+
+    // Ch 10..16 wrapped onto two lines in the Channel Names grid.
+    const chLbl = await page.evaluate(() => {
+      const rows = document.querySelectorAll('#chNamesGrid > div');
+      const last = rows[rows.length - 1];
+      const span = last.querySelector('span');
+      return { text: span.textContent, h: Math.round(span.getBoundingClientRect().height),
+        rowH: Math.round(last.getBoundingClientRect().height) };
+    });
+    check('the Ch 16 label in Channel Names fits on one line', chLbl.h < 22, chLbl);
+  });
+
   // ---------------- Drum Map (.drm) import ----------------
 
   // A minimal Cubase-shaped drum map: one generic "Sound N" placeholder, one

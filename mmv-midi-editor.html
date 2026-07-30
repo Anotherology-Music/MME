@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.37
+  MMV MIDI & CC Curve Editor v0.9.38
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -859,6 +859,40 @@
   Note Names removes the names for one channel or all of them, defaulting to the
   channel you are looking at, and is undoable with Ctrl+Z.
 
+
+  v0.9.38 Three reported cosmetic defects, and the Setup panel tidied.
+
+  A plain mouse wheel over the piano keys did nothing, while Ctrl and Alt
+  gestures over the same keys worked fine. The keys are a left column OUTSIDE
+  the piano-roll scroller — they are kept aligned by a transform rather than by
+  living inside it — so an unmodified wheel had no scroll container to act on,
+  whereas the modifier gestures drive the app's own zoom state and never needed
+  one. The wheel now forwards to the piano roll, so the keys behave like the
+  grid beside them.
+
+  A three-digit CC value clipped the last digit in a lane's V field; it is
+  slightly wider. The Setup panel's "Insert at" field showed green text on
+  white: it is the panel's only bare text input, and the shared input styling
+  covered number and select but not text. Fixed for the panel rather than
+  globally, because `input[type=text]` outranks a class and would otherwise
+  take over the Note Info Position field's padding and clip a full
+  Bar.Beat.16th.Tick value there — which it duly did, and a pre-existing test
+  caught it.
+
+  The IMPORT / EXPORT sub-headings were grey and the group read as one
+  undifferentiated block. They now use the same amber as section titles for
+  their left rule, each sub-section is separated by a divider rather than by
+  colour alone, every label and caption is one size (they had drifted between
+  9, 10 and 11px), and panel buttons get a lighter face so they stop reading as
+  text. "Ch 10:" to "Ch 16:" in Channel Names were wrapping onto two lines and
+  no longer do.
+
+  The insert-channel option named an abstraction — "onto the View CH channel" —
+  which meant looking back at the main window to find out what it meant. It now
+  names the channel: "onto Ch10 (Drums)". When View CH is All there is no single
+  channel to mean, so it resolves to the default channel and says so, in the
+  option and in the readout beside it, rather than picking one silently.
+
 -->
 
 
@@ -933,13 +967,29 @@
      instead of the amber that means "section", and set in from the section's
      left edge with a rule so the grouping reads structurally rather than
      relying on the colour difference alone. */
-  .setup-subtitle{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);
-    margin-top:5px;padding-left:7px;border-left:2px solid var(--line);}
-  .setup-subtitle:first-of-type{margin-top:1px;}
+  .setup-subtitle{font-size:10px;font-weight:700;letter-spacing:.10em;text-transform:uppercase;color:var(--txt);
+    margin-top:12px;margin-bottom:5px;padding-left:8px;border-left:2px solid var(--accent2);}
+  .setup-subtitle:first-of-type{margin-top:2px;}
+  /* The sub-sections needed separating from each other, not just labelling:
+     with three of them stacked, a grey label alone left the buttons, notes and
+     controls reading as one undifferentiated block. A rule above each one and
+     a consistent 11px for every label and note in the group does more for
+     legibility than the heading colour did. */
+  .setup-subtitle:not(:first-of-type){border-top:1px solid var(--line);padding-top:11px;margin-left:-2px;}
   /* Rows belonging to a sub-section line up under its rule rather than under
      the section title, so the visual hierarchy survives the flex-wrap. */
-  .setup-sub-row{padding-left:9px;}
-  .setup-note{font-size:11px;color:var(--txt2);line-height:1.35;padding-left:9px;max-width:100%;}
+  .setup-sub-row{padding-left:10px;}
+  .setup-note{font-size:11px;color:var(--txt2);line-height:1.4;padding-left:10px;max-width:100%;}
+  /* One type size for every label, radio and checkbox caption in the panel.
+     They had drifted between 9, 10 and 11px, which is what made the group look
+     unconsidered rather than dense. */
+  #setupPanel .setup-row label,#setupPanel .setup-row .lbl,
+  #setupPanel .setup-sub-row label,#setupPanel .setup-sub-row .lbl{font-size:11px;}
+  /* Buttons carried the same background as the panel, so they read as text
+     with a faint outline. A lighter face and a stronger border makes the
+     actionable things in the panel look actionable. */
+  #setupPanel button{background:var(--panel3,#262b34);border-color:var(--line2,#3a404e);}
+  #setupPanel button:hover{border-color:var(--accent);}
   .setup-note svg{vertical-align:-2px;}
   .setup-opt{font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;}
   .setup-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
@@ -1051,6 +1101,14 @@
     border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:12px;}
   input[type=number]{width:56px;}
   select{max-width:170px;}
+  /* Text inputs inside the Setup panel only. The shared rule above covers
+     number and select; #midiInsertAt is the panel's one bare text input and
+     was rendering green --pos text on the browser's default white. Scoped
+     rather than added to the shared rule because `input[type=text]` outranks a
+     class, and would quietly take over .ni-input's padding in the Note Info
+     bar — which clipped a full Bar.Beat.16th.Tick value there. */
+  #setupPanel input[type=text]{background:var(--panel2);color:var(--txt);
+    border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:12px;}
   button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
     border-radius:5px;padding:5px 9px;font-size:12px;cursor:pointer;white-space:nowrap;}
   button:hover{border-color:var(--accent);}
@@ -1425,7 +1483,7 @@
   .lane .leftcol .row2-right{display:flex;align-items:center;gap:3px;min-width:0;flex-shrink:0;}
   .lane .leftcol .row2 .mini-lbl{font-size:10px;color:var(--txt2);flex-shrink:0;}
   .lane .leftcol .step-badge{color:var(--txt2);opacity:.8;font-size:9px;flex-shrink:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40px;}
-  .lane .leftcol .val-input{flex:0 1 40px;width:40px;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:4px;}
+  .lane .leftcol .val-input{flex:0 1 48px;width:48px;min-width:0;padding:1px 4px;font-size:10px;background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:4px;}
   /* Widened to comfortably fit the largest realistic BBT string,
      "1234.12.12.123" (4-digit bar.beat.16th.tick) — measured at ~84px wide
      in this exact font/size (10px ui-monospace/Consolas/monospace); 100px
@@ -1655,7 +1713,7 @@
               <input type="radio" name="midiImportMode" id="midiImportInsert" value="insert"> Insert
             </label>
             <select id="midiInsertChMode" disabled style="width:172px;" title="Which MIDI channel the inserted data lands on">
-              <option value="viewch">onto the View CH channel</option>
+              <option value="viewch">onto the View CH channel</option><!-- relabelled live by refreshSetupPanelDynamics -->
               <option value="keep">keeping the file's channels</option>
               <option value="free">remapped to free channels</option>
             </select>
@@ -6776,7 +6834,24 @@
   // that are edited further down this same panel.
   function refreshSetupPanelDynamics(){
     if(!$('midiImportInsert').checked||document.activeElement!==$('midiInsertAt')) $('midiInsertAt').value=tickToBBT(state.playhead);
-    $('midiInsertChLbl').textContent=chLabelFor(focusCh())+(state.viewCh==null?' (View CH: All)':'');
+    // Name the channel in the option itself rather than making you look back
+    // at the main window to find out what "View CH" currently is. When View CH
+    // is All there is no single channel to mean, so it resolves to the default
+    // channel and says so — silently picking one would be worse than either
+    // naming it or refusing.
+    const all=state.viewCh==null;
+    const fc=focusCh();
+    const chModeSel=$('midiInsertChMode');
+    if(chModeSel&&chModeSel.options.length){
+      chModeSel.options[0].textContent=all
+        ? ('onto '+chLabelFor(fc)+' (View CH is All)')
+        : ('onto '+chLabelFor(fc));
+    }
+    const lbl=$('midiInsertChLbl');
+    lbl.textContent=all?('All \u2192 '+chLabelFor(fc)):chLabelFor(fc);
+    lbl.title=all
+      ? 'View CH is set to All, so there is no single channel in focus. Inserted data goes to the default channel, '+chLabelFor(fc)+'. Pick a specific View CH, or choose "keeping the file\u2019s channels", if that is not what you want.'
+      : 'The channel currently in focus in the main window.';
     populateClearNamesCh();
     updateMidiImportModeUI();
   }
@@ -10151,6 +10226,17 @@
       window.addEventListener('mouseup',()=>{ if(spd){ spd=null; sp.classList.remove('dragging'); document.body.style.cursor=''; } }); })();
     document.querySelector('.editor').addEventListener('wheel',e=>{
       if(e.ctrlKey){ e.preventDefault(); zoomHAt(e.deltaY<0?1.12:1/1.12, e.clientX); return; }
+      // The piano keys live in a left column OUTSIDE #prScroll — they are kept
+      // aligned by a transform, not by being inside the scroller — so a plain
+      // wheel over them has nothing to scroll and did nothing at all. The
+      // modifier gestures worked because they act on the app's own zoom state
+      // rather than on a scroll container. Forward the scroll to the piano
+      // roll so the keys behave like the grid beside them.
+      if(!e.shiftKey&&!e.altKey&&e.target.closest&&e.target.closest('#keysCol')){
+        e.preventDefault();
+        prScroll.scrollTop+=e.deltaY;
+        return;
+      }
       if(e.shiftKey){ e.preventDefault(); masterScroll.scrollLeft+=e.deltaY||e.deltaX; return; }
       if(e.altKey){ e.preventDefault(); const f=e.deltaY<0?1.12:1/1.12;
         const laneEl=e.target.closest&&e.target.closest('.lane');
@@ -10162,7 +10248,7 @@
     const grid=$('chNamesGrid');
     if(grid){ for(let i=0;i<16;i++){
       const row=document.createElement('div'); row.style.cssText='display:flex;align-items:center;gap:4px;';
-      const lbl=document.createElement('span'); lbl.textContent='Ch '+(i+1)+':'; lbl.style.cssText='font-size:11px;color:var(--txt2);width:32px;flex-shrink:0;';
+      const lbl=document.createElement('span'); lbl.textContent='Ch '+(i+1)+':'; lbl.style.cssText='font-size:11px;color:var(--txt2);width:42px;flex-shrink:0;white-space:nowrap;';
       const inp=document.createElement('input'); inp.type='text'; inp.value=state.channelNames[i];
       inp.style.cssText='flex:1;font-size:11px;padding:2px 4px;'; inp.placeholder='(none)';
       inp.addEventListener('input',()=>{ state.channelNames[i]=inp.value; populateViewCh(); });
