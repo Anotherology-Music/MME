@@ -133,6 +133,20 @@ function buildTestHtml() {
       '  window._TEST_noteNameToPitch = (s) => noteNameToPitch(s);',
       '  window._TEST_parseNoteNameCsv = (t) => parseNoteNameCsv(t);',
       '  window._TEST_handleNoteNameCsvFile = (text, name) => handleNoteNameCsvFile(new File([text], name, { type: "text/csv" }));',
+      // ── CC macros. Every one of these lives in the same top-level scope as
+      // snapshot()/state, which is exactly the scope this init(); anchor
+      // injects into — unlike the ISF helpers below, which need their own.
+      '  window._TEST_captureMacro = (name, laneIds) => { const m = captureMacro(name, laneIds); return m ? m.id : null; };',
+      '  window._TEST_macros = () => JSON.parse(JSON.stringify(state.macros || []));',
+      '  window._TEST_showMacroCaptureDialog = () => showMacroCaptureDialog();',
+      '  window._TEST_assignMacroToNote = (noteId, macroId) => assignMacroToNote(state.notes.find(n => n.id === noteId), macroById(macroId));',
+      '  window._TEST_resyncMacros = () => resyncMacros();',
+      '  window._TEST_laneValueAt = (laneId, t) => laneValueAt(state.ccLanes.find(l => l.id === laneId), t);',
+      '  window._TEST_lanePoints = (laneId) => { const l = state.ccLanes.find(x => x.id === laneId); return l ? JSON.parse(JSON.stringify(l.points)) : null; };',
+      '  window._TEST_noteById = (id) => { const n = state.notes.find(x => x.id === id); return n ? { ...n } : null; };',
+      '  window._TEST_addNote = (o) => { const n = Object.assign({ id: state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 }, o); state.notes.push(n); return n.id; };',
+      '  window._TEST_selectNotes = (ids) => { state.selection.clear(); ids.forEach(i => state.selection.add(i)); state.focus = "piano"; updateNoteInfo(); requestDraw(); };',
+      '  window._TEST_getCss = (v) => getCss(v);',
       '  init();',
     ].join('\n')
   );
@@ -1398,12 +1412,15 @@ async function run() {
     // Note Info is a true single row (v0.9.13, replacing the old header-row
     // + 4-column-grid layout; the "Note Info" title itself was removed in
     // v0.9.19 to make room for the Len field): toggle, note details, V
-    // label+value, Len label+value, Position, Channel button — all direct
-    // children of #noteInfoLeft .ni-row, in that left-to-right order.
+    // label+value, Len label+value, Position, Channel button, and finally
+    // the CC-macro badge — all direct children of #noteInfoLeft .ni-row, in
+    // that left-to-right order. The macro badge is last and hidden outright
+    // unless the selection carries a macro, so the row is byte-for-byte as
+    // compact as before for the notes that have none.
     const order = await page.evaluate(() =>
       [...document.querySelectorAll('#noteInfoLeft .ni-row > *')].map(el => el.id || el.className));
-    check('Note Info renders as one row: toggle, note, V-label, V, Len-label, Len, Pos, Ch — in order',
-      JSON.stringify(order) === JSON.stringify(['niToggleBtn', 'noteInfoNote', 'mini-lbl', 'velValInput', 'mini-lbl', 'noteInfoLen', 'noteInfoPos', 'noteInfoCh']),
+    check('Note Info renders as one row: toggle, note, V-label, V, Len-label, Len, Pos, Ch, macro — in order',
+      JSON.stringify(order) === JSON.stringify(['niToggleBtn', 'noteInfoNote', 'mini-lbl', 'velValInput', 'mini-lbl', 'noteInfoLen', 'noteInfoPos', 'noteInfoCh', 'noteInfoMacro']),
       order);
   });
 
@@ -8155,6 +8172,476 @@ async function run() {
     }));
     check('clearing a channel with no custom names changes nothing and pushes no undo entry',
       res.names === 0 && res.undoDisabled, res);
+  });
+
+  // ---------------- CC Macros ----------------
+  // Timing constants used throughout this section: the default project is
+  // 4/4 at ppq 480, so a bar is 1920 ticks and bar 5 starts at tick 7680.
+  const BAR = 1920, BAR5 = 7680;
+
+  await withPage(browser, async (page) => {
+    // Capture stores each point's tick RELATIVE to the range start — a macro
+    // is a shape, not a location, so the same capture has to be droppable at
+    // any note position later.
+    const res = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: BAR, v: 10 }, { t: BAR + 960, v: 90 }, { t: 2 * BAR, v: 20 }]);
+      s.locStart = BAR; s.locEnd = 2 * BAR;
+      const mid = window._TEST_captureMacro('Swell', [laneId]);
+      return { mid, macros: window._TEST_macros() };
+    }, BAR);
+    const m = res.macros[0];
+    check('capture stores the macro span and one entry per ticked lane',
+      res.macros.length === 1 && m.name === 'Swell' && m.spanTicks === BAR && m.lanes.length === 1, res.macros);
+    check('capture stores each point\'s tick relative to the loop-range start (0-based)',
+      JSON.stringify(m.lanes[0].points) === JSON.stringify([{ t: 0, v: 10 }, { t: 960, v: 90 }, { t: BAR, v: 20 }]),
+      m.lanes[0].points);
+    check('capture records the lane\'s addressing (type/cc/ch), not its lane id',
+      m.lanes[0].type === 'cc' && m.lanes[0].cc === 20 && m.lanes[0].ch === 0, m.lanes[0]);
+  });
+
+  await withPage(browser, async (page) => {
+    // The capture dialog must offer exactly the lanes that have points in the
+    // range — a lane with nothing there would contribute an empty gesture —
+    // and tick them by default.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const inRange = window._TEST_addLane(21, 0);
+      const outOfRange = window._TEST_addLane(22, 0);
+      window._TEST_setLanePoints(inRange, [{ t: BAR, v: 5 }, { t: 2 * BAR, v: 60 }]);
+      window._TEST_setLanePoints(outOfRange, [{ t: 5 * BAR, v: 70 }]);
+      s.locStart = BAR; s.locEnd = 2 * BAR;
+      window._TEST_showMacroCaptureDialog();
+      return { inRange, outOfRange };
+    }, BAR);
+    await page.waitForTimeout(60);
+    const offered = await page.evaluate(() => Array.from(document.querySelectorAll('#macroCaptureDialog label[data-lane-id]'))
+      .map(l => ({ id: +l.dataset.laneId, checked: l.querySelector('input').checked })));
+    check('the capture dialog offers only lanes with points inside the loop range',
+      offered.length === 1 && offered[0].id === ids.inRange, offered);
+    check('...and ticks them by default', offered.length === 1 && offered[0].checked === true, offered);
+    await page.click('#macroCaptureOk');
+    await page.waitForTimeout(60);
+    const macros = await page.evaluate(() => window._TEST_macros());
+    check('the capture dialog\'s Capture button stores the macro', macros.length === 1 && macros[0].lanes.length === 1, macros);
+  });
+
+  await withPage(browser, async (page) => {
+    // THE COLLISION RULE, exactly as reported: a lane holding a single point
+    // of 12 at bar 1 and nothing else, with a 127 → 0 → 127 macro dropped in
+    // at bar 5. Without guards the lane would ramp 12 → 127 across bars 1-5
+    // and then sit at 127 forever; both must be prevented.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      // Now make the lane look like the reported project: one point of 12 at
+      // bar 1 beat 1, nothing else.
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_selectNotes([noteId]);
+      window._TEST_assignMacroToNote(noteId, mid);
+      return { laneId, mid, noteId };
+    }, BAR);
+    await page.waitForTimeout(60);
+    const v = await page.evaluate(({ laneId }) => ({
+      atBar3: window._TEST_laneValueAt(laneId, 3 * 1920),
+      justBefore: window._TEST_laneValueAt(laneId, 7679),
+      spanStart: window._TEST_laneValueAt(laneId, 7680),
+      spanMid: window._TEST_laneValueAt(laneId, 7680 + 960),
+      spanEnd: window._TEST_laneValueAt(laneId, 9600),
+      justAfter: window._TEST_laneValueAt(laneId, 9601),
+      wellAfter: window._TEST_laneValueAt(laneId, 12000),
+      points: window._TEST_lanePoints(laneId),
+    }), ids);
+    check('assign bakes the macro at the note\'s own start tick',
+      v.spanStart === 127 && v.spanMid === 0 && v.spanEnd === 127, v);
+    check('every baked point is tagged with the note\'s macro instance id',
+      v.points.filter(p => p.t >= 7680 && p.t <= 9600).every(p => p.mi != null), v.points);
+    check('the leading guard stops the lane ramping up to the macro across the bars in front of it',
+      v.atBar3 === 12 && v.justBefore === 12, v);
+    check('the value immediately after the macro span returns to 12, not 127',
+      v.justAfter === 12, v);
+    check('...and stays at 12 well past the span', v.wellAfter === 12, v);
+    check('guards are tagged with the instance too, so removal can clean them up',
+      v.points.filter(p => p.t === 7679 || p.t === 9601).length === 2
+      && v.points.filter(p => p.t === 7679 || p.t === 9601).every(p => p.mi != null), v.points);
+  });
+
+  await withPage(browser, async (page) => {
+    // Guards only exist to stop a wrong ramp. When the lane already holds the
+    // macro's own edge value on both sides, or has no points at all, adding
+    // them would just litter the lane.
+    const res = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const src = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(src, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [src]);
+      // Flat at exactly the macro's own start/end value: nothing to preserve.
+      window._TEST_setLanePoints(src, [{ t: 0, v: 127 }]);
+      const n1 = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_assignMacroToNote(n1, mid);
+      const flat = window._TEST_lanePoints(src);
+      window._TEST_undo();
+      // A lane with no authored points at all has nothing to preserve either.
+      window._TEST_setLanePoints(src, []);
+      const n2 = window._TEST_addNote({ start: 7680, pitch: 62 });
+      window._TEST_assignMacroToNote(n2, mid);
+      return { flat, empty: window._TEST_lanePoints(src) };
+    }, BAR);
+    check('no guard is added where the lane already holds the macro\'s edge value',
+      res.flat.length === 4 && !res.flat.some(p => p.t === 7679 || p.t === 9601), res.flat);
+    check('a lane with no points at all gets the macro but no guards',
+      res.empty.length === 3 && res.empty.every(p => p.mi != null), res.empty);
+  });
+
+  await withPage(browser, async (page) => {
+    // Moving a macro note re-bakes: the old instance's points (and guards)
+    // go, the macro reappears at the new start, and the lane still returns to
+    // 12 on both sides — driven through the real Position field, not by
+    // poking state.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_selectNotes([noteId]);
+      window._TEST_assignMacroToNote(noteId, mid);
+      return { laneId, mid, noteId, target: window._TEST_tickToBBT(7680 + 2 * BAR) };
+    }, BAR);
+    await page.waitForTimeout(60);
+    await page.fill('#noteInfoPos', ids.target);
+    await page.press('#noteInfoPos', 'Enter');
+    await page.waitForTimeout(80);
+    const v = await page.evaluate(({ laneId, noteId }) => ({
+      start: window._TEST_noteById(noteId).start,
+      oldSpanStart: window._TEST_laneValueAt(laneId, 7680),
+      oldSpanMid: window._TEST_laneValueAt(laneId, 7680 + 960),
+      newSpanStart: window._TEST_laneValueAt(laneId, 11520),
+      newSpanMid: window._TEST_laneValueAt(laneId, 11520 + 960),
+      afterNew: window._TEST_laneValueAt(laneId, 13441),
+      pointsAtOldSpan: window._TEST_lanePoints(laneId).filter(p => p.t >= 7679 && p.t <= 9601).length,
+    }), ids);
+    check('moving a macro note re-bakes it at the new position',
+      v.start === 11520 && v.newSpanStart === 127 && v.newSpanMid === 0, v);
+    check('...and leaves nothing behind at the old span',
+      v.pointsAtOldSpan === 0 && v.oldSpanStart === 12 && v.oldSpanMid === 12, v);
+    check('...with the guards re-derived around the new span', v.afterNew === 12, v);
+  });
+
+  await withPage(browser, async (page) => {
+    // Deleting a macro note removes that instance's points, and one Ctrl+Z
+    // puts both the note and its CC back.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_selectNotes([noteId]);
+      window._TEST_assignMacroToNote(noteId, mid);
+      window._TEST_clearCcSel();
+      return { laneId, mid, noteId };
+    }, BAR);
+    await page.waitForTimeout(60);
+    await page.locator('body').click({ position: { x: 5, y: 5 } });
+    await page.keyboard.press('Delete');
+    await page.waitForTimeout(80);
+    const afterDel = await page.evaluate(({ laneId, noteId }) => ({
+      note: window._TEST_noteById(noteId),
+      points: window._TEST_lanePoints(laneId),
+      at: window._TEST_laneValueAt(laneId, 8000),
+    }), ids);
+    check('deleting a macro note removes every point that instance owned',
+      afterDel.note === null && afterDel.points.length === 1 && afterDel.points[0].v === 12 && afterDel.at === 12, afterDel);
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(80);
+    const afterUndo = await page.evaluate(({ laneId, noteId, mid }) => {
+      const n = window._TEST_noteById(noteId);
+      return { hasNote: !!n, macroId: n && n.macroId, mid, at: window._TEST_laneValueAt(laneId, 8640) };
+    }, ids);
+    check('a single Ctrl+Z undoes the delete — note and its baked CC both come back',
+      afterUndo.hasNote && afterUndo.macroId === afterUndo.mid && afterUndo.at === 0, afterUndo);
+  });
+
+  await withPage(browser, async (page) => {
+    // A single Ctrl+Z has to undo an assign too — the lane rewrite and the
+    // note's macro fields are one edit, not two.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_selectNotes([noteId]);
+      window._TEST_assignMacroToNote(noteId, mid);
+      window._TEST_clearCcSel();
+      return { laneId, mid, noteId };
+    }, BAR);
+    await page.waitForTimeout(60);
+    await page.locator('body').click({ position: { x: 5, y: 5 } });
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(80);
+    const after = await page.evaluate(({ laneId, noteId }) => ({
+      note: window._TEST_noteById(noteId),
+      points: window._TEST_lanePoints(laneId),
+      macros: window._TEST_macros().length,
+    }), ids);
+    check('a single Ctrl+Z undoes an assign, restoring the lane and clearing the note\'s macro',
+      after.note && after.note.macroId === undefined && after.points.length === 1 && after.points[0].v === 12, after);
+    check('...without undoing the capture itself', after.macros === 1, after);
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(80);
+    const afterSecond = await page.evaluate(() => window._TEST_macros().length);
+    check('a further Ctrl+Z undoes the capture', afterSecond === 0, afterSecond);
+    await page.keyboard.press('Control+y');
+    await page.waitForTimeout(80);
+    const afterRedo = await page.evaluate(() => window._TEST_macros().length);
+    check('macros survive undo/redo round-trips', afterRedo === 1, afterRedo);
+  });
+
+  await withPage(browser, async (page) => {
+    // Applying a macro in a project that lacks the lanes it was captured from
+    // must ASK per lane — never silently create, never silently drop.
+    const setup = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const a = window._TEST_addLane(20, 0);
+      const b = window._TEST_addLane(21, 0);
+      const c = window._TEST_addLane(22, 0);
+      window._TEST_setLanePoints(a, [{ t: 0, v: 10 }, { t: BAR, v: 30 }]);
+      window._TEST_setLanePoints(b, [{ t: 0, v: 40 }, { t: BAR, v: 50 }]);
+      window._TEST_setLanePoints(c, [{ t: 0, v: 60 }, { t: BAR, v: 70 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Tri', [a, b, c]);
+      // Renumber the source lanes so the macro can no longer find any of them
+      // — the same situation as opening this macro in a project that never
+      // had those lanes at all.
+      [a, b, c].forEach(id => { s.ccLanes.find(l => l.id === id).cc += 40; });
+      const dest = window._TEST_addLane(99, 3);
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_selectNotes([noteId]);
+      return { a, b, c, dest, mid, noteId };
+    }, BAR);
+    await page.evaluate(({ noteId, mid }) => window._TEST_assignMacroToNote(noteId, mid), setup);
+    await page.waitForTimeout(80);
+    const rows = await page.evaluate(() => Array.from(document.querySelectorAll('#macroLanesDialog tr[data-macro-lane]')).map(tr => ({
+      idx: tr.dataset.macroLane,
+      label: tr.querySelector('td[data-col="lane"]').textContent,
+      actions: Array.from(tr.querySelector('td[data-col="action"] select').options).map(o => o.value),
+      targetDisabled: tr.querySelector('td[data-col="target"] select').disabled,
+    })));
+    check('a macro applied without its lanes opens the missing-lane dialog, one row per missing lane',
+      rows.length === 3, rows);
+    check('...offering create / map / skip for each',
+      rows.every(r => r.actions.join(',') === 'create,map,skip'), rows.map(r => r.actions));
+    check('...with the map target inert until "Map to…" is chosen',
+      rows.every(r => r.targetDisabled === true), rows.map(r => r.targetDisabled));
+    check('...labelled with what the lane actually addresses',
+      rows[0].label.indexOf('CC20 Ch1') >= 0, rows.map(r => r.label));
+    await page.selectOption('#macroLanesDialog tr[data-macro-lane="0"] td[data-col="action"] select', 'create');
+    await page.selectOption('#macroLanesDialog tr[data-macro-lane="1"] td[data-col="action"] select', 'map');
+    await page.selectOption('#macroLanesDialog tr[data-macro-lane="1"] td[data-col="target"] select', String(setup.dest));
+    await page.selectOption('#macroLanesDialog tr[data-macro-lane="2"] td[data-col="action"] select', 'skip');
+    await page.click('#macroLanesApply');
+    await page.waitForTimeout(80);
+    const res = await page.evaluate(({ a, b, c, dest, noteId }) => {
+      const s = window._TEST_state;
+      const created = s.ccLanes.filter(l => l.cc === 20 && l.ch === 0 && ![a, b, c].includes(l.id));
+      const note = s.notes.find(n => n.id === noteId);
+      const tagged = id => { const l = s.ccLanes.find(x => x.id === id); return l ? l.points.filter(p => p.mi != null).length : -1; };
+      return {
+        createdCount: created.length,
+        createdTagged: created.length ? tagged(created[0].id) : -1,
+        createdIsMapped: created.length ? note.macroMap[0] === created[0].id : false,
+        destTagged: tagged(dest),
+        destValues: (s.ccLanes.find(l => l.id === dest) || { points: [] }).points.filter(p => p.mi != null).map(p => p.v),
+        map: note.macroMap,
+        skippedAnywhere: s.ccLanes.some(l => l.points.some(p => p.mi != null && (p.v === 60 || p.v === 70))),
+      };
+    }, setup);
+    check('"create it" makes exactly the lane the macro asked for and bakes into it',
+      res.createdCount === 1 && res.createdTagged > 0 && res.createdIsMapped, res);
+    check('"map it to an existing lane" bakes into that lane instead',
+      res.map[1] === setup.dest && res.destTagged > 0 && res.destValues.indexOf(40) >= 0, res);
+    check('"skip" applies that lane nowhere at all',
+      res.map[2] === null && res.skippedAnywhere === false, res);
+  });
+
+  await withPage(browser, async (page) => {
+    // Cancelling the missing-lane dialog must apply nothing — not a partial
+    // assign, not a stray created lane.
+    const setup = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const a = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(a, [{ t: 0, v: 10 }, { t: BAR, v: 30 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('One', [a]);
+      s.ccLanes.find(l => l.id === a).cc = 77;
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      return { mid, noteId, laneCount: s.ccLanes.length };
+    }, BAR);
+    await page.evaluate(({ noteId, mid }) => window._TEST_assignMacroToNote(noteId, mid), setup);
+    await page.waitForTimeout(60);
+    await page.evaluate(() => document.querySelector('#macroLanesDialog button').click());
+    await page.waitForTimeout(60);
+    const after = await page.evaluate(({ noteId }) => ({
+      note: window._TEST_noteById(noteId),
+      laneCount: window._TEST_state.ccLanes.length,
+      anyTagged: window._TEST_state.ccLanes.some(l => l.points.some(p => p.mi != null)),
+    }), setup);
+    check('cancelling the missing-lane dialog assigns nothing and creates nothing',
+      after.note.macroId === undefined && after.laneCount === setup.laneCount && after.anyTagged === false, after);
+  });
+
+  await withPage(browser, async (page) => {
+    // Macros, the note's macro fields and the per-point instance tags all
+    // have to survive a real project save/load round trip.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const noteId = window._TEST_addNote({ start: 7680, pitch: 60 });
+      window._TEST_assignMacroToNote(noteId, mid);
+      return { laneId, mid, noteId };
+    }, BAR);
+    await page.waitForTimeout(60);
+    const json = await page.evaluate(() => JSON.stringify({ version: 1, projectName: 'macro-song', audioFile: '', snapshot: JSON.parse(window._TEST_snapshot()) }));
+    await page.evaluate((j) => {
+      const file = new File([j], 'macro-song.mmvp', { type: 'application/json' });
+      return window._TEST_loadProject(file);
+    }, json);
+    await page.waitForTimeout(150);
+    const after = await page.evaluate(({ noteId }) => {
+      const s = window._TEST_state;
+      const n = s.notes.find(x => x.id === noteId);
+      const lane = s.ccLanes.find(l => l.cc === 20 && l.ch === 0);
+      return {
+        macros: window._TEST_macros(),
+        macroId: n && n.macroId, macroInst: n && n.macroInst, macroAt: n && n.macroAt, macroMap: n && n.macroMap,
+        tagged: lane ? lane.points.filter(p => p.mi != null).length : -1,
+        justAfter: lane ? window._TEST_laneValueAt(lane.id, 9601) : null,
+      };
+    }, ids);
+    check('macros survive a project save/load round trip',
+      after.macros.length === 1 && after.macros[0].name === 'Dip' && after.macros[0].lanes[0].points.length === 3, after.macros);
+    check('...as do the note\'s macro fields and the per-point instance tags',
+      after.macroId === ids.mid && after.macroInst != null && after.macroAt === 7680
+      && Array.isArray(after.macroMap) && after.tagged === 5, after);
+    check('...so the reloaded lane still returns to its pre-macro value after the span',
+      after.justAfter === 12, after);
+  });
+
+  await withPage(browser, async (page) => {
+    // Play Macro treats a macro note as an editing marker: no MIDI note out,
+    // but the CC gesture it stands for still plays untouched.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(30, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: 960, v: 100 }, { t: BAR, v: 0 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Blip', [laneId]);
+      const macroNote = window._TEST_addNote({ start: BAR, pitch: 60 });
+      const plainNote = window._TEST_addNote({ start: BAR, pitch: 72 });
+      window._TEST_assignMacroToNote(macroNote, mid);
+      return { laneId, mid, macroNote, plainNote };
+    }, BAR);
+    const count = () => page.evaluate(() => {
+      const evs = window._TEST_buildPassEvents(1900, 4200);
+      return {
+        on60: evs.filter(e => e.msg && e.msg[0] === 0x90 && e.msg[1] === 60).length,
+        on72: evs.filter(e => e.msg && e.msg[0] === 0x90 && e.msg[1] === 72).length,
+        cc: evs.filter(e => e.msg && (e.msg[0] & 0xf0) === 0xb0).length,
+      };
+    });
+    const before = await count();
+    const modeOff = await page.evaluate(() => window._TEST_state.playMacroMode);
+    check('Play Macro is off by default, so a macro note sounds like any other note',
+      modeOff === false && before.on60 === 1, { modeOff, before });
+    await page.locator('#playMacroBtn').click();
+    await page.waitForTimeout(50);
+    const after = await count();
+    check('Play Macro on suppresses the macro note\'s own MIDI note-out', after.on60 === 0, { before, after });
+    check('...while ordinary notes are untouched', after.on72 === 1 && before.on72 === 1, { before, after });
+    check('...and CC output is completely unaffected',
+      before.cc > 0 && after.cc === before.cc, { before, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // A macro note is drawn in the app's amber/warning token so it reads
+    // differently from a velocity-shaded ordinary note. Sampled from the real
+    // piano-roll canvas, well clear of the note's own text label.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(40, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 20 }, { t: 480, v: 90 }, { t: 960, v: 20 }]);
+      s.locStart = 0; s.locEnd = 960;
+      const mid = window._TEST_captureMacro('Bump', [laneId]);
+      const macroNote = window._TEST_addNote({ start: 0, pitch: 60, length: BAR });
+      const plainNote = window._TEST_addNote({ start: 0, pitch: 64, length: BAR });
+      window._TEST_assignMacroToNote(macroNote, mid);
+      s.selection.clear();
+      return { macroNote, plainNote, mid };
+    }, BAR);
+    await page.evaluate(() => window._TEST_requestDraw());
+    await page.waitForTimeout(60);
+    const px = await page.evaluate(() => {
+      const s = window._TEST_state;
+      const ctx = document.getElementById('prCanvas').getContext('2d');
+      const G = window._TEST_GUTTER();
+      const sample = (pitch) => {
+        const x = Math.round(window._TEST_tickToX(0) - s.scrollLeft + G) + 200;
+        const y = Math.round((127 - pitch) * s.noteHeight) + 4;
+        const d = ctx.getImageData(x, y, 1, 1).data;
+        return [d[0], d[1], d[2]];
+      };
+      const tok = window._TEST_getCss('--accent2');
+      return { macro: sample(60), plain: sample(64), token: [1, 3, 5].map(i => parseInt(tok.substr(i, 2), 16)) };
+    });
+    check('a macro note is drawn in the app\'s amber token (--accent2), not the velocity blue',
+      px.macro.join(',') === px.token.join(','), px);
+    check('...while an ordinary note at the same tick keeps its velocity colour',
+      px.plain.join(',') !== px.token.join(','), px);
+  });
+
+  await withPage(browser, async (page) => {
+    // Note Info has to name the macro — colour alone cannot say WHICH one.
+    const ids = await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 10 }, { t: BAR, v: 30 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Riser', [laneId]);
+      const macroNote = window._TEST_addNote({ start: 7680, pitch: 60 });
+      const plainNote = window._TEST_addNote({ start: 7680, pitch: 64 });
+      window._TEST_assignMacroToNote(macroNote, mid);
+      window._TEST_selectNotes([macroNote]);
+      return { macroNote, plainNote };
+    }, BAR);
+    await page.waitForTimeout(60);
+    const withMacro = await page.evaluate(() => {
+      const el = document.getElementById('noteInfoMacro');
+      return { text: el.textContent, hidden: el.style.display === 'none' };
+    });
+    check('Note Info names the macro carried by the selected note',
+      withMacro.hidden === false && withMacro.text === '◆ Riser', withMacro);
+    await page.evaluate(({ plainNote }) => window._TEST_selectNotes([plainNote]), ids);
+    await page.waitForTimeout(60);
+    const withoutMacro = await page.evaluate(() => document.getElementById('noteInfoMacro').style.display === 'none');
+    check('...and stays hidden for a note with no macro', withoutMacro === true, withoutMacro);
   });
 
   await browser.close();

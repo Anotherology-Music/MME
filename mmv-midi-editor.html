@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.38
+  MMV MIDI & CC Curve Editor v0.9.39
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -893,6 +893,49 @@
   channel to mean, so it resolves to the default channel and says so, in the
   option and in the readout beside it, rather than picking one silently.
 
+
+  v0.9.39 CC Macros. Capture a slice of automation across several lanes — the
+  loop range, whichever lanes have points in it — name it, and attach it to a
+  note. The note becomes a handle for the whole multi-lane gesture: it draws
+  amber, moving it moves the automation, deleting it removes it, and one Ctrl+Z
+  undoes any of that in a single step. Lanes belonging to different shaders can
+  live in the same macro, since a lane already knows its own ISF.
+
+  This is an editing aid, not a playback feature, and the implementation follows
+  from that: macros are expanded into ordinary CC points when you assign them,
+  never resolved during playback. The scheduler only ever sees normal points, so
+  playback costs exactly what it did before — no per-frame or per-tick macro
+  work exists anywhere. The optional "Play Macro" toggle only suppresses a macro
+  note's own Note On/Off so the note reads as a marker rather than a sound; the
+  CC data it carries plays regardless. It defaults to off.
+
+  The part that needed care is what happens at the edges of the span. CC lanes
+  interpolate linearly between points, so simply replacing the points inside a
+  macro's range corrupts the automation OUTSIDE it in two places at once: a long
+  wrong ramp from whatever preceded the span up to the macro's first value, and
+  a lane left stranded at the macro's last value forever afterwards. A lane
+  holding a single point of 12, with a macro dropped in at bar 5 that runs
+  127-0-127, would read as a slow climb from 12 to 127 across four bars and then
+  sit at 127 for the rest of the piece — neither of which the user asked for.
+  So before replacing anything, the value the lane WOULD have played just before
+  and just after the span is sampled from the original points, and guard points
+  are laid at those two ticks. They are added only when the lane would otherwise
+  play something different there — the test is "ask laneValueAt what this would
+  do", not "is there a neighbouring point", because in the example above there
+  are no points after the span at all and the trailing guard is still exactly
+  what is wanted. Redundant guards are never created, and the guards are tagged
+  with the macro instance so removing it cleans them up too.
+
+  Applying a macro in a project that lacks some of its lanes asks, per lane,
+  whether to create it, map it to an existing lane, or skip it — never silently
+  creating and never silently dropping. That resolution is stored on the note,
+  so moving it later honours the answers you gave rather than re-resolving by
+  channel and CC number and quietly undoing a deliberate mapping.
+
+  Known behaviour, not a bug: a macro's baked points are ordinary points, so you
+  can hand-edit inside a span, but a later move re-bakes over that edit. The
+  alternative is the app fighting your own edits, which is worse.
+
 -->
 
 
@@ -1076,6 +1119,12 @@
   .ni-disp{color:var(--txt);display:flex;align-items:center;justify-content:center;}
   /* Note-name readout ("F#8  126") is read-only → grey. */
   .ni-note{color:var(--txt2);display:flex;align-items:center;justify-content:center;}
+  /* Macro badge — read-only, but amber rather than grey, matching the colour
+     a macro note is drawn in in the piano roll (--accent2) so the two read as
+     the same thing. Hidden outright when the selection carries no macro. */
+  .ni-macro{flex:0 1 auto;min-width:0;height:19px;padding:2px 5px;font-size:10px;line-height:15px;
+    background:var(--panel2);border:1px solid rgba(255,180,84,.4);border-radius:4px;color:var(--accent2);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   /* Manual minimize/maximize toggle for the whole Note Info box — same
      .move-btn/.toggle-btn visual language as the CC lane row-1 toggle
      (▾ expanded / ▸ minimized, same .on convention), just scoped to
@@ -1617,6 +1666,7 @@
         <button id="metroBtn" class="icon-btn" title="Metronome click during playback (C)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6l5 18H4L9 3z"/><path d="M8 15h8"/><path d="M12 5.5v9"/></svg></button>
         <button id="syncFollow" class="icon-btn" title="Follow MMV: when Ch16 sync-track notes arrive, move playhead to match MMV position"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
         <button id="scrollLockBtn" class="icon-btn" title="Scroll Lock: once the playhead reaches the middle of the view during playback, keep it centered there and scroll the timeline underneath it instead"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></button>
+        <button id="playMacroBtn" class="icon-btn" title="Play Macro: a note carrying a CC macro plays the MACRO only — its CC gesture (already baked into the lanes) still plays, but the note itself is not sent as MIDI. Off = macro notes sound like any other note."><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 15c3 0 3-6 6-6s3 6 6 6 3-6 6-6"/><circle cx="3" cy="15" r="1.4" fill="currentColor" stroke="none"/></svg></button>
       </div>
     </div>
     <div class="position-grp">
@@ -1800,6 +1850,15 @@
           </div>
         </div>
         <div class="setup-section">
+          <div class="setup-title">CC Macros</div>
+          <div class="setup-row">
+            <button id="macroCaptureBtn" title="Capture the current loop range across the chosen CC lanes as a reusable macro">Capture Loop Range…</button>
+            <button id="macroClearNoteBtn" title="Remove the macro from the selected note (its baked CC points go too)">Clear from selected note</button>
+          </div>
+          <div id="macroList" style="display:flex;flex-direction:column;gap:2px;margin-top:4px;"></div>
+          <div class="hint" style="margin-top:4px;">A macro is an editing aid: attaching one to a note expands it into ordinary CC points at that note's position. Macro notes are drawn amber in the piano roll.</div>
+        </div>
+        <div class="setup-section">
           <div class="setup-title">Danger zone</div>
           <div class="setup-row">
             <button id="clearBtn" class="warn">Clear All</button>
@@ -1958,6 +2017,7 @@
           <input type="number" id="noteInfoLen" class="ni-input" min="1" placeholder="—" title="Note length in ticks — applies to all selected notes">
           <input type="text" id="noteInfoPos" class="ni-input mono" placeholder="—" title="Position (Bar.Beat.16th.Tick) — shown when selected notes share the same start. Editing shifts all selected notes together.&#10;Scroll or ↑↓ = ±1 tick, Shift = ±1/16th, Ctrl = ±1 beat, Alt = ±1 bar">
           <button type="button" id="noteInfoCh" class="chn-btn" title="Channel — applies to all selected notes">Ch—</button>
+          <span id="noteInfoMacro" class="ni-macro" style="display:none;">◆</span>
         </div>
       </div>
       <div class="scroll hx" id="velScroll"><canvas id="velCanvas"></canvas><span class="vel-gutter-lbl">VEL</span></div>
@@ -2215,6 +2275,17 @@
     playing:false, playhead:0, lastPlayStart:0, midiOut:null, clipboard:null,
     locStart:null, locEnd:null, syncFollow:false, mmvSmooth:true, scrollLock:false,
     audioOffset:0, audioLatencyMs:0,
+    // CC macros: captured multi-lane automation gestures, each attachable to a
+    // note (see the "CC Macros" section further down). Project data, so it
+    // rides in snapshot()/applyState() and therefore in save/load too.
+    macros:[],
+    // "Play macro" mode. OFF by default — a macro note behaves like any other
+    // note and sends its MIDI note out. ON makes it an editing marker only:
+    // its CC gesture is already baked into the lanes, so the note itself
+    // stays silent. A session/UI mode like metronomeOn and scrollLock, and
+    // deliberately NOT part of snapshot(): it describes how you are working
+    // right now, not what the project contains.
+    playMacroMode:false,
   };
   const PITCH_MIN=0, PITCH_MAX=127, NPITCH=128;
   const LANE_COLORS=['#4fa3ff','#ffb454','#7ed957','#ff6fae','#b18cff','#36d1c4','#ff8a5c','#c9d24f'];
@@ -2520,6 +2591,11 @@
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     tempoMap:state.tempoMap,
     isfHistory:state.isfHistory||[],
+    // Macro definitions. The per-note fields (macroId/macroInst/macroAt/
+    // macroMap) and the per-point {mi:…} instance tags need no entry of their
+    // own — notes and lane points are already serialised whole, so they ride
+    // along, which is also what makes undo of an assign/move/delete work.
+    macros:state.macros||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
     genLen:state.genLen,channelNames:state.channelNames,
     genLo:state.genLo,genHi:state.genHi,genTension:state.genTension,genPhase:state.genPhase,
@@ -2541,6 +2617,11 @@
     state.locStart=o.locS; state.locEnd=o.locE; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
     state.projectName=o.projectName||''; if($('projectName')) $('projectName').value=state.projectName;
     if(o.isfHistory) state.isfHistory=o.isfHistory;
+    // Projects saved before macros existed have no `macros` key at all — an
+    // empty list is the correct reading of "this project has no macros",
+    // and it must be assigned unconditionally so undoing back past a capture
+    // actually drops the macro rather than leaving the old array in place.
+    state.macros=o.macros||[];
     if(o.genLen){ state.genLen=o.genLen; if($('genLen')) $('genLen').value=state.genLen; }
     if(o.channelNames) state.channelNames=o.channelNames;
     if(o.genLo!=null){ state.genLo=o.genLo; if($('advLo')){ $('advLo').value=o.genLo; $('advLoR').value=o.genLo; } }
@@ -2580,7 +2661,7 @@
     // so filtering is a no-op there and a real fix for undo/redo.
     const validNoteIds=new Set(state.notes.map(n=>n.id));
     state.selection=new Set([...state.selection].filter(id=>validNoteIds.has(id)));
-    syncInputs(); updateLoopStatus(); updateDuration(); resizeCanvases(); }
+    syncInputs(); updateLoopStatus(); updateDuration(); renderMacroList(); resizeCanvases(); }
   // ---------- Undo/redo view preservation ----------
   // applyState() necessarily tears down and rebuilds every lane's DOM (see
   // its own comment above on why — points/lanes are wholesale-replaced
@@ -3014,7 +3095,11 @@
     const hasSel=state.selection.size>0;
     function drawNote(n,sel){
       const x=tickToX(n.start),y=pitchToY(n.pitch),nw=Math.max(2,tickToX(n.length));
-      ctx.fillStyle=velColor(n.vel); ctx.fillRect(x,y+1,nw,nh-2);
+      // A macro note is the handle for a whole multi-lane CC gesture, not
+      // just a note — paint it in the app's existing amber/warning token so
+      // it reads differently at a glance from an ordinary velocity-shaded
+      // note (whose fill is a blue whose lightness encodes velocity).
+      ctx.fillStyle=(n.macroId!=null)?getCss('--accent2'):velColor(n.vel); ctx.fillRect(x,y+1,nw,nh-2);
       ctx.strokeStyle=sel?getCss('--sel'):chanColor(n.ch); ctx.lineWidth=sel?2:1; ctx.strokeRect(x+0.5,y+1.5,nw-1,nh-3);
       if(nw>14&&nh>=10){ ctx.save(); ctx.beginPath(); ctx.rect(x+1,y+1,nw-2,nh-2); ctx.clip();
         ctx.fillStyle=sel?'#06223f':'#06223f'; ctx.font=Math.min(9,nh-2)+'px system-ui'; ctx.textBaseline='middle';
@@ -3381,7 +3466,11 @@
       newNotes.forEach(n=>state.notes.push(n));
       state.selection.clear(); newNotes.forEach(n=>state.selection.add(n.id));
     }
-    prDrag=null; commitUndo(); updateVelValInput(); requestDraw(); });
+    // Before commitUndo(), so a macro note that was dragged (or alt-copied,
+    // which restores the original's start and therefore needs no re-bake but
+    // still has to be checked) folds its re-baked CC points into the SAME
+    // undo entry as the note move itself — one Ctrl+Z, one result.
+    prDrag=null; resyncMacros(); commitUndo(); updateVelValInput(); requestDraw(); });
   prCanvas.addEventListener('dblclick',e=>{ const {x,y}=prCoords(e); const n=noteAt(x,y);
     if(n){ pushUndo(); removeNote(n); requestDraw(); }
     else if(effTool(e)==='select'){
@@ -3403,7 +3492,10 @@
   });
   prCanvas.addEventListener('mousemove',e=>{ if(!prDrag){ const {x,y}=prCoords(e); updateStatus(x,y);} });
   function byId(id){ return state.notes.find(n=>n.id===id); }
-  function removeNote(n){ const i=state.notes.indexOf(n); if(i>=0) state.notes.splice(i,1); state.selection.delete(n.id); }
+  // resyncMacros() here covers the erase tool and the double-click delete;
+  // it is a no-op the moment the project has no macros, and n.macroId is not
+  // consulted directly so a note removed by any route is handled the same way.
+  function removeNote(n){ const i=state.notes.indexOf(n); if(i>=0) state.notes.splice(i,1); state.selection.delete(n.id); resyncMacros(); }
 
   // ---------- Quantise ----------
   function quantizeSelection(mode, iterative){
@@ -3422,6 +3514,7 @@
         n.length=Math.max(1,newEnd-n.start);
       }
     });
+    resyncMacros();
     updateNoteInfo(); requestDraw();
   }
 
@@ -3457,6 +3550,19 @@
       const allSame=sel.length>0 && sel.every(n=>n.ch===sel[0].ch);
       nc.textContent=allSame?('Ch'+(sel[0].ch+1)):'Ch—';
       nc.classList.toggle('ch16',allSame&&sel[0].ch===15);
+    }
+    // Macro badge — the piano roll only says "this note carries a macro" by
+    // colour, which cannot say WHICH macro. Shown only when every selected
+    // note carries the same one, same "shared value or nothing" convention as
+    // the fields above. Hidden entirely (not "—") so the single Note Info row
+    // stays exactly as compact as it was for the overwhelming majority of
+    // notes, which have no macro.
+    const nm=$('noteInfoMacro');
+    if(nm){
+      const m=(sel.length&&sel[0].macroId!=null&&sel.every(n=>n.macroId===sel[0].macroId))?macroById(sel[0].macroId):null;
+      nm.textContent=m?('◆ '+m.name):'';
+      nm.style.display=m?'':'none';
+      nm.title=m?('Macro "'+m.name+'" — '+m.lanes.length+' lane'+(m.lanes.length!==1?'s':'')+', '+m.spanTicks+' ticks'):'';
     }
     // Note Info is a single row at ALL times (true one-row minimized view,
     // v0.9.13) — minimized, nothing-selected, and a real selection all
@@ -3533,6 +3639,7 @@
       const sel=[...state.selection].map(byId).filter(Boolean); if(!sel.length) return;
       pushUndo();
       sel.forEach(n=>{ n.start=Math.max(0,n.start+delta); });
+      resyncMacros();
       updateNoteInfo(); requestDraw();
     }
     np.addEventListener('change',()=>{
@@ -3541,7 +3648,7 @@
       const newT=bbtToTick(np.value.trim());
       if(isNaN(newT)||newT<0){ updateNoteInfo(); return; }
       const delta=newT-sel[0].start;
-      if(delta!==0){ pushUndo(); sel.forEach(n=>{ n.start=Math.max(0,n.start+delta); }); }
+      if(delta!==0){ pushUndo(); sel.forEach(n=>{ n.start=Math.max(0,n.start+delta); }); resyncMacros(); }
       updateNoteInfo(); requestDraw();
     });
     np.addEventListener('keydown',e=>{
@@ -4527,6 +4634,390 @@
       if(l._scroll) l._scroll.style.opacity=(!hasActive||isActive)?'1':'0.45';
     });
     if(typeof updateGenerateButtonsEnabled==='function') updateGenerateButtonsEnabled();
+  }
+
+  // ---------- CC Macros ----------
+  // A macro is a captured slice of CC automation across one or more lanes,
+  // attached to a NOTE so that one note becomes the handle for a whole
+  // multi-lane gesture.
+  //
+  // It is strictly an EDITING AID, never a playback feature: assigning or
+  // moving a macro note expands it into ordinary lane points there and then,
+  // so the scheduler (buildPassEvents / _followWindow) only ever sees normal
+  // points and playback costs exactly what it did before. Nothing in this
+  // section runs per frame or per tick — every entry point below is reached
+  // from a user edit.
+  //
+  // Shapes:
+  //   state.macros[i] = {id, name, spanTicks, lanes:[…], createdAt}
+  //   macro.lanes[j]  = {cc, ch, type, isfName, name, points:[{t,v}]}   t is
+  //                     0-based relative to the macro start — a macro is a
+  //                     shape, not a location.
+  //   note.macroId    = which macro this note carries
+  //   note.macroInst  = this note's instance id; every point baked for it
+  //                     (including its guards) carries {mi:<that id>}, so a
+  //                     later move/delete finds exactly this note's points
+  //                     and never touches hand-drawn ones. Separate from
+  //                     macroId because one macro can be on many notes.
+  //   note.macroAt    = the tick the instance was baked at (see resyncMacros)
+  //   note.macroMap   = laneId (or null for "skip") per macro.lanes entry, so
+  //                     a re-bake reuses the user's earlier create/map/skip
+  //                     answers instead of re-asking or silently dropping a
+  //                     lane they deliberately mapped elsewhere.
+  function macroById(id){ return (state.macros||[]).find(m=>m.id===id)||null; }
+
+  // Label for a captured lane wherever it has to be named to the user. A
+  // macro can span lanes belonging to more than one ISF shader, so the
+  // shader-side parameter name leads when there is one — "CC12 Ch1" on its
+  // own is meaningless once two shaders are in play.
+  function macroLaneLabel(ml){
+    const what=ml.type==='pb'?'Pitch Bend':ml.type==='cp'?'Ch Pressure':('CC'+ml.cc);
+    const who=(ml.isfName||ml.name||'').trim();
+    return (who?who+' — ':'')+what+' Ch'+((ml.ch|0)+1);
+  }
+  function laneLabelFor(l){
+    const what=(l.type||'cc')==='pb'?'Pitch Bend':(l.type||'cc')==='cp'?'Ch Pressure':('CC'+l.cc);
+    const who=((l.isf&&l.isf.name)||l.name||'').trim();
+    return (who?who+' — ':'')+what+' Ch'+((l.ch|0)+1);
+  }
+
+  // Which existing lane a captured lane spec refers to. Matched on
+  // type + channel (+ CC number), never on lane id or name: ids are
+  // per-project and a name is free text, but "CC12 on Ch1" is what actually
+  // reaches the synth, and is the only thing that can be meaningfully
+  // recognised in a different project.
+  function findMacroLane(ml){
+    return state.ccLanes.find(l=>(l.type||'cc')===ml.type && l.ch===ml.ch
+      && (ml.type==='cc' ? l.cc===ml.cc : true))||null;
+  }
+
+  // ── Capture ────────────────────────────────────────────────────
+  // Lanes worth offering for capture: the ones that actually have points in
+  // the loop range. A lane with nothing in the range would contribute an
+  // empty gesture, and ticking it by default would be noise.
+  function macroCaptureCandidates(){
+    const a=state.locStart,b=state.locEnd;
+    if(a==null||b==null||b<=a) return [];
+    return state.ccLanes.filter(l=>l.points.some(p=>p.t>=a&&p.t<=b));
+  }
+  function captureMacro(name, laneIds){
+    const a=state.locStart,b=state.locEnd;
+    if(a==null||b==null||b<=a){ flash('Set a loop range on the ruler first — Capture uses it as the macro span'); return null; }
+    const ids=new Set(laneIds||[]);
+    const lanes=state.ccLanes.filter(l=>ids.has(l.id)).map(l=>({
+      cc:l.cc, ch:l.ch, type:l.type||'cc',
+      isfName:(l.isf&&l.isf.name)||null,
+      // Not part of the minimum shape, but the plain lane name is often the
+      // only human-readable handle a non-ISF lane has — without it the
+      // missing-lane dialog could only ever say "CC12 Ch1".
+      name:l.name||'',
+      points:l.points.filter(p=>p.t>=a&&p.t<=b).map(p=>({t:Math.round(p.t-a), v:p.v}))
+    })).filter(ml=>ml.points.length);
+    if(!lanes.length){ flash('No CC points in the loop range — nothing to capture'); return null; }
+    pushUndo();
+    const macro={id:state.nextId++, name:(name||'').trim()||('Macro '+((state.macros||[]).length+1)),
+      spanTicks:Math.round(b-a), lanes, createdAt:new Date().toISOString()};
+    state.macros.push(macro);
+    renderMacroList();
+    flash('Captured "'+macro.name+'" — '+lanes.length+' lane'+(lanes.length!==1?'s':''));
+    return macro;
+  }
+
+  // ── Baking (the collision rule) ────────────────────────────────
+  // Replace a lane's points across [s,e] with the macro's, while PRESERVING
+  // what the lane held on either side of the span.
+  //
+  // This is the subtle part. CC lanes interpolate linearly between points, so
+  // a bare replace silently rewrites the lane OUTSIDE the span too: a lane
+  // holding 12 from bar 1 with a macro dropped in at bar 5 would ramp
+  // 12 → 127 across the four bars in front of it, and would then sit at the
+  // macro's final value forever instead of dropping back to 12.
+  //
+  // "Only if necessary" is decided by asking the post-replace lane what it
+  // would actually play at the guard tick: if that already equals the
+  // original value there — because a surviving point sits on that tick, or
+  // because the surrounding points happen to interpolate to it — the guard
+  // would change nothing and is not added. A lane with no points at all had
+  // nothing authored to preserve, so it gets no guards either.
+  function bakeMacroIntoLane(lane, ml, s, e, inst){
+    const orig=lane.points;
+    const r=laneRange(lane);
+    const q=v=>clamp(Math.round(v), r.min, r.max);
+    // Both sampled from the ORIGINAL points, before anything is removed.
+    const vBefore=laneValueAt(lane, s-1), vAfter=laneValueAt(lane, e+1);
+    const hadPoints=orig.length>0;
+    const kept=orig.filter(p=>p.t<s||p.t>e);
+    // Clamped into the target lane's own range: "map it to an existing lane"
+    // in the missing-lane dialog can legitimately point a pitch-bend capture
+    // at a 7-bit CC lane, and out-of-range points would otherwise be drawn
+    // and sent as garbage.
+    const baked=ml.points.map(p=>({t:Math.round(s+p.t), v:q(p.v), mi:inst}));
+    const merged=kept.concat(baked).sort((x,y)=>x.t-y.t);
+    const probe={type:lane.type, points:merged};
+    const guards=[];
+    // s-1 < 0 has no tick to hold a guard, and nothing can precede tick 0.
+    if(hadPoints && s>0 && q(laneValueAt(probe,s-1))!==q(vBefore)) guards.push({t:s-1, v:q(vBefore), mi:inst});
+    if(hadPoints && q(laneValueAt(probe,e+1))!==q(vAfter)) guards.push({t:e+1, v:q(vAfter), mi:inst});
+    lane.points=guards.length?merged.concat(guards).sort((x,y)=>x.t-y.t):merged;
+  }
+
+  // Undo one bake: drop every point tagged with this instance — the macro's
+  // own points AND its guards, since the guards exist only to protect the
+  // macro's edges and leaving them behind would be worse than removing them.
+  // What remains is exactly the lane's untouched hand-drawn data, which is
+  // the sane restore. The one exception is a lane that would be stripped
+  // completely bare: laneValueAt() reports a point-less lane as the range
+  // centre, so hold on to a single untagged point carrying the value the
+  // lane had after the span rather than letting it silently jump to 64.
+  function stripMacroInstance(inst){
+    for(const lane of state.ccLanes){
+      if(!lane.points.some(p=>p.mi===inst)) continue;
+      const tagged=lane.points.filter(p=>p.mi===inst);
+      const kept=lane.points.filter(p=>p.mi!==inst);
+      if(!kept.length) kept.push({t:0, v:tagged[tagged.length-1].v});
+      lane.points=kept;
+    }
+  }
+
+  function bakeMacroOnNote(note, macro, map){
+    const inst=state.nextId++;
+    const s=Math.round(note.start), e=s+macro.spanTicks;
+    macro.lanes.forEach((ml,i)=>{
+      const laneId=map[i];
+      if(laneId==null) return; // "skip" — deliberately not applied to any lane
+      const lane=state.ccLanes.find(l=>l.id===laneId);
+      if(!lane) return;
+      bakeMacroIntoLane(lane, ml, s, e, inst);
+    });
+    note.macroId=macro.id; note.macroInst=inst; note.macroAt=note.start; note.macroMap=map.slice();
+  }
+
+  // ── Assign ─────────────────────────────────────────────────────
+  function assignMacroToNote(note, macro){
+    if(!note||!macro) return;
+    const map=macro.lanes.map(ml=>{ const l=findMacroLane(ml); return l?l.id:null; });
+    const missing=[]; map.forEach((id,i)=>{ if(id==null) missing.push(i); });
+    // Every mutation happens inside finish(), AFTER a single pushUndo() — lane
+    // creation, the point rewrite and the note's own macro fields all land in
+    // one undo entry, so a single Ctrl+Z puts everything back.
+    function finish(resolved, creates){
+      pushUndo();
+      (creates||[]).forEach(c=>{
+        const lane=_addLane(c.ml.type, c.ml.type==='cc'?c.ml.cc:null, c.ml.ch);
+        // Carry the captured name over so a lane created for an ISF shader
+        // parameter arrives already labelled. _addLane() has already built
+        // the row from the (empty) default, so the field needs syncing.
+        lane.name=(c.ml.isfName||c.ml.name||'');
+        if(lane._nameInput) lane._nameInput.value=lane.name;
+        resolved[c.index]=lane.id;
+      });
+      if(note.macroInst!=null) stripMacroInstance(note.macroInst);
+      bakeMacroOnNote(note, macro, resolved);
+      refreshTagBar(); resizeCanvases(); updateNoteInfo(); requestDraw();
+      flash('Macro "'+macro.name+'" applied at '+tickToBBT(note.start));
+    }
+    if(missing.length){ showMacroMissingLanesDialog(macro, map, missing, finish); return; }
+    finish(map, []);
+  }
+  // ── Move / delete propagation ──────────────────────────────────
+  // Re-derives what the lanes should contain from what the notes now say,
+  // rather than making every one of the many code paths that can move or
+  // delete a note (drag, nudge, Position field, quantise, Move All, Delete,
+  // erase tool, double-click) do its own bookkeeping.
+  //
+  // Bails immediately on a project with no macros — the normal case — and is
+  // only ever called from an edit, never from playback or a draw frame.
+  // Deliberately NOT called from applyState(): an undo/redo snapshot already
+  // contains consistent baked points, and re-baking there would invent a new
+  // instance id on every undo.
+  function resyncMacros(){
+    if(!state.macros||!state.macros.length) return false;
+    let changed=false;
+    const live=new Set();
+    for(const n of state.notes) if(n.macroId!=null&&n.macroInst!=null) live.add(n.macroInst);
+    // Points whose owning note no longer exists (deleted note, or a macro
+    // definition that was removed).
+    const orphans=new Set();
+    for(const lane of state.ccLanes) for(const p of lane.points) if(p.mi!=null&&!live.has(p.mi)) orphans.add(p.mi);
+    orphans.forEach(mi=>{ stripMacroInstance(mi); changed=true; });
+    for(const n of state.notes){
+      if(n.macroId==null) continue;
+      if(n.macroInst!=null && n.macroAt===n.start) continue;
+      const macro=macroById(n.macroId);
+      if(!macro){ // the macro definition itself was deleted — drop the marker
+        delete n.macroId; delete n.macroInst; delete n.macroAt; delete n.macroMap; changed=true; continue; }
+      if(n.macroInst!=null) stripMacroInstance(n.macroInst);
+      const map=(n.macroMap&&n.macroMap.length===macro.lanes.length)
+        ? n.macroMap.slice()
+        : macro.lanes.map(ml=>{ const l=findMacroLane(ml); return l?l.id:null; });
+      bakeMacroOnNote(n, macro, map);
+      changed=true;
+    }
+    return changed;
+  }
+
+  // ── UI ─────────────────────────────────────────────────────────
+  function renderMacroList(){
+    const box=$('macroList'); if(!box) return;
+    box.innerHTML='';
+    const macros=state.macros||[];
+    if(!macros.length){
+      const h=document.createElement('span'); h.className='hint';
+      h.textContent='No macros yet — select a loop range on the ruler, then Capture.';
+      box.appendChild(h); return;
+    }
+    macros.forEach(m=>{
+      const row=document.createElement('div');
+      row.className='setup-row'; row.dataset.macroId=m.id;
+      row.style.cssText='padding:2px 0;';
+      const nm=document.createElement('span'); nm.dataset.col='name'; nm.textContent=m.name;
+      nm.style.cssText='flex:1;min-width:80px;font-size:11px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      const meta=document.createElement('span'); meta.dataset.col='meta'; meta.className='hint';
+      meta.textContent=m.lanes.length+' lane'+(m.lanes.length!==1?'s':'')+' · '+m.spanTicks+'t';
+      meta.title=m.lanes.map(macroLaneLabel).join('\n');
+      const assign=document.createElement('button'); assign.dataset.act='assign'; assign.textContent='→ Note';
+      assign.title='Attach this macro to the selected note';
+      assign.addEventListener('click',()=>{
+        const sel=[...state.selection].map(byId).filter(Boolean);
+        if(sel.length!==1){ flash('Select exactly one note to attach a macro to'); return; }
+        assignMacroToNote(sel[0], m);
+      });
+      const del=document.createElement('button'); del.dataset.act='delete'; del.textContent='✕';
+      del.title='Delete this macro (notes carrying it lose their baked points)';
+      del.addEventListener('click',()=>{
+        pushUndo();
+        const i=state.macros.indexOf(m); if(i>=0) state.macros.splice(i,1);
+        resyncMacros(); renderMacroList(); updateNoteInfo(); requestDraw();
+      });
+      row.appendChild(nm); row.appendChild(meta); row.appendChild(assign); row.appendChild(del);
+      box.appendChild(row);
+    });
+  }
+
+  // Shared chrome for the two macro dialogs — same look as the drum-map /
+  // MIDI-import dialogs rather than a third style.
+  function macroDialogShell(id, title, sub){
+    const existing=document.getElementById(id); if(existing) existing.remove();
+    const dlg=document.createElement('dialog');
+    dlg.id=id;
+    dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+      +'width:min(520px,95vw);max-height:85vh;overflow:hidden;display:flex;flex-direction:column;';
+    const hdr=document.createElement('div');
+    hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;';
+    const t=document.createElement('div'); t.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;'; t.textContent=title;
+    const s=document.createElement('div'); s.style.cssText='font-size:12px;color:#7a8099;margin-top:6px;'; s.textContent=sub;
+    hdr.appendChild(t); hdr.appendChild(s); dlg.appendChild(hdr);
+    const body=document.createElement('div');
+    body.style.cssText='padding:8px 18px;font-size:12px;overflow-y:auto;flex:1 1 auto;';
+    dlg.appendChild(body);
+    const footer=document.createElement('div');
+    footer.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;display:flex;gap:8px;align-items:center;';
+    dlg.appendChild(footer);
+    return {dlg, body, footer};
+  }
+  function macroDlgButton(label, primary){
+    const b=document.createElement('button'); b.type='button'; b.textContent=label;
+    b.style.cssText=primary
+      ? 'background:#4fa3ff;color:#0d0f14;border:none;border-radius:4px;padding:6px 18px;cursor:pointer;font-size:13px;font-weight:700;'
+      : 'background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;margin-right:auto;';
+    return b;
+  }
+
+  function showMacroCaptureDialog(){
+    const a=state.locStart,b=state.locEnd;
+    if(a==null||b==null||b<=a){ flash('Set a loop range on the ruler first — Capture uses it as the macro span'); return; }
+    const cands=macroCaptureCandidates();
+    if(!cands.length){ flash('No CC lane has points in the loop range'); return; }
+    const {dlg, body, footer}=macroDialogShell('macroCaptureDialog','Capture CC Macro',
+      'Captures '+tickToBBT(a)+' → '+tickToBBT(b)+' ('+Math.round(b-a)+' ticks) from the ticked lanes. '
+      +'Points are stored relative to the range start, so the macro can be dropped on any note.');
+    const nameRow=document.createElement('div');
+    nameRow.style.cssText='display:flex;align-items:center;gap:8px;padding:4px 0 10px;';
+    const nameLbl=document.createElement('span'); nameLbl.textContent='Name'; nameLbl.style.color='#7a8099';
+    const nameInp=document.createElement('input'); nameInp.type='text'; nameInp.id='macroCaptureName';
+    nameInp.value='Macro '+((state.macros||[]).length+1);
+    nameInp.style.cssText='flex:1;background:#23272f;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:4px 6px;';
+    nameRow.appendChild(nameLbl); nameRow.appendChild(nameInp); body.appendChild(nameRow);
+    const rows=[];
+    cands.forEach(l=>{
+      const row=document.createElement('label');
+      row.dataset.laneId=l.id;
+      row.style.cssText='display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;';
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=true; // ticked by default
+      const txt=document.createElement('span'); txt.dataset.col='lane'; txt.textContent=laneLabelFor(l);
+      const cnt=document.createElement('span'); cnt.className='hint'; cnt.style.marginLeft='auto';
+      cnt.textContent=l.points.filter(p=>p.t>=a&&p.t<=b).length+' pts';
+      row.appendChild(cb); row.appendChild(txt); row.appendChild(cnt);
+      body.appendChild(row); rows.push({cb, lane:l});
+    });
+    const cancel=macroDlgButton('Cancel',false);
+    const ok=macroDlgButton('Capture',true); ok.id='macroCaptureOk';
+    footer.appendChild(cancel); footer.appendChild(ok);
+    document.body.appendChild(dlg); dlg.showModal();
+    cancel.addEventListener('click',()=>{ dlg.close(); dlg.remove(); });
+    dlg.addEventListener('cancel',()=>{ dlg.remove(); });
+    ok.addEventListener('click',()=>{
+      const ids=rows.filter(r=>r.cb.checked).map(r=>r.lane.id);
+      dlg.close(); dlg.remove();
+      if(!ids.length){ flash('No lanes ticked — nothing captured'); return; }
+      captureMacro(nameInp.value, ids);
+    });
+  }
+
+  // A macro applied in a project that lacks some of the lanes it was captured
+  // from must ASK, once per missing lane. Silently creating lanes would
+  // litter a project that deliberately routes elsewhere; silently dropping
+  // them would leave half a gesture with no sign anything was lost.
+  function showMacroMissingLanesDialog(macro, map, missing, onApply){
+    const {dlg, body, footer}=macroDialogShell('macroLanesDialog','Macro "'+macro.name+'" — missing lanes',
+      missing.length+' of this macro’s '+macro.lanes.length+' lane'+(macro.lanes.length!==1?'s':'')
+      +' do not exist in this project. Choose what to do with each.');
+    const table=document.createElement('table');
+    table.style.cssText='width:100%;border-collapse:collapse;';
+    const tbody=document.createElement('tbody');
+    const rows=[];
+    missing.forEach(i=>{
+      const ml=macro.lanes[i];
+      const tr=document.createElement('tr'); tr.dataset.macroLane=String(i);
+      const tdName=document.createElement('td'); tdName.dataset.col='lane';
+      tdName.style.cssText='padding:5px 6px 5px 0;'; tdName.textContent=macroLaneLabel(ml);
+      const tdAct=document.createElement('td'); tdAct.dataset.col='action'; tdAct.style.cssText='padding:5px 6px;';
+      const act=document.createElement('select');
+      act.style.cssText='background:#23272f;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:3px 6px;';
+      [['create','Create it'],['map','Map to…'],['skip','Skip']].forEach(([v,t])=>{
+        const o=document.createElement('option'); o.value=v; o.textContent=t; act.appendChild(o); });
+      tdAct.appendChild(act);
+      const tdTgt=document.createElement('td'); tdTgt.dataset.col='target'; tdTgt.style.cssText='padding:5px 0 5px 6px;';
+      const tgt=document.createElement('select');
+      tgt.style.cssText='background:#23272f;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:3px 6px;max-width:220px;';
+      state.ccLanes.forEach(l=>{ const o=document.createElement('option'); o.value=String(l.id); o.textContent=laneLabelFor(l); tgt.appendChild(o); });
+      // "Map to…" needs somewhere to map to. With no lanes at all in the
+      // project the option is offered but inert, so say so rather than
+      // presenting an empty picker.
+      if(!state.ccLanes.length){ const o=document.createElement('option'); o.value=''; o.textContent='(no lanes)'; tgt.appendChild(o); }
+      tdTgt.appendChild(tgt);
+      function syncTgt(){ tgt.disabled=act.value!=='map'; tgt.style.opacity=tgt.disabled?'0.35':'1'; }
+      act.addEventListener('change',syncTgt); syncTgt();
+      tr.appendChild(tdName); tr.appendChild(tdAct); tr.appendChild(tdTgt);
+      tbody.appendChild(tr); rows.push({i, act, tgt, ml});
+    });
+    table.appendChild(tbody); body.appendChild(table);
+    const cancel=macroDlgButton('Cancel',false);
+    const ok=macroDlgButton('Apply',true); ok.id='macroLanesApply';
+    footer.appendChild(cancel); footer.appendChild(ok);
+    document.body.appendChild(dlg); dlg.showModal();
+    cancel.addEventListener('click',()=>{ dlg.close(); dlg.remove(); }); // nothing is applied at all
+    dlg.addEventListener('cancel',()=>{ dlg.remove(); });
+    ok.addEventListener('click',()=>{
+      const resolved=map.slice(), creates=[];
+      rows.forEach(r=>{
+        if(r.act.value==='create') creates.push({index:r.i, ml:r.ml});
+        else if(r.act.value==='map') resolved[r.i]=r.tgt.value===''?null:+r.tgt.value;
+        else resolved[r.i]=null;
+      });
+      dlg.close(); dlg.remove();
+      onApply(resolved, creates);
+    });
   }
 
   // ---------- Curve generators ----------
@@ -5757,6 +6248,10 @@
     const SMOOTH_OFF = state.mmvSmooth ? 10 : 0; // ms to trim off Note Off end
     const SMOOTH_ON  = state.mmvSmooth ?  5 : 0; // ms gap added before Note On at beat boundary
     for(const n of state.notes){
+      // Same suppression as buildPassEvents — Follow MMV is the other path
+      // that sends notes out, so play-macro mode has to hold here too or the
+      // marker would sound whenever MME is slaved to MMV instead of playing.
+      if(state.playMacroMode && n.macroId!=null) continue;
       const end=n.start+Math.max(1,n.length);
       if(!followSentNotes.has(n.id) && n.start<lo && end>lo){
         // Chase: note in progress — send Note On immediately, schedule Note Off at natural end
@@ -6048,6 +6543,12 @@
   function buildPassEvents(a,b){
     const evs=[];
     for(const n of state.notes){ if(n.start>=a && n.start<b){
+      // Play-macro mode (state.playMacroMode, OFF by default) treats a macro
+      // note as an editing marker: its CC gesture is already expanded into
+      // ordinary lane points, so the note itself must not sound. One field
+      // test inside a loop that already existed — no added playback cost, and
+      // the CC loop below is untouched, so the gesture still plays.
+      if(state.playMacroMode && n.macroId!=null) continue;
       evs.push({tick:n.start, o:2, msg:[0x90|(n.ch&15), n.pitch&127, clamp(n.vel,1,127)]});
       const off=Math.min(b, n.start+Math.max(1,n.length)); evs.push({tick:off, o:1, msg:[0x80|(n.ch&15), n.pitch&127, 0]}); } }
     const step=Math.max(1, Math.round(state.ppq/state.ccRes));
@@ -6725,7 +7226,11 @@
     if(!delta) return;
     if(!hasMidi && !audioBuf) return; // nothing to move
     pushUndo();
-    state.notes.forEach(n=>{ n.start=Math.max(0,n.start+delta); });
+    // Notes and lane points move in lockstep here, so a macro note's baked
+    // points are already where they should be — carry macroAt along with the
+    // note so resyncMacros() doesn't mistake this for a drag and re-bake
+    // (which would be a no-op with a needless new instance id).
+    state.notes.forEach(n=>{ n.start=Math.max(0,n.start+delta); if(n.macroAt!=null) n.macroAt=n.start; });
     state.ccLanes.forEach(l=>{ l.points.forEach(p=>{ p.t=Math.max(0,Math.round(p.t+delta)); }); l.points.sort((a,b)=>a.t-b.t); });
     if(audioBuf){ state.audioOffset=(state.audioOffset||0)+delta; updateAudioOffsetBadge(); }
     let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+Math.max(1,n.length)));
@@ -6792,6 +7297,22 @@
     if(!state.syncFollow){ syncFeedStale(); clearSyncHeartbeat(); lastSyncBeatIdx=-1; } });
   $('scrollLockBtn').addEventListener('click',()=>{ state.scrollLock=!state.scrollLock; $('scrollLockBtn').classList.toggle('on',state.scrollLock);
     if(state.scrollLock) applyScrollLock(); });
+  // Play Macro. Mid-playback the current pass has already been scheduled, so
+  // reschedule it the same way the Mute/Solo toggles do — otherwise the
+  // change would only take effect at the next loop wrap.
+  $('playMacroBtn').addEventListener('click',()=>{ state.playMacroMode=!state.playMacroMode;
+    $('playMacroBtn').classList.toggle('on',state.playMacroMode);
+    if(state.playing) rescheduleCurrentPass(); });
+  $('macroCaptureBtn').addEventListener('click',()=>showMacroCaptureDialog());
+  $('macroClearNoteBtn').addEventListener('click',()=>{
+    const sel=[...state.selection].map(byId).filter(Boolean);
+    const withMacro=sel.filter(n=>n.macroId!=null);
+    if(!withMacro.length){ flash('No selected note carries a macro'); return; }
+    pushUndo();
+    withMacro.forEach(n=>{ if(n.macroInst!=null) stripMacroInstance(n.macroInst);
+      delete n.macroId; delete n.macroInst; delete n.macroAt; delete n.macroMap; });
+    updateNoteInfo(); requestDraw();
+  });
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
   $('drumMapImportBtn').onclick=()=>$('drumMapFileInput').click();
   $('drumMapFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f) return; handleDrumMapFile(f); e.target.value=''; });
@@ -6854,6 +7375,7 @@
       : 'The channel currently in focus in the main window.';
     populateClearNamesCh();
     updateMidiImportModeUI();
+    renderMacroList();
   }
   function chLabelFor(ch){ const n=(state.channelNames&&state.channelNames[ch]||'').trim(); return 'Ch'+(ch+1)+(n?' ('+n+')':''); }
 
@@ -7107,7 +7629,7 @@
     }
     if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
-      else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); }
+      else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); resyncMacros(); }
       requestDraw(); }
   });
 
@@ -10261,7 +10783,7 @@
     prScroll.scrollTop=pitchToY(84); state.scrollTop=prScroll.scrollTop;
     keysCanvas.style.transform='translateY('+(-state.scrollTop)+'px)'; prCanvas.style.transform='translate(0px,'+state.scrollTop+'px)';
     updatePlayheadEl(); updateUndoBtns(); updateLoopStatus(); updatePlayPos(); updateTransportBtns(); updateDuration();
-    updateMapButtonLabels();
+    updateMapButtonLabels(); renderMacroList();
     requestDraw();
     setupPWA();
     // Crash recovery: offer to restore a previous session's unsaved work,
