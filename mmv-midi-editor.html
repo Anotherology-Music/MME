@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.36
+  MMV MIDI & CC Curve Editor v0.9.37
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -813,6 +813,52 @@
   peak points sit near cap height — which is exactly what distinguishes this
   mark from the N it replaces.
 
+
+  v0.9.37 Setup panel reorganised, and three new import features. "Files" is
+  now IMPORT / EXPORT with three labelled subsections — MIDI, ISF and KEY NAMES
+  — because these are powerful features that had been sitting in the panel as
+  unlabelled icons with no indication of what they do.
+
+  MIDI now gets one row per action, with that action's options beside it rather
+  than three buttons sharing a row and only one of them having settings.
+  Import .mid gains a Replace all / Insert choice: Insert merges at a position
+  you set (defaulting to the playhead, editable as Bar.Beat.16th.Tick) and can
+  place the incoming events onto the View CH channel, keep the file's own
+  channels, or remap to free ones. The point is to drop a drum pattern at a
+  chosen bar, on channel 10, without touching anything already on other
+  channels — so Insert never deletes, and notes/CC/PB/CP all land offset by the
+  insert position. The offset anchors the file's FIRST event rather than its
+  tick 0, since a pattern lifted from bar 3 of another project should land where
+  you asked for it, not two bars later. Export .mid's two filters became three
+  mutually exclusive choices with an explicit "Export all". Export Sync Track
+  now explains what a sync track is for and shows the same chain-link icon the
+  transport's Follow control uses, so the connection between the two is
+  visible.
+
+  The MIDI connection status reads green when a device is actually connected
+  instead of the same amber as every section heading. It is driven by a state
+  flag rather than by matching the message text, because "disconnected"
+  contains "connected".
+
+  ISF: an Enable Preview tickbox, default on and remembered between sessions.
+  With it off the import dialog is exactly the parameter table it was before
+  v0.9.35 — the preview pane is not mounted and no renderer starts, rather than
+  being built and hidden, since a hidden pane would still hold a WebGL context
+  and browsers cap how many exist at once. "Migrate to MMV" is now "Update ISF",
+  which is what it does; the old name suggested a one-way migration. Its
+  description was also wrong in the panel and is now accurate: the "(MME)" copy
+  of a shader is made when you IMPORT it, and Update ISF rewrites that same file
+  in place — it does not create a new one each time — alongside a wiring sheet
+  for MMV's Source/Feature/CC and Modifiers.
+
+  KEY NAMES collects the naming tools. Import Drum Map (Cubase .drm) as before,
+  plus two new ones. Import CSV reads comma-delimited note/name pairs —
+  C1,Bass Drum or C1="Bass Drum", C#1="Side Stick" — quoted or not, one pair per
+  line or several, tolerating comments, a header row, and commas inside quoted
+  names, and reporting the offending line when something will not parse. Clear
+  Note Names removes the names for one channel or all of them, defaulting to the
+  channel you are looking at, and is undoable with Ctrl+Z.
+
 -->
 
 
@@ -866,14 +912,40 @@
   #bpm.field-variable,#tsNum.field-variable,#tsDen.field-variable{border-color:var(--tempoVar);color:var(--tempoVar);}
   /* ── Setup dropdown ── */
   #setupWrapper{position:relative;}
-  #setupPanel{position:absolute;top:calc(100% + 3px);right:0;width:500px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;}
+  /* 620px, up from 500px: the IMPORT / EXPORT section now puts each action's
+     options on the SAME row as the action button (Import .mid + Replace/Insert,
+     Export .mid + its three scopes). At 500px those rows wrapped mid-option-
+     group and read as unrelated controls.
+     The max-width/max-height/overflow-y guards are new with the widen: the
+     section grew tall enough to run past the bottom of a 900px screen, which
+     put Danger zone out of reach entirely. Note that the panel is anchored to
+     #setupWrapper at the right end of .toolbar-r1, which is flex-wrap:nowrap
+     and ~1915px wide — so on a window narrower than that the panel sits partly
+     off-screen no matter what width it is. That predates this change; fixing it
+     means letting row 1 wrap or scroll, which is a separate job. */
+  #setupPanel{position:absolute;top:calc(100% + 3px);right:0;width:620px;max-width:calc(100vw - 16px);max-height:calc(100vh - 60px);overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;}
   #setupPanel.open{display:block;}
   .setup-section{padding:9px 14px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px;}
   .setup-section:last-child{border-bottom:none;}
   .setup-title{font-size:9px;font-weight:700;letter-spacing:.10em;text-transform:uppercase;color:var(--accent2);}
+  /* Sub-heading inside a section (MIDI / ISF / KEY NAMES under IMPORT /
+     EXPORT). Deliberately subordinate to .setup-title, not a peer: grey
+     instead of the amber that means "section", and set in from the section's
+     left edge with a rule so the grouping reads structurally rather than
+     relying on the colour difference alone. */
+  .setup-subtitle{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--txt2);
+    margin-top:5px;padding-left:7px;border-left:2px solid var(--line);}
+  .setup-subtitle:first-of-type{margin-top:1px;}
+  /* Rows belonging to a sub-section line up under its rule rather than under
+     the section title, so the visual hierarchy survives the flex-wrap. */
+  .setup-sub-row{padding-left:9px;}
+  .setup-note{font-size:11px;color:var(--txt2);line-height:1.35;padding-left:9px;max-width:100%;}
+  .setup-note svg{vertical-align:-2px;}
+  .setup-opt{font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;}
   .setup-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
   .setup-section button{font-size:11px;padding:3px 8px;}
   .setup-section select,.setup-section input[type=number]{font-size:11px;padding:2px 5px;}
+  .setup-section input[type=text]{font-size:11px;padding:2px 5px;}
   #setupBtn.open{background:var(--accent2);color:#1a1200;border-color:var(--accent2);font-weight:600;}
   /* ── Time Signature / Tempo Map dropdowns — a matched pair of buttons (see
      .map-btn-grp) that split what used to be one combined "Time Sig" popover.
@@ -1439,7 +1511,13 @@
   .adv-sel{font-size:11px;background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:3px;padding:1px 2px;}
   .ab-btn{font-size:11px;font-weight:700;padding:1px 8px;background:transparent;border:1px solid var(--line);border-radius:3px;color:var(--txt2);cursor:pointer;}
   .ab-btn.ab-active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  /* Amber is this panel's "heading / neutral notice" colour, so a connected
+     port read exactly like a section label. Green (--pos, the app's only
+     other semantic colour) now means "a port is actually connected"; every
+     other state — not enabled, no outputs, disconnected, error — stays amber
+     so the one green line is unambiguous at a glance. */
   #midiStatus{color:var(--accent2);}
+  #midiStatus.ok{color:var(--pos);}
 </style>
 
 <div id="app">
@@ -1562,31 +1640,85 @@
           </div>
         </div>
         <div class="setup-section">
-          <div class="setup-title">Files</div>
-          <div class="setup-row">
-            <button id="importBtn">Import .mid</button>
-            <button id="exportBtn">Export .mid</button>
+          <div class="setup-title">IMPORT / EXPORT</div>
+
+          <div class="setup-subtitle">MIDI</div>
+          <!-- One row per action, that action's options alongside it. The old
+               layout put all three buttons on one row and hung the export
+               options underneath, which read as if they applied to Import. -->
+          <div class="setup-row setup-sub-row">
+            <button id="importBtn" style="width:104px;">Import .mid</button>
+            <label class="setup-opt" title="Wipe the project and replace it with the file's contents (tempo map, time signatures, notes and lanes)">
+              <input type="radio" name="midiImportMode" id="midiImportReplace" value="replace" checked> Replace all
+            </label>
+            <label class="setup-opt" title="Add the file's contents to the project at the Insert at position, leaving every existing note and lane untouched">
+              <input type="radio" name="midiImportMode" id="midiImportInsert" value="insert"> Insert
+            </label>
+            <select id="midiInsertChMode" disabled style="width:172px;" title="Which MIDI channel the inserted data lands on">
+              <option value="viewch">onto the View CH channel</option>
+              <option value="keep">keeping the file's channels</option>
+              <option value="free">remapped to free channels</option>
+            </select>
+          </div>
+          <div class="setup-row setup-sub-row" id="midiInsertAtRow">
+            <span class="lbl">Insert at</span>
+            <input type="text" id="midiInsertAt" value="1.1.1.0" style="width:92px;font-family:ui-monospace,Consolas,monospace;color:var(--pos);" title="Timeline position for the first imported event (Bar.Beat.16th.Tick). Defaults to the playhead every time Setup is opened.">
+            <button id="midiInsertAtPlayhead" title="Reset to the current playhead position">&#x21BA; Playhead</button>
+            <span class="lbl">View CH</span>
+            <span id="midiInsertChLbl" class="hint" style="color:var(--accent2);">Ch1</span>
+          </div>
+
+          <div class="setup-row setup-sub-row">
+            <button id="exportBtn" style="width:104px;">Export .mid</button>
+            <!-- Radios, not checkboxes: the three scopes are mutually
+                 exclusive. #exportSoloOnly / #exportExcludeMuted keep their
+                 ids and their .checked semantics, so exportMidi() is
+                 unchanged — "Export all" is simply "neither is checked". -->
+            <label class="setup-opt" title="Export every lane, ignoring mute and solo">
+              <input type="radio" name="exportMode" id="exportAll" checked> Export all
+            </label>
+            <label class="setup-opt" title="Export .mid only includes lanes with at least one Soloed lane in the project — has no effect when nothing is soloed">
+              <input type="radio" name="exportMode" id="exportSoloOnly"> Solo lanes only
+            </label>
+            <label class="setup-opt" title="Export .mid leaves out any Muted lane">
+              <input type="radio" name="exportMode" id="exportExcludeMuted"> Exclude muted tracks
+            </label>
+          </div>
+
+          <div class="setup-row setup-sub-row">
             <button id="syncExport" title="Export a sync-track MIDI for MMV. Re-export whenever Tempo, Bars, or Sig changes.">Export Sync Track</button>
           </div>
-          <div class="setup-row" style="font-size:11px;color:var(--txt2);">
-            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Export .mid only includes lanes with at least one Soloed lane in the project — has no effect when nothing is soloed">
-              <input type="checkbox" id="exportSoloOnly"> Export Solo lanes only
-            </label>
-            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Export .mid leaves out any Muted lane">
-              <input type="checkbox" id="exportExcludeMuted"> Exclude Muted lanes
-            </label>
-          </div>
-          <div class="setup-row">
-            <span style="font-size:11px;color:var(--txt2);">Save Project / Load Project moved to the top row, next to the project name.</span>
-          </div>
-          <div class="setup-row">
+          <div class="setup-note">This will create a MIDI file to copy into MMV. When you play an MMV project with a sync track, and the
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            icon is on in the MME transport, MME will listen for that track and synchronise playback.</div>
+
+          <div class="setup-subtitle">ISF</div>
+          <div class="setup-row setup-sub-row">
             <button id="isfImportBtn" title="Import ISF shader parameters as CC lanes (v0.5.0)">&#x2B21; Import ISF</button>
             <input type="file" id="isfFileInput" accept=".fs,.glsl,.isf,.frag" style="display:none">
-            <button id="isfMigrateBtn" title="Review which imported ISF parameters are automated vs. static, bake updated defaults, and export a wiring sheet for MMV's Source/Feature/CC + Modifiers">&#x21C4; Migrate to MMV</button>
+            <label class="setup-opt" title="Show the shader alongside the parameter table while you choose which parameters get a CC# lane">
+              <input type="checkbox" id="isfPreviewEnable" checked> Enable Preview
+            </label>
           </div>
-          <div class="setup-row">
-            <button id="drumMapImportBtn" title="Import a Cubase drum map (.drm) to name piano-roll keys on a chosen channel — e.g. General MIDI percussion note names">&#x1F941; Import Drum Map</button>
+          <div class="setup-note">Enabling preview will display the shader so you can visually validate which parameters you wish to create a CC# lane to control.</div>
+          <div class="setup-row setup-sub-row">
+            <button id="isfMigrateBtn" title="Review which imported ISF parameters are automated vs. static, bake updated defaults into the shader's &quot;(MME)&quot; working copy, and export a wiring sheet for MMV's Source/Feature/CC + Modifiers">&#x21C4; Update ISF</button>
+          </div>
+          <div class="setup-note">Rewrites the &ldquo;(MME)&rdquo; working copy that Import ISF put in your project folder &mdash; baking the values at the playhead in as the shader&rsquo;s new ISF defaults, so it opens elsewhere looking the way you set it up here. It also downloads a wiring sheet listing each automated parameter&rsquo;s channel, CC# and Scale/Offset/Step for MMV&rsquo;s Source/Feature/CC + Modifiers.</div>
+
+          <div class="setup-subtitle">KEY NAMES</div>
+          <div class="setup-row setup-sub-row">
+            <button id="drumMapImportBtn" title="Import a Cubase drum map (.drm) to name piano-roll keys on a chosen channel — e.g. General MIDI percussion note names">&#x1F941; Import Drum Map (Cubase .drm)</button>
             <input type="file" id="drumMapFileInput" accept=".drm,.xml" style="display:none">
+          </div>
+          <div class="setup-row setup-sub-row">
+            <button id="csvNamesImportBtn" title="Import comma-delimited note,name pairs — e.g. C1=&quot;Bass Drum&quot;, C#1=&quot;Side Stick&quot;">&#x1F5D2; Import CSV</button>
+            <input type="file" id="csvNamesFileInput" accept=".csv,.txt" style="display:none">
+            <span class="hint">note,name pairs &mdash; C1="Bass Drum", C#1="Side Stick"</span>
+          </div>
+          <div class="setup-row setup-sub-row">
+            <button id="clearNamesBtn" class="warn" title="Delete the custom key names on the chosen channel (undoable with Ctrl+Z)">Clear Note Names</button>
+            <select id="clearNamesCh" style="width:190px;" title="Which channel's key names to clear"></select>
           </div>
         </div>
         <div class="setup-section" id="chNamesSection">
@@ -2140,6 +2272,22 @@
   function isBlack(p){ return [1,3,6,8,10].includes(((p%12)+12)%12); }
   function noteName(p){ const n=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
     return n[((p%12)+12)%12]+(Math.floor(p/12)-2); } // note 36 = C1
+  // Inverse of noteName(), and then some: noteName only ever emits sharps, but
+  // a hand-written CSV of key names is just as likely to say Db1 as C#1, so
+  // both spellings (and double accidentals, and the ASCII "s" for sharp that
+  // some exporters use) resolve to the same pitch. Same octave convention as
+  // noteName — C1 = 36. Returns null for anything unparseable or out of the
+  // 0–127 MIDI range, so callers can report the offending text rather than
+  // silently naming the wrong key.
+  const NOTE_LETTER_SEMI={c:0,d:2,e:4,f:5,g:7,a:9,b:11};
+  function noteNameToPitch(str){
+    const m=/^\s*([A-Ga-g])\s*([#♯sS]{0,2}|[b♭]{0,2})\s*(-?\d{1,2})\s*$/.exec(String(str||''));
+    if(!m) return null;
+    let acc=0;
+    for(const c of m[2]) acc+=(c==='b'||c==='♭')?-1:1;
+    const p=NOTE_LETTER_SEMI[m[1].toLowerCase()]+acc+(parseInt(m[3],10)+2)*12;
+    return (p>=0&&p<=127)?p:null;
+  }
   function pitchName(p,ch){ return state.pitchNames[ch+'_'+p]||state.pitchNames[p]||null; }
   function noteLabel(p,ch){ const cn=pitchName(p,ch??state.viewCh??state.defCh); return cn||noteName(p); }
   function tickToBBT(t){ const {bar,seg,tickInBar}=walkToTick(t);
@@ -5014,7 +5162,36 @@
         else if(type===0xC0){ p+=1; } else { p++; } } p=end; }
     return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,cpMap,mmvMeta,tsEvents,tempoEvents}; }
   function closeNote(open,ch,pitch,abs,notes){ const arr=open[ch+'_'+pitch]; if(arr&&arr.length){ const o=arr.shift(); notes.push({start:o.start,length:Math.max(1,abs-o.start),pitch,vel:o.vel,ch}); } }
+  // Reads the Setup panel's Import .mid options. Kept separate from
+  // importMidi() so the parsing of the "Insert at" field (which can hold
+  // whatever the user typed) happens in one place, and so a headless test can
+  // drive applyMidiImport directly with the same opts shape.
+  function midiInsertOpts(){
+    const at=$('midiInsertAt'), t=at?bbtToTick((at.value||'').trim()):0;
+    return { offset:(isNaN(t)||t<0)?0:t,
+             chMode:($('midiInsertChMode')||{}).value||'viewch',
+             targetCh:focusCh() };
+  }
+  // "The channel currently in focus" — View CH when it's filtering to one,
+  // otherwise the New Note default channel. Same fallback chain noteLabel()
+  // uses, so an inserted drum pattern lands on whatever channel the key names
+  // on screen already belong to.
+  function focusCh(){ const c=state.viewCh!=null?state.viewCh:state.defCh; return clamp(c|0,0,15); }
   function importMidi(buf, filename){ let r; try{ r=parseMidi(buf); }catch(err){ alert('Could not read file: '+err.message); return; }
+    // Insert is an explicit, already-answered choice about how to combine the
+    // file with the project, so it skips the Replace/Merge chooser entirely —
+    // asking again would only offer to undo what was just ticked.
+    const insertChosen=$('midiImportInsert') && $('midiImportInsert').checked;
+    if(insertChosen){
+      const io=midiInsertOpts();
+      // 'free' is the existing merge remap, just reached from the Insert row
+      // instead of the Replace/Merge chooser — so it rides on the same
+      // remapChannels argument rather than growing a parallel code path.
+      applyMidiImport(r,'insert',io.chMode==='free',io);
+      flash('Inserted '+(filename||'MIDI file')+' at '+tickToBBT(io.offset)
+        +(io.chMode==='viewch'?' on Ch'+(io.targetCh+1):''));
+      return;
+    }
     if(!projectHasContent()){ applyMidiImport(r,'replace'); return; }
     showMidiImportDialog(r, filename||'MIDI file');
   }
@@ -5075,6 +5252,76 @@
     out.sort((a,b)=>a.note-b.note);
     return out;
   }
+  // ═══ Note-name CSV import ══════════════════════════════════════
+  // A plain text list of note,name pairs. Two spellings are accepted because
+  // both turn up in the wild and in the way people describe this file:
+  //   C1,Bass Drum                  ← classic CSV, one pair per line
+  //   C1="Bass Drum", C#1="Side Stick"   ← name=value, several pairs per line
+  // Quoting is optional in both; quotes are what let a name contain a comma.
+  // Rather than guess, the line is classified by whether it has a top-level
+  // "=": with one, every comma separates PAIRS; without one, commas separate
+  // FIELDS and an even number of them is read as alternating note,name.
+  // An odd field count is reported rather than silently dropping the tail.
+  function splitTopLevel(s,sep){
+    const out=[]; let cur='',q=false;
+    for(let i=0;i<s.length;i++){
+      const c=s[i];
+      if(c==='"'){ q=!q; continue; }
+      if(c===sep&&!q){ out.push(cur); cur=''; continue; }
+      cur+=c;
+    }
+    out.push(cur);
+    return out;
+  }
+  function hasTopLevelEq(s){ let q=false; for(const c of s){ if(c==='"') q=!q; else if(c==='='&&!q) return true; } return false; }
+  function parseNoteNameCsv(text){
+    const byNote=new Map(), errors=[];
+    String(text||'').split(/\r?\n/).forEach((raw,idx)=>{
+      const lineNo=idx+1, line=raw.trim();
+      if(!line||line.startsWith('//')||line.startsWith(';')) return;
+      const fail=reason=>errors.push({line:lineNo,text:raw.trim(),reason});
+      const accept=(noteTxt,nameTxt)=>{
+        const note=noteNameToPitch(noteTxt);
+        if(note==null){ fail('not a note name in 0–127 ("'+String(noteTxt).trim()+'")'); return; }
+        const name=String(nameTxt).replace(/^\s*"|"\s*$/g,'').trim();
+        if(!name){ fail('empty name'); return; }
+        byNote.set(note,name); // last spelling of a note wins
+      };
+      if(hasTopLevelEq(line)){
+        splitTopLevel(line,',').forEach(rec=>{
+          if(!rec.trim()) return;
+          const eq=rec.indexOf('=');
+          if(eq<0){ fail('expected note="name"'); return; }
+          accept(rec.slice(0,eq),rec.slice(eq+1));
+        });
+        return;
+      }
+      const f=splitTopLevel(line,',').map(x=>x.trim());
+      // Spreadsheet exports often lead with a header row; treat it as
+      // structure, not as a broken pair.
+      if(lineNo<=1&&f.length===2&&/^(note|pitch|key)$/i.test(f[0])&&/^(name|label)$/i.test(f[1])) return;
+      if(f.length<2||f.length%2!==0){ fail('expected note,name pairs (got '+f.length+' field'+(f.length!==1?'s':'')+')'); return; }
+      for(let i=0;i<f.length;i+=2) accept(f[i],f[i+1]);
+    });
+    const entries=[...byNote.entries()].map(([note,name])=>({note,name})).sort((a,b)=>a.note-b.note);
+    return {entries,errors};
+  }
+  function handleNoteNameCsvFile(file){
+    const fr=new FileReader();
+    fr.onload=()=>{
+      const {entries,errors}=parseNoteNameCsv(fr.result);
+      if(!entries.length){
+        flash(errors.length?('CSV import failed — line '+errors[0].line+': '+errors[0].reason):'No note,name pairs found in that file');
+        return;
+      }
+      showDrumMapImportDialog(entries,file.name,{
+        title:'Import Note Names (CSV)',
+        msg:'Tick the notes to name, choose the channel, then Import.',
+        errors, allTicked:true });
+    };
+    fr.readAsText(file);
+  }
+
   function handleDrumMapFile(file){
     const fr=new FileReader();
     fr.onload=()=>{
@@ -5092,7 +5339,17 @@
   // built from) so importing a mostly-empty map doesn't clobber 100+ keys
   // with meaningless labels; still listed (unticked) so they can be opted
   // back in individually if genuinely wanted.
-  function showDrumMapImportDialog(entries, filename){
+  // opts (all optional) let the CSV note-name importer reuse this dialog
+  // wholesale — same channel picker, same tick/untick review, same
+  // pitchNames write — instead of growing a near-identical second one:
+  //   title / msg   — header wording
+  //   errors        — parse failures to surface above the rows, each with the
+  //                   offending source line (a CSV can be malformed line by
+  //                   line; a .drm either parses as XML or doesn't)
+  //   allTicked     — skip the "Sound N" placeholder heuristic, which is a
+  //                   Cubase-template artefact with no CSV equivalent
+  function showDrumMapImportDialog(entries, filename, opts){
+    opts=opts||{};
     const existing=document.getElementById('drumMapImportDialog'); if(existing) existing.remove();
     const dlg=document.createElement('dialog');
     dlg.id='drumMapImportDialog';
@@ -5101,10 +5358,30 @@
 
     const hdr=document.createElement('div');
     hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;';
-    const hdrTitle=document.createElement('div'); hdrTitle.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;'; hdrTitle.textContent='Import Drum Map';
+    // Stable id rather than leaving tests to find the title by position or by
+    // matching an inline style string (style attributes set via cssText come
+    // back re-serialised with spaces, so [style*="font-weight:700"] never
+    // matches — a trap the drum-map dialog's own tests already sidestepped by
+    // matching on "monospace" instead).
+    const hdrTitle=document.createElement('div'); hdrTitle.id='drumMapImportTitle'; hdrTitle.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;'; hdrTitle.textContent=opts.title||'Import Drum Map';
     const hdrFile=document.createElement('div'); hdrFile.style.cssText='font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;'; hdrFile.textContent=filename;
-    const hdrMsg=document.createElement('div'); hdrMsg.style.cssText='font-size:12px;color:#7a8099;margin-top:8px;'; hdrMsg.textContent='Tick the notes to name, choose the channel, then Import. Generic placeholder names ("Sound N", "---") start unticked.';
+    const hdrMsg=document.createElement('div'); hdrMsg.style.cssText='font-size:12px;color:#7a8099;margin-top:8px;'; hdrMsg.textContent=opts.msg||'Tick the notes to name, choose the channel, then Import. Generic placeholder names ("Sound N", "---") start unticked.';
     hdr.appendChild(hdrTitle); hdr.appendChild(hdrFile); hdr.appendChild(hdrMsg);
+    if(opts.errors&&opts.errors.length){
+      const errBox=document.createElement('div');
+      errBox.id='noteNameCsvErrors';
+      errBox.style.cssText='margin-top:8px;padding:6px 8px;border:1px solid #5a3b1a;border-radius:4px;background:#241c11;'
+        +'font-size:11px;color:#ffb454;max-height:110px;overflow-y:auto;';
+      errBox.appendChild(Object.assign(document.createElement('div'),{textContent:'⚠ '+opts.errors.length+' line'+(opts.errors.length!==1?'s':'')+' could not be read (skipped):',style:'font-weight:700;margin-bottom:3px;'}));
+      opts.errors.forEach(er=>{
+        const d=document.createElement('div');
+        d.className='csv-err';
+        d.style.cssText='font-family:monospace;white-space:pre-wrap;word-break:break-all;';
+        d.textContent='line '+er.line+': '+er.reason+' — '+er.text;
+        errBox.appendChild(d);
+      });
+      hdr.appendChild(errBox);
+    }
     dlg.appendChild(hdr);
 
     const chRow=document.createElement('div');
@@ -5126,7 +5403,7 @@
       // Cubase's own blank-template placeholders — seen in the wild as both
       // "Sound N" (numbered) and a bare run of dashes, depending which
       // template the map started from.
-      const isPlaceholder=/^Sound\s+\d+$/i.test(entry.name)||/^-+$/.test(entry.name);
+      const isPlaceholder=!opts.allTicked&&(/^Sound\s+\d+$/i.test(entry.name)||/^-+$/.test(entry.name));
       const row=document.createElement('label');
       row.style.cssText='display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;';
       const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!isPlaceholder;
@@ -5249,7 +5526,15 @@
     const out=[]; evs.forEach(e=>{ if(out.length&&out[out.length-1].tick===e.tick) out[out.length-1]=e; else out.push(e); });
     return out;
   }
-  function applyMidiImport(r, mode, remapChannels){
+  // mode: 'replace' wipes the project first; 'merge' and 'insert' both add to
+  // it without touching anything already there. 'insert' is 'merge' plus the
+  // two transforms the Setup panel's Insert options describe — a tick offset
+  // (land the file at a chosen timeline position) and an optional channel
+  // force — passed as insertOpts {offset, chMode, targetCh}. Neither of those
+  // can delete or overwrite data on any channel: notes are pushed, and CC/PB/CP
+  // arrive as brand-new lanes, exactly as merge already did. That's what makes
+  // "drop a drum pattern onto Ch10 at bar 9" safe for the rest of the project.
+  function applyMidiImport(r, mode, remapChannels, insertOpts){
     pushUndo();
     if(mode==='replace'){
       state.ppq=midiDiv(r); state.tsNum=r.tsN; state.tsDen=r.tsD;
@@ -5272,12 +5557,40 @@
       syncInputs(); updateDuration(); resizeCanvases();
       return;
     }
-    // merge — add the imported notes/lanes alongside whatever is already in the project
+    // merge / insert — add the imported notes/lanes alongside whatever is already in the project
     const scale=state.ppq/midiDiv(r);
-    let notes=r.notes.map(n=>({pitch:n.pitch,start:Math.round(n.start*scale),length:Math.max(1,Math.round(n.length*scale)),vel:n.vel,ch:n.ch}));
+    const io=(mode==='insert'&&insertOpts)?insertOpts:null;
+    // The offset is applied AFTER the ppq rescale, because it is a position in
+    // this project's ticks (it came from bbtToTick on the project's own bar
+    // ruler), not in the file's.
+    const off=io?Math.max(0,Math.round(io.offset||0)):0;
+    // A file's own events can start well after tick 0 (a pattern exported from
+    // bar 5 of some other project). "Insert at" should mean "the first event
+    // lands here", not "tick 0 of the file lands here" — otherwise the inserted
+    // block appears at an arbitrary distance past the position the user typed.
+    let srcZero=0;
+    if(io){
+      let first=Infinity;
+      r.notes.forEach(n=>{ if(n.start<first) first=n.start; });
+      [r.ccMap,r.pbMap||{},r.cpMap||{}].forEach(m=>Object.values(m).forEach(l=>l.points.forEach(pt=>{ if(pt.t<first) first=pt.t; })));
+      if(isFinite(first)) srcZero=Math.round(first*scale);
+    }
+    const shift=off-srcZero;
+    let notes=r.notes.map(n=>({pitch:n.pitch,start:Math.max(0,Math.round(n.start*scale)+shift),length:Math.max(1,Math.round(n.length*scale)),vel:n.vel,ch:n.ch}));
     let ccList=Object.values(r.ccMap).map(l=>({cc:l.cc,ch:l.ch,points:l.points}));
     let pbList=Object.values(r.pbMap||{}).map(l=>({ch:l.ch,points:l.points}));
     let cpList=Object.values(r.cpMap||{}).map(l=>({ch:l.ch,points:l.points}));
+    const shiftPt=pt=>({t:Math.max(0,Math.round(pt.t*scale)+shift),v:pt.v});
+    if(io&&io.chMode==='viewch'){
+      // Everything onto one channel — the drum-pattern-to-Ch10 case. Done
+      // before the free-channel remap below so the two can't fight.
+      const tc=clamp(io.targetCh|0,0,15);
+      notes=notes.map(n=>({...n,ch:tc}));
+      ccList=ccList.map(l=>({...l,ch:tc}));
+      pbList=pbList.map(l=>({...l,ch:tc}));
+      cpList=cpList.map(l=>({...l,ch:tc}));
+      remapChannels=false;
+    }
     if(remapChannels){
       const used=usedChannels();
       const incoming=[...importedChannels(r)].sort((a,b)=>a-b);
@@ -5292,14 +5605,14 @@
     }
     notes.forEach(n=>state.notes.push({id:state.nextId++,...n}));
     let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+n.length));
-    ccList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,Math.round(pt.t*scale))));
-    pbList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,Math.round(pt.t*scale))));
-    cpList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,Math.round(pt.t*scale))));
+    ccList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
+    pbList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
+    cpList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
     state.bars=Math.max(state.bars,Math.ceil(maxT/ticksPerBar())+1);
     const newLanes=[];
-    ccList.forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(pt=>({t:Math.round(pt.t*scale),v:pt.v})):[{t:0,v:64},{t:totalTicks(),v:64}]; newLanes.push(lane); });
-    pbList.forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:Math.round(pt.t*scale),v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
-    cpList.forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:Math.round(pt.t*scale),v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
+    ccList.forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:64},{t:totalTicks(),v:64}]; newLanes.push(lane); });
+    pbList.forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
+    cpList.forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
     if(r.mmvMeta){
       Object.assign(state.pitchNames, r.mmvMeta.pitchNames||{});
       const ln=r.mmvMeta.laneNames||{};
@@ -5322,7 +5635,7 @@
       settled=true; midiAccess=access;
       midiAccess.onstatechange=e=>{
         const p=e.port;
-        setMidiStatus((p.type==='output'?'Out':'In')+' '+p.state+': '+p.name);
+        setMidiStatus((p.type==='output'?'Out':'In')+' '+p.state+': '+p.name, p.state==='connected');
         populateOuts(); populateIns();
         if(p.type==='output' && p.state==='connected' && p.id===lastMidiOutId) setMidiOutById(p.id);
       };
@@ -5613,7 +5926,10 @@
     }
     recCountInTimer=setTimeout(()=>{ recCountInTimer=null; recCountInNodes=null; beginRecording(recordStartWall); }, Math.max(0,recordStartWall-performance.now()));
   }
-  function setMidiStatus(t){ $('midiStatus').textContent=t; }
+  // `ok` is passed explicitly by the one caller that knows a port genuinely
+  // came up, rather than sniffing the message text for "connected" — the
+  // statechange message also carries "disconnected", which contains it.
+  function setMidiStatus(t,ok){ const el=$('midiStatus'); el.textContent=t; el.classList.toggle('ok',!!ok); }
   function mSend(arr,ts){
     const o=state.midiOut;
     if(!o) return;
@@ -6421,6 +6737,85 @@
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
   $('drumMapImportBtn').onclick=()=>$('drumMapFileInput').click();
   $('drumMapFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f) return; handleDrumMapFile(f); e.target.value=''; });
+  $('csvNamesImportBtn').onclick=()=>$('csvNamesFileInput').click();
+  $('csvNamesFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f) return; handleNoteNameCsvFile(f); e.target.value=''; });
+
+  // ── Setup ▸ IMPORT / EXPORT ▸ ISF: Enable Preview ────────────────
+  // Persisted the same way the last-used MIDI ports are (plain localStorage
+  // inside try/catch — setItem throws outright in Safari private browsing,
+  // and a lost preference must never take the app down with it). Absent key
+  // means "never touched", which keeps the markup's checked default.
+  const ISF_PREVIEW_KEY='mmv-isf-preview';
+  try{ const v=localStorage.getItem(ISF_PREVIEW_KEY); if(v!==null) $('isfPreviewEnable').checked=(v==='1'); }catch(e){}
+  $('isfPreviewEnable').addEventListener('change',()=>{
+    try{ localStorage.setItem(ISF_PREVIEW_KEY,$('isfPreviewEnable').checked?'1':'0'); }catch(e){}
+  });
+
+  // ── Setup ▸ IMPORT / EXPORT ▸ MIDI: Import .mid options ──────────
+  // Insert's extras stay disabled (not hidden) while Replace all is selected,
+  // so the row doesn't reflow the whole panel every time the radio flips.
+  function updateMidiImportModeUI(){
+    const ins=$('midiImportInsert').checked;
+    $('midiInsertChMode').disabled=!ins;
+    const row=$('midiInsertAtRow');
+    row.style.opacity=ins?'1':'0.45';
+    $('midiInsertAt').disabled=!ins;
+    $('midiInsertAtPlayhead').disabled=!ins;
+  }
+  document.querySelectorAll('input[name="midiImportMode"]').forEach(r=>r.addEventListener('change',updateMidiImportModeUI));
+  $('midiInsertAtPlayhead').addEventListener('click',()=>{ $('midiInsertAt').value=tickToBBT(state.playhead); });
+  // Normalise whatever was typed back through the project's own bar ruler, so
+  // a half-typed "9" becomes "9.1.1.0" rather than silently meaning something
+  // different to bbtToTick than it looks like it means.
+  $('midiInsertAt').addEventListener('change',()=>{
+    const t=bbtToTick(($('midiInsertAt').value||'').trim());
+    $('midiInsertAt').value=tickToBBT(isNaN(t)||t<0?0:t);
+  });
+  // Re-seeded on every Setup open: the playhead and View CH both move while
+  // the panel is shut, and the Clear Note Names picker shows channel names
+  // that are edited further down this same panel.
+  function refreshSetupPanelDynamics(){
+    if(!$('midiImportInsert').checked||document.activeElement!==$('midiInsertAt')) $('midiInsertAt').value=tickToBBT(state.playhead);
+    $('midiInsertChLbl').textContent=chLabelFor(focusCh())+(state.viewCh==null?' (View CH: All)':'');
+    populateClearNamesCh();
+    updateMidiImportModeUI();
+  }
+  function chLabelFor(ch){ const n=(state.channelNames&&state.channelNames[ch]||'').trim(); return 'Ch'+(ch+1)+(n?' ('+n+')':''); }
+
+  // ── Setup ▸ IMPORT / EXPORT ▸ KEY NAMES: Clear Note Names ────────
+  function populateClearNamesCh(){
+    const sel=$('clearNamesCh'); if(!sel) return;
+    sel.innerHTML='';
+    const all=document.createElement('option'); all.value='all'; all.textContent='ALL'; sel.appendChild(all);
+    for(let c=0;c<16;c++){ const o=document.createElement('option'); o.value=String(c); o.textContent=chLabelFor(c); sel.appendChild(o); }
+    // Always snap back to the channel in focus. An earlier version tried to
+    // keep a previous non-default pick, but it could not tell a deliberate
+    // choice from the last auto-default, so switching View CH and reopening
+    // Setup left the picker aimed at the channel you had just navigated away
+    // from — the most dangerous possible default for a delete button. This
+    // only runs when the panel is (re)opened, so a pick made while it is open
+    // is never clobbered.
+    sel.value=String(focusCh());
+  }
+  refreshSetupPanelDynamics(); // seed before the panel is ever opened
+  $('clearNamesBtn').addEventListener('click',()=>{
+    const v=$('clearNamesCh').value;
+    // state.pitchNames is already part of snapshot()/applyState(), so a plain
+    // pushUndo() before the delete is all Ctrl+Z needs — no snapshot change
+    // was required for this.
+    const keys=Object.keys(state.pitchNames);
+    const doomed=v==='all'?keys:keys.filter(k=>{
+      const i=k.indexOf('_');
+      // Legacy channel-less keys (bare pitch, see pitchName()) belong to no
+      // single channel, so only ALL clears them.
+      return i>0 && k.slice(0,i)===v;
+    });
+    if(!doomed.length){ flash(v==='all'?'No custom key names to clear':'No custom key names on '+chLabelFor(+v)); return; }
+    pushUndo();
+    doomed.forEach(k=>{ delete state.pitchNames[k]; });
+    requestDraw(); updateNoteInfo();
+    flash('Cleared '+doomed.length+' key name'+(doomed.length!==1?'s':'')+(v==='all'?' (all channels)':' on '+chLabelFor(+v))+' — Ctrl+Z to undo');
+  });
   $('saveProjectBtn').onclick=saveProject;
   $('loadProjectBtn').addEventListener('click',e=>{ e.stopPropagation();
     if(!hasFSA){ $('projectFileInput').click(); return; }
@@ -7883,8 +8278,10 @@
       const w=await fh.createWritable(); await w.write(text); await w.close();
     }
 
-    // Migrate to MMV's export target: the same "(MME)" working copy every
-    // time, updated in place — not a fresh "...migrated.fs" per export.
+    // Update ISF's export target (the button was "Migrate to MMV" until this
+    // release; the internal openMigrateSheet/isfMigrate* names still say so):
+    // the same "(MME)" working copy every time, updated in place — not a fresh
+    // "...migrated.fs" per export.
     // Mirrors saveProject()'s own try-the-project-folder-then-download
     // fallback. Returns true if it wrote straight into the folder, false if
     // it fell back to a browser download the user needs to save over the
@@ -7907,6 +8304,16 @@
       const rows=buildMappingRows(inputs);
       if(!rows.length){ flash('No mappable parameters found in ISF shader.'); return; }
 
+      // Setup ▸ IMPORT / EXPORT ▸ ISF ▸ Enable Preview, read once per open and
+      // recorded on the dialog so the preview pane and its effect scan are
+      // built (or skipped entirely) off a single decision rather than each
+      // consulting the checkbox for itself. Absent checkbox = on, so a
+      // stripped-down embed still gets the default behaviour.
+      // NOTE: this build renders only the parameter table — there is no
+      // preview pane here yet for the "off" branch to skip.
+      const isfPreviewCb=document.getElementById('isfPreviewEnable');
+      const previewEnabled=!isfPreviewCb||isfPreviewCb.checked;
+
       // Anything whose TYPE isn't one buildMappingRows knows how to turn
       // into a row (a genuinely unsupported/unrecognized type, or a typo)
       // would otherwise vanish from this dialog with zero indication —
@@ -7923,8 +8330,9 @@
 
       const dlg=document.createElement('dialog');
       dlg.id='isfDialog';
+      dlg.dataset.preview=previewEnabled?'on':'off';
       dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
-        +'width:min(1340px,97vw);max-height:92vh;overflow:hidden;display:flex;flex-direction:column;';
+        +'width:min('+(previewEnabled?1340:960)+'px,97vw);max-height:92vh;overflow:hidden;display:flex;flex-direction:column;';
 
       // ── Title header ────────────────────────────────────────────
       const shaderTitle=header.LABEL||header.label||header.DESCRIPTION||filename||'ISF Shader';
@@ -8275,7 +8683,12 @@
       pvCtls.style.cssText='flex:1;overflow-y:auto;padding:8px 12px 12px;border-top:1px solid #23272f;';
       pv.appendChild(pvCtls);
 
-      bodyRow.appendChild(pv);
+      // Setup ▸ IMPORT / EXPORT ▸ ISF ▸ "Enable Preview" governs whether the
+      // pane is mounted at all. Building it and hiding it would still create a
+      // WebGL context, and browsers cap how many exist at once — so with the
+      // preference off the dialog is exactly the parameter table it was before
+      // the preview existed, and costs nothing extra.
+      if(previewEnabled) bodyRow.appendChild(pv);
       dlg.appendChild(bodyRow);
 
       // ── Footer ────────────────────────────────────────────────────
@@ -8667,7 +9080,8 @@
       topBtn.addEventListener('click',tickTopMovers);
       useValsBtn.addEventListener('click',defaultsFromPreview);
       dlg.addEventListener('close',stopPreview);
-      startPreview();
+      if(previewEnabled) startPreview();
+      else { scanBtn.disabled=true; topBtn.disabled=true; useValsBtn.disabled=true; }
 
       // Initial state — all unticked, dimmable cells dimmed
       rowRefs.forEach(function(ref){ ref.setDimmed(true); ref.checkConflict(); });
@@ -8923,7 +9337,7 @@
       const hdr=document.createElement('div');
       hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;';
       hdr.innerHTML=
-        '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x21C4; Migrate to MMV</div>'
+        '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x21C4; Update ISF</div>'
         +'<div style="font-size:12px;color:#4fa3ff;margin-top:3px;">'+escHtml(entry.label||entry.filename)+'</div>'
         +'<div style="font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;">'+escHtml(entry.filename)+'</div>'
         +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Static rows get their ISF default updated to the current playhead value. Automated rows get a wiring-sheet entry (channel, CC, Scale/Offset/Step) for MMV\'s modifiers.</div>';
@@ -9130,7 +9544,7 @@
         +'width:min(520px,95vw);max-height:80vh;overflow:hidden;display:flex;flex-direction:column;';
       const hdr=document.createElement('div');
       hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;font-size:14px;font-weight:700;color:#e0e4ef;';
-      hdr.textContent='Migrate which ISF import?';
+      hdr.textContent='Update which ISF import?';
       dlg.appendChild(hdr);
       const list=document.createElement('div');
       list.style.cssText='overflow-y:auto;padding:8px;';
@@ -9156,7 +9570,7 @@
       dlg.showModal();
     }
 
-    // Wire up the Migrate to MMV button
+    // Wire up the Update ISF button (id kept as isfMigrateBtn)
     document.addEventListener('DOMContentLoaded',function(){
       const btn=document.getElementById('isfMigrateBtn');
       if(!btn) return;
@@ -9245,7 +9659,11 @@
   function init(){
     schedWorker=makeWorker();
     // Setup panel toggle
-    $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; });
+    // Opening Setup re-reads the playhead / View CH / channel names, the same
+    // way the TS and Tempo panels below re-seed their bar field on open —
+    // those readouts are meaningless if they show where the playhead was the
+    // last time the panel happened to be opened.
+    $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; if(open) refreshSetupPanelDynamics(); });
     $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); } });
     $('tempoBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tempoPanel'); const open=p.classList.toggle('open'); $('tempoBtn').classList.toggle('open',open); $('tempoBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTempoMapUI(); $('tempoMapBar').value=nearestBarAt(state.playhead); } });
     // Note Info manual minimize/maximize — same ▾/▸ two-state convention as

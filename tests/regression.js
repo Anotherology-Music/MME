@@ -52,7 +52,7 @@ function buildTestHtml() {
       '  window._TEST_addLane = (cc, ch) => { const l = addLane(cc, ch); return l.id; };',
       '  window._TEST_addPbLane = (ch) => { const l = addPbLane(ch); return l.id; };',
       '  window._TEST_addCpLane = (ch) => { const l = addCpLane(ch); return l.id; };',
-      '  window._TEST_applyMidiImport = (r, mode, remapChannels) => applyMidiImport(r, mode, remapChannels);',
+      '  window._TEST_applyMidiImport = (r, mode, remapChannels, insertOpts) => applyMidiImport(r, mode, remapChannels, insertOpts);',
       '  window._TEST_upsertPoint = (laneId, t, v) => { const l = state.ccLanes.find(x => x.id === laneId); upsertPoint(l, t, v); };',
       '  window._TEST_tickToBBT = (t) => tickToBBT(t);',
       '  window._TEST_bbtToTick = (s) => bbtToTick(s);',
@@ -126,6 +126,13 @@ function buildTestHtml() {
       '  window._TEST_updateVariabilityIndicators = () => updateVariabilityIndicators();',
       '  window._TEST_buildSyncTrack = () => Array.from(buildSyncTrack());',
       '  window._TEST_makeAppIcon = (size) => makeAppIcon(size);',
+      '  window._TEST_setMidiStatus = (t, ok) => setMidiStatus(t, ok);',
+      '  window._TEST_importMidi = (bytes, name) => importMidi(new Uint8Array(bytes).buffer, name);',
+      '  window._TEST_midiInsertOpts = () => midiInsertOpts();',
+      '  window._TEST_refreshSetupPanelDynamics = () => refreshSetupPanelDynamics();',
+      '  window._TEST_noteNameToPitch = (s) => noteNameToPitch(s);',
+      '  window._TEST_parseNoteNameCsv = (t) => parseNoteNameCsv(t);',
+      '  window._TEST_handleNoteNameCsvFile = (text, name) => handleNoteNameCsvFile(new File([text], name, { type: "text/csv" }));',
       '  init();',
     ].join('\n')
   );
@@ -7314,6 +7321,49 @@ async function run() {
       geom && geom.minY < 128 * 0.36, geom);
   });
 
+  // ---------------- Enable Preview actually suppresses the preview ----------------
+  // The checkbox and its persistence were built against a tree that had no
+  // preview to switch off, so the half that matters — that turning it off
+  // really does skip the WebGL pane — needs asserting directly.
+  await withPage(browser, async (page) => {
+    const src = [
+      '/*{"INPUTS":[{"NAME":"amount","TYPE":"float","MIN":0.0,"MAX":1.0,"DEFAULT":0.5}]}*/',
+      'void main(){ gl_FragColor = vec4(gl_FragCoord.xy/RENDERSIZE, amount, 1.0); }',
+    ].join('\n');
+    const header = JSON.parse(src.match(/\/\*([\s\S]*?)\*\//)[1]);
+
+    await page.evaluate(() => { document.getElementById('isfPreviewEnable').checked = true; });
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'prev-on.fs', s), { h: header, s: src });
+    await page.waitForTimeout(350);
+    const on = await page.evaluate(() => ({
+      flag: document.getElementById('isfDialog').dataset.preview,
+      pane: !!document.getElementById('isfPreviewPane'),
+      canvas: !!document.querySelector('#isfPreviewPane canvas'),
+      rows: document.querySelectorAll('#isfDialog tbody tr').length,
+    }));
+    check('with Enable Preview ticked the shader preview pane is mounted and rendering',
+      on.flag === 'on' && on.pane && on.canvas && on.rows === 1, on);
+    await page.evaluate(() => { const d = document.getElementById('isfDialog'); d.close(); d.remove(); });
+
+    await page.evaluate(() => { document.getElementById('isfPreviewEnable').checked = false; });
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'prev-off.fs', s), { h: header, s: src });
+    await page.waitForTimeout(350);
+    const off = await page.evaluate(() => ({
+      flag: document.getElementById('isfDialog').dataset.preview,
+      pane: !!document.getElementById('isfPreviewPane'),
+      canvas: !!document.querySelector('#isfPreviewPane canvas'),
+      rows: document.querySelectorAll('#isfDialog tbody tr').length,
+      importable: !!Array.from(document.querySelectorAll('#isfDialog button')).find(b => b.textContent === 'Import Lanes'),
+    }));
+    // No pane AND no canvas: building it hidden would still burn a WebGL
+    // context, and browsers cap how many are alive at once.
+    check('with Enable Preview unticked no preview pane or WebGL canvas is created at all',
+      off.flag === 'off' && off.pane === false && off.canvas === false, off);
+    check('the parameter table still works fully with the preview switched off',
+      off.rows === 1 && off.importable, off);
+    await page.evaluate(() => { const d = document.getElementById('isfDialog'); d.close(); d.remove(); });
+  });
+
   // ---------------- Drum Map (.drm) import ----------------
 
   // A minimal Cubase-shaped drum map: one generic "Sound N" placeholder, one
@@ -7426,6 +7476,589 @@ async function run() {
     check('"All" ticks every row (including "Sound 1") and the chosen channel is used for every key',
       pitchNames['3_0'] === 'Sound 1' && pitchNames['3_35'] === 'Acoustic Bass Drum' && pitchNames['3_25'] === 'Snare Sidestick',
       pitchNames);
+  });
+
+  // ================================================================
+  //  Setup ▸ IMPORT / EXPORT rework
+  // ================================================================
+
+  // ---------------- MIDI connected status goes green ----------------
+
+  await withPage(browser, async (page) => {
+    // --pos (#7ed957) is the app's only green; --accent2 (#ffb454) is the
+    // amber that also means "section heading", which is exactly why a
+    // connected port had to stop using it.
+    const connected = await page.evaluate(() => {
+      window._TEST_setMidiStatus('Out connected: Out to Visuals', true);
+      const el = document.getElementById('midiStatus');
+      return { text: el.textContent, ok: el.classList.contains('ok'), color: getComputedStyle(el).color };
+    });
+    check('a connected MIDI port shows its status in the app green (--pos), not heading amber',
+      connected.ok && connected.color === 'rgb(126, 217, 87)', connected);
+
+    const disconnected = await page.evaluate(() => {
+      window._TEST_setMidiStatus('Out disconnected: Out to Visuals', false);
+      const el = document.getElementById('midiStatus');
+      return { ok: el.classList.contains('ok'), color: getComputedStyle(el).color };
+    });
+    check('a disconnected port drops straight back to amber (the green class is cleared, not left on)',
+      !disconnected.ok && disconnected.color === 'rgb(255, 180, 84)', disconnected);
+
+    const notEnabled = await page.evaluate(() => {
+      window._TEST_setMidiStatus('Web MIDI not supported in this browser');
+      const el = document.getElementById('midiStatus');
+      return { ok: el.classList.contains('ok'), color: getComputedStyle(el).color };
+    });
+    check('non-connection states (not supported / not enabled / error) stay amber',
+      !notEnabled.ok && notEnabled.color === 'rgb(255, 180, 84)', notEnabled);
+  });
+
+  // ---------------- Setup panel: IMPORT / EXPORT + subsections ----------------
+
+  await withPage(browser, async (page) => {
+    const info = await page.evaluate(() => {
+      const secs = [...document.querySelectorAll('#setupPanel .setup-section')];
+      const ie = secs.find(s => s.querySelector('.setup-title')?.textContent === 'IMPORT / EXPORT');
+      return {
+        titles: secs.map(s => s.querySelector('.setup-title')?.textContent || ''),
+        subs: ie ? [...ie.querySelectorAll('.setup-subtitle')].map(s => s.textContent.trim()) : null,
+        panelText: document.getElementById('setupPanel').textContent,
+        importInIE: !!ie && ie.contains(document.getElementById('importBtn')),
+        isfInIE: !!ie && ie.contains(document.getElementById('isfImportBtn')),
+        drumInIE: !!ie && ie.contains(document.getElementById('drumMapImportBtn')),
+      };
+    });
+    check('the Files section is renamed IMPORT / EXPORT', info.titles.includes('IMPORT / EXPORT') && !info.titles.includes('Files'), info.titles);
+    check('IMPORT / EXPORT holds exactly the MIDI / ISF / KEY NAMES subsections, in that order',
+      JSON.stringify(info.subs) === JSON.stringify(['MIDI', 'ISF', 'KEY NAMES']), info.subs);
+    check('Import .mid, Import ISF and Import Drum Map all live under IMPORT / EXPORT',
+      info.importInIE && info.isfInIE && info.drumInIE, info);
+    check('the stale "Save Project / Load Project moved to the top row" line is gone',
+      !info.panelText.includes('moved to the top row'), info.panelText.includes('moved to the top row'));
+
+    // Sub-headings must read as subordinate to .setup-title, not as peers:
+    // grey rather than the amber that means "section".
+    const colors = await page.evaluate(() => {
+      const t = document.querySelector('#setupPanel .setup-title');
+      const s = document.querySelector('#setupPanel .setup-subtitle');
+      return { title: getComputedStyle(t).color, sub: getComputedStyle(s).color };
+    });
+    check('subsection headings are visually subordinate to .setup-title (different, non-amber colour)',
+      colors.title === 'rgb(255, 180, 84)' && colors.sub !== colors.title, colors);
+
+    // The whole point of the 500px -> 620px widen is that each action row
+    // keeps its options on the same visual line as its button.
+    const fits = await page.evaluate(() => {
+      document.getElementById('setupBtn').click();
+      const p = document.getElementById('setupPanel');
+      const btn = document.getElementById('importBtn').getBoundingClientRect();
+      const sel = document.getElementById('midiInsertChMode').getBoundingClientRect();
+      const r = p.getBoundingClientRect();
+      // Same visual line = vertically overlapping, which is what "the options
+      // sit beside the button" actually means once flex centring is involved.
+      return { sameLine: btn.top < sel.bottom && sel.top < btn.bottom,
+               width: Math.round(r.width), height: Math.round(r.height),
+               viewportH: window.innerHeight, overflows: p.scrollHeight > p.clientHeight + 1 };
+    });
+    check('the Import .mid row keeps its options on one line at the widened panel width', fits.sameLine, fits);
+    check('the Setup panel is the declared 620px wide', fits.width === 620, fits);
+    // The extra rows made the panel tall enough to run off the bottom of a
+    // 900px screen, so it is now height-capped and scrolls internally rather
+    // than putting Danger zone out of reach.
+    check('the taller Setup panel is capped to the viewport height and scrolls inside itself',
+      fits.height <= fits.viewportH - 55 && fits.overflows, fits);
+
+    // Narrow window: the max-width guard has to clamp the panel rather than
+    // let 620px of fixed width push it off the side.
+    await page.setViewportSize({ width: 480, height: 760 });
+    await page.waitForTimeout(50);
+    const narrow = await page.evaluate(() => {
+      const r = document.getElementById('setupPanel').getBoundingClientRect();
+      return { width: Math.round(r.width), iw: window.innerWidth };
+    });
+    check('on a narrow window the Setup panel clamps to the viewport instead of staying 620px',
+      narrow.width <= narrow.iw - 16, narrow);
+  });
+
+  // ---------------- Export .mid: three mutually exclusive scopes ----------------
+
+  await withPage(browser, async (page) => {
+    const initial = await page.evaluate(() => ({
+      all: document.getElementById('exportAll').checked,
+      solo: document.getElementById('exportSoloOnly').checked,
+      excl: document.getElementById('exportExcludeMuted').checked,
+      types: ['exportAll', 'exportSoloOnly', 'exportExcludeMuted'].map(id => document.getElementById(id).type),
+      names: ['exportAll', 'exportSoloOnly', 'exportExcludeMuted'].map(id => document.getElementById(id).name),
+    }));
+    check('Export .mid defaults to "Export all", with the other two scopes off',
+      initial.all && !initial.solo && !initial.excl, initial);
+    check('the three export scopes are one radio group (mutually exclusive by construction)',
+      initial.types.every(t => t === 'radio') && new Set(initial.names).size === 1, initial);
+
+    const afterSolo = await page.evaluate(() => {
+      document.getElementById('exportSoloOnly').click();
+      return { all: document.getElementById('exportAll').checked, solo: document.getElementById('exportSoloOnly').checked,
+               excl: document.getElementById('exportExcludeMuted').checked };
+    });
+    check('picking "Solo lanes only" clears Export all and Exclude muted',
+      afterSolo.solo && !afterSolo.all && !afterSolo.excl, afterSolo);
+
+    const afterExcl = await page.evaluate(() => {
+      document.getElementById('exportExcludeMuted').click();
+      return { all: document.getElementById('exportAll').checked, solo: document.getElementById('exportSoloOnly').checked,
+               excl: document.getElementById('exportExcludeMuted').checked };
+    });
+    check('picking "Exclude muted tracks" clears the other two', afterExcl.excl && !afterExcl.all && !afterExcl.solo, afterExcl);
+
+    const afterAll = await page.evaluate(() => {
+      document.getElementById('exportAll').click();
+      return { all: document.getElementById('exportAll').checked, solo: document.getElementById('exportSoloOnly').checked,
+               excl: document.getElementById('exportExcludeMuted').checked };
+    });
+    check('going back to "Export all" leaves exportMidi() reading .checked === false on both filters',
+      afterAll.all && !afterAll.solo && !afterAll.excl, afterAll);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Export Sync Track blurb must reuse the Follow-MMV transport icon,
+    // not a lookalike — the sentence is telling the user to look for that
+    // exact glyph in the transport bar.
+    const icons = await page.evaluate(() => {
+      const note = [...document.querySelectorAll('#setupPanel .setup-note')].find(n => n.textContent.includes('sync track'));
+      const follow = document.querySelector('#syncFollow svg');
+      const inNote = note ? note.querySelector('svg') : null;
+      const paths = el => el ? [...el.querySelectorAll('path')].map(p => p.getAttribute('d')).join('|') : null;
+      return { text: note ? note.textContent.replace(/\s+/g, ' ').trim() : null, notePaths: paths(inNote), followPaths: paths(follow) };
+    });
+    check('Export Sync Track carries the explanatory MMV sync-track text',
+      icons.text && icons.text.includes('copy into MMV') && icons.text.includes('synchronise playback'), icons.text);
+    check('that text uses the SAME chain-link icon as the Follow-MMV transport control',
+      icons.notePaths && icons.notePaths === icons.followPaths, icons);
+  });
+
+  // ---------------- Import .mid: Replace all vs Insert ----------------
+
+  await withPage(browser, async (page) => {
+    const modes = await page.evaluate(() => {
+      const rep = document.getElementById('midiImportReplace'), ins = document.getElementById('midiImportInsert');
+      return { repType: rep.type, insType: ins.type, sameName: rep.name === ins.name,
+               repChecked: rep.checked, insChecked: ins.checked,
+               selDisabled: document.getElementById('midiInsertChMode').disabled };
+    });
+    check('Replace all / Insert are mutually exclusive radios, defaulting to Replace all (the old behaviour)',
+      modes.repType === 'radio' && modes.insType === 'radio' && modes.sameName && modes.repChecked && !modes.insChecked, modes);
+    check('the Insert dropdown stays disabled while Replace all is selected', modes.selDisabled, modes);
+
+    const afterInsert = await page.evaluate(() => {
+      document.getElementById('midiImportInsert').click();
+      return { selDisabled: document.getElementById('midiInsertChMode').disabled,
+               atDisabled: document.getElementById('midiInsertAt').disabled,
+               repChecked: document.getElementById('midiImportReplace').checked };
+    });
+    check('ticking Insert enables its dropdown and the Insert at field, and unticks Replace all',
+      !afterInsert.selDisabled && !afterInsert.atDisabled && !afterInsert.repChecked, afterInsert);
+  });
+
+  await withPage(browser, async (page) => {
+    // "Insert at" defaults to the playhead and is shown in the app's own
+    // Bar.Beat.16th.Tick position format, like every other position field.
+    await page.evaluate(() => { window._TEST_seekPlayhead(window._TEST_barToTick(4)); });
+    await page.evaluate(() => { window._TEST_state.viewCh = 9; window._TEST_refreshSetupPanelDynamics(); });
+    const seeded = await page.evaluate(() => ({
+      at: document.getElementById('midiInsertAt').value,
+      expect: window._TEST_tickToBBT(window._TEST_state.playhead),
+      chLbl: document.getElementById('midiInsertChLbl').textContent,
+      opts: window._TEST_midiInsertOpts(),
+    }));
+    check('Insert at defaults to the playhead, in the app\'s Bar.Beat.16th.Tick position format',
+      seeded.at === seeded.expect && /^\d+\.\d+\.\d+\.\d+$/.test(seeded.at), seeded);
+    check('the Insert row reports the channel currently in focus from View CH',
+      seeded.chLbl.startsWith('Ch10') && seeded.opts.targetCh === 9, seeded);
+
+    const edited = await page.evaluate(() => {
+      const at = document.getElementById('midiInsertAt');
+      at.value = '9'; at.dispatchEvent(new Event('change'));
+      return { value: at.value, offset: window._TEST_midiInsertOpts().offset, bar9: window._TEST_barToTick(8) };
+    });
+    check('a hand-typed Insert at position is normalised back through the project bar ruler',
+      edited.value === '9.1.1.0' && edited.offset === edited.bar9, edited);
+  });
+
+  await withPage(browser, async (page) => {
+    // The core requirement: land an imported drum pattern at a chosen bar on
+    // the focused channel WITHOUT touching data that is already there.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.notes.push({ id: s.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 3 });
+      s.notes.push({ id: s.nextId++, pitch: 62, start: 1920, length: 240, vel: 100, ch: 3 });
+      s.viewCh = 9;
+    });
+    const bar5 = await page.evaluate(() => window._TEST_barToTick(4));
+    const r = await page.evaluate(() => ({
+      fmt: 1, div: 480, bpm: 120, tsN: 4, tsD: 4, tsEvents: [], tempoEvents: [],
+      notes: [
+        { pitch: 36, start: 0, length: 120, vel: 110, ch: 0 },
+        { pitch: 38, start: 480, length: 120, vel: 90, ch: 0 },
+      ],
+      ccMap: { '0_74': { cc: 74, ch: 0, points: [{ t: 0, v: 10 }, { t: 480, v: 120 }] } },
+      pbMap: {}, cpMap: {},
+    }));
+    await page.evaluate(([r, off]) => window._TEST_applyMidiImport(r, 'insert', false, { offset: off, chMode: 'viewch', targetCh: 9 }), [r, bar5]);
+
+    const after = await page.evaluate((bar5) => {
+      const s = window._TEST_state;
+      return {
+        total: s.notes.length,
+        onSourceCh: s.notes.filter(n => n.ch === 0).length,
+        imported: s.notes.filter(n => n.ch === 9).map(n => ({ pitch: n.pitch, start: n.start })).sort((a, b) => a.start - b.start),
+        preexisting: s.notes.filter(n => n.ch === 3).map(n => ({ pitch: n.pitch, start: n.start })).sort((a, b) => a.start - b.start),
+        ccLane: (() => { const l = s.ccLanes.find(x => x.cc === 74); return l ? { ch: l.ch, points: l.points } : null; })(),
+        bar5,
+      };
+    }, bar5);
+    check('Insert lands the imported notes at the requested tick, offset by the insert position',
+      after.imported.length === 2 && after.imported[0].start === bar5 && after.imported[1].start === bar5 + 480, after.imported);
+    check('Insert puts the imported notes on the channel in focus (View CH), leaving nothing on the file\'s own channel',
+      after.imported.length === 2 && after.onSourceCh === 0, after);
+    check('Insert leaves every pre-existing note on other channels exactly where it was',
+      after.total === 4 && after.preexisting.length === 2 &&
+      after.preexisting[0].start === 0 && after.preexisting[0].pitch === 60 &&
+      after.preexisting[1].start === 1920 && after.preexisting[1].pitch === 62, after);
+    check('Insert offsets imported CC points too, onto a NEW lane on the focused channel',
+      after.ccLane && after.ccLane.ch === 9 && after.ccLane.points[0].t === bar5 && after.ccLane.points[1].t === bar5 + 480, after.ccLane);
+  });
+
+  await withPage(browser, async (page) => {
+    // A file whose own events start late (a pattern lifted out of bar 3 of
+    // some other project) must still land ON the insert position, not that
+    // far past it.
+    const bar5 = await page.evaluate(() => window._TEST_barToTick(4));
+    const r = await page.evaluate(() => ({
+      fmt: 1, div: 480, bpm: 120, tsN: 4, tsD: 4, tsEvents: [], tempoEvents: [],
+      notes: [{ pitch: 36, start: 3840, length: 120, vel: 110, ch: 0 }, { pitch: 38, start: 4320, length: 120, vel: 110, ch: 0 }],
+      ccMap: {}, pbMap: {}, cpMap: {},
+    }));
+    await page.evaluate(([r, off]) => window._TEST_applyMidiImport(r, 'insert', false, { offset: off, chMode: 'keep', targetCh: 9 }), [r, bar5]);
+    const starts = await page.evaluate(() => window._TEST_state.notes.map(n => ({ start: n.start, ch: n.ch })).sort((a, b) => a.start - b.start));
+    check('Insert anchors the file\'s FIRST event to the insert position, preserving internal spacing',
+      starts.length === 2 && starts[0].start === bar5 && starts[1].start === bar5 + 480, { starts, bar5 });
+    check('"keeping the file\'s channels" leaves the source channel alone', starts.every(s => s.ch === 0), starts);
+  });
+
+  await withPage(browser, async (page) => {
+    // Whole path through the real UI controls, not just applyMidiImport:
+    // export a two-note ch0 project, wipe it, then Insert it back at bar 5
+    // onto Ch10 via the Setup panel widgets.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.notes.push({ id: s.nextId++, pitch: 40, start: 0, length: 240, vel: 100, ch: 0 });
+      s.notes.push({ id: s.nextId++, pitch: 42, start: 960, length: 240, vel: 100, ch: 0 });
+    });
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.notes = [{ id: s.nextId++, pitch: 72, start: 0, length: 240, vel: 100, ch: 5 }];
+      s.viewCh = 9;
+      document.getElementById('midiImportInsert').click();
+      document.getElementById('midiInsertChMode').value = 'viewch';
+      const at = document.getElementById('midiInsertAt');
+      at.value = '5.1.1.0'; at.dispatchEvent(new Event('change'));
+    });
+    await page.evaluate((b) => window._TEST_importMidi(b, 'drums.mid'), bytes);
+    await page.waitForTimeout(50);
+    const res = await page.evaluate(() => ({
+      bar5: window._TEST_barToTick(4),
+      dialogOpen: !!document.getElementById('midiImportDialog'),
+      notes: window._TEST_state.notes.map(n => ({ pitch: n.pitch, start: n.start, ch: n.ch })).sort((a, b) => a.start - b.start || a.pitch - b.pitch),
+    }));
+    const ins = res.notes.filter(n => n.ch === 9);
+    check('choosing Insert skips the Replace/Merge chooser entirely', !res.dialogOpen, res.dialogOpen);
+    check('a real Import .mid with Insert ticked lands every event at the typed bar on the View CH channel',
+      ins.length === 2 && ins[0].start === res.bar5 && ins[1].start === res.bar5 + 960 && ins.every(n => n.ch === 9), res.notes);
+    check('the untouched channel 5 note is still at tick 0 after an Insert',
+      res.notes.filter(n => n.ch === 5).length === 1 && res.notes.find(n => n.ch === 5).start === 0, res.notes);
+  });
+
+  await withPage(browser, async (page) => {
+    // "remapped to free channels" reuses the existing merge remap rather than
+    // a parallel path — so it has to actually reach applyMidiImport's
+    // remapChannels argument from the Insert row.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.notes.push({ id: s.nextId++, pitch: 40, start: 0, length: 240, vel: 100, ch: 0 });
+    });
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    await page.evaluate(() => {
+      document.getElementById('midiImportInsert').click();
+      document.getElementById('midiInsertChMode').value = 'free';
+      const at = document.getElementById('midiInsertAt');
+      at.value = '3.1.1.0'; at.dispatchEvent(new Event('change'));
+    });
+    await page.evaluate((b) => window._TEST_importMidi(b, 'x.mid'), bytes);
+    await page.waitForTimeout(50);
+    const res = await page.evaluate(() => ({
+      bar3: window._TEST_barToTick(2),
+      notes: window._TEST_state.notes.map(n => ({ start: n.start, ch: n.ch })).sort((a, b) => a.start - b.start),
+    }));
+    check('Insert "remapped to free channels" moves the imported notes off the occupied channel and still honours the position',
+      res.notes.length === 2 && res.notes[0].ch === 0 && res.notes[0].start === 0 &&
+      res.notes[1].ch !== 0 && res.notes[1].start === res.bar3, res);
+  });
+
+  // ---------------- ISF: Enable Preview + Update ISF ----------------
+
+  await withPage(browser, async (page) => {
+    const label = await page.evaluate(() => {
+      const b = document.getElementById('isfMigrateBtn');
+      return { text: b.textContent.trim(), title: b.title };
+    });
+    check('the Migrate to MMV button is relabelled "Update ISF" (id isfMigrateBtn unchanged)',
+      label.text.includes('Update ISF') && !label.text.includes('Migrate'), label);
+    check('its tooltip no longer says "Migrate to MMV" either', !/Migrate to MMV/.test(label.title), label.title);
+
+    // The description has to match what the code actually does: Import ISF
+    // makes the "(MME)" copy, and Update ISF rewrites THAT file in place
+    // plus downloads a wiring sheet.
+    const desc = await page.evaluate(() => {
+      const notes = [...document.querySelectorAll('#setupPanel .setup-note')].map(n => n.textContent.replace(/\s+/g, ' ').trim());
+      return notes.find(t => t.includes('(MME)')) || '';
+    });
+    check('Update ISF is described as rewriting the existing "(MME)" working copy, not creating a new suffixed shader',
+      /\(MME\)/.test(desc) && /working copy/i.test(desc) && !/creates? a new shader/i.test(desc), desc);
+    check('the description also covers the wiring sheet the export produces',
+      /wiring sheet/i.test(desc), desc);
+  });
+
+  await withPage(browser, async (page) => {
+    const cb = await page.evaluate(() => {
+      const el = document.getElementById('isfPreviewEnable');
+      return { type: el.type, checked: el.checked };
+    });
+    check('Import ISF has an Enable Preview tickbox, defaulting ON', cb.type === 'checkbox' && cb.checked, cb);
+
+    const blurb = await page.evaluate(() => {
+      const n = [...document.querySelectorAll('#setupPanel .setup-note')].find(x => x.textContent.includes('Enabling preview'));
+      return n ? n.textContent.replace(/\s+/g, ' ').trim() : null;
+    });
+    check('the Enable Preview explanatory text is present',
+      blurb && blurb.includes('visually validate') && blurb.includes('CC# lane'), blurb);
+
+    // The dialog records the one decision it made about preview, so the
+    // preview pane and its effect scan can both be skipped from a single
+    // branch. (This build's dialog is the parameter table only — there is
+    // no preview pane here yet for the "off" branch to suppress.)
+    const on = await page.evaluate(() => {
+      window._TEST_showISFDialog({ INPUTS: [{ NAME: 'level', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 }] }, 'x.fs', '/*{}*/');
+      const d = document.getElementById('isfDialog');
+      const r = { preview: d.dataset.preview, rows: d.querySelectorAll('tbody tr').length };
+      d.close(); d.remove();
+      return r;
+    });
+    check('with Enable Preview on, the ISF dialog opens in its preview-enabled mode', on.preview === 'on' && on.rows === 1, on);
+
+    const off = await page.evaluate(() => {
+      document.getElementById('isfPreviewEnable').click();
+      window._TEST_showISFDialog({ INPUTS: [{ NAME: 'level', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 }] }, 'x.fs', '/*{}*/');
+      const d = document.getElementById('isfDialog');
+      const r = { preview: d.dataset.preview, rows: d.querySelectorAll('tbody tr').length,
+                  canvases: d.querySelectorAll('canvas').length };
+      d.close(); d.remove();
+      return r;
+    });
+    check('unticking Enable Preview makes the ISF dialog skip the preview and show the parameter table alone',
+      off.preview === 'off' && off.rows === 1 && off.canvases === 0, off);
+
+    const stored = await page.evaluate(() => localStorage.getItem('mmv-isf-preview'));
+    check('the Enable Preview choice is persisted (same localStorage mechanism as the remembered MIDI ports)', stored === '0', stored);
+  });
+
+  await withPage(browser, async (page) => {
+    // Reload with the pref already stored: the checkbox must come back off.
+    await page.evaluate(() => localStorage.setItem('mmv-isf-preview', '0'));
+    await page.reload();
+    await page.waitForTimeout(250);
+    const restored = await page.evaluate(() => document.getElementById('isfPreviewEnable').checked);
+    check('a stored Enable Preview = off survives a reload', restored === false, restored);
+    await page.evaluate(() => localStorage.removeItem('mmv-isf-preview'));
+    await page.reload();
+    await page.waitForTimeout(250);
+    const dflt = await page.evaluate(() => document.getElementById('isfPreviewEnable').checked);
+    check('with no stored preference, Enable Preview falls back to its ON default', dflt === true, dflt);
+  });
+
+  // ---------------- KEY NAMES: CSV import ----------------
+
+  await withPage(browser, async (page) => {
+    const pitches = await page.evaluate(() => ({
+      c1: window._TEST_noteNameToPitch('C1'),
+      cs1: window._TEST_noteNameToPitch('C#1'),
+      db1: window._TEST_noteNameToPitch('Db1'),
+      lower: window._TEST_noteNameToPitch('c#1'),
+      lowest: window._TEST_noteNameToPitch('C-2'),
+      highest: window._TEST_noteNameToPitch('G8'),
+      tooHigh: window._TEST_noteNameToPitch('C9'),
+      junk: window._TEST_noteNameToPitch('Bass Drum'),
+      empty: window._TEST_noteNameToPitch(''),
+      roundTrip: window._TEST_noteName(window._TEST_noteNameToPitch('F#3')),
+    }));
+    check('noteNameToPitch inverts noteName on the app\'s own octave convention (C1 = 36)', pitches.c1 === 36, pitches);
+    check('sharp and flat spellings of the same key resolve identically (C#1 === Db1)',
+      pitches.cs1 === 37 && pitches.db1 === 37 && pitches.lower === 37, pitches);
+    check('the full MIDI range parses and anything outside it is rejected',
+      pitches.lowest === 0 && pitches.highest === 127 && pitches.tooHigh === null, pitches);
+    check('unparseable note text returns null rather than a wrong key',
+      pitches.junk === null && pitches.empty === null, pitches);
+    check('noteNameToPitch round-trips through noteName', pitches.roundTrip === 'F#3', pitches.roundTrip);
+  });
+
+  await withPage(browser, async (page) => {
+    const CSV = [
+      'note,name',
+      'C1,Bass Drum',
+      'C#1,"Side Stick"',
+      'Db1=Side Stick (flat spelling wins)',
+      'D1="Acoustic Snare", Eb1="Hand Clap"',
+      'E1,"Comma, In A Name"',
+      'H9,Not A Note',
+      'F1',
+      '',
+      'F#1=Closed Hi Hat',
+    ].join('\n');
+    const parsed = await page.evaluate((csv) => window._TEST_parseNoteNameCsv(csv), CSV);
+    const byNote = Object.fromEntries(parsed.entries.map(e => [e.note, e.name]));
+    check('CSV import accepts the classic "note,name" form, quoted or not',
+      byNote[36] === 'Bass Drum' && byNote[38] === 'Acoustic Snare', byNote);
+    check('CSV import accepts the note="name" form, several pairs on one line',
+      byNote[39] === 'Hand Clap' && byNote[42] === 'Closed Hi Hat', byNote);
+    check('quotes let a name contain a comma without splitting the pair', byNote[40] === 'Comma, In A Name', byNote);
+    check('flat and sharp spellings collapse onto one key (last one written wins)',
+      byNote[37] === 'Side Stick (flat spelling wins)', byNote);
+    check('a leading spreadsheet header row is skipped, not reported as an error',
+      !parsed.errors.some(e => e.line === 1), parsed.errors);
+    check('entries come back sorted by pitch', parsed.entries.map(e => e.note).join(',') === [...parsed.entries.map(e => e.note)].sort((a, b) => a - b).join(','), parsed.entries);
+
+    const badNote = parsed.errors.find(e => e.text.startsWith('H9'));
+    const badPair = parsed.errors.find(e => e.text === 'F1');
+    check('a malformed note name is reported with its line number and the offending line',
+      badNote && badNote.line === 7 && /not a note name/.test(badNote.reason) && badNote.text === 'H9,Not A Note', parsed.errors);
+    check('a line that isn\'t a note/name pair is reported rather than silently dropped',
+      badPair && badPair.line === 8 && /expected note,name pairs/.test(badPair.reason), parsed.errors);
+    check('malformed lines do not stop the good ones importing', parsed.entries.length === 6 && parsed.errors.length === 2, parsed);
+  });
+
+  await withPage(browser, async (page) => {
+    // End-to-end through the file handler and the shared review dialog.
+    await page.evaluate(() => { window._TEST_state.viewCh = 9; });
+    await page.evaluate(() => window._TEST_handleNoteNameCsvFile('C1,Bass Drum\nC#1="Side Stick"\nZZ,Nope\n', 'names.csv'));
+    await page.waitForTimeout(100);
+    const dlg = await page.evaluate(() => {
+      const d = document.getElementById('drumMapImportDialog');
+      if (!d) return null;
+      return {
+        open: d.open,
+        title: document.getElementById('drumMapImportTitle').textContent,
+        filename: d.querySelector('div[style*="monospace"]').textContent,
+        errs: [...d.querySelectorAll('.csv-err')].map(e => e.textContent),
+        ticked: [...d.querySelectorAll('label input[type=checkbox]')].map(c => c.checked),
+        ch: d.querySelector('select').value,
+      };
+    });
+    check('Import CSV opens the same review dialog the drum map import uses, retitled', dlg && dlg.open && dlg.title.includes('CSV'), dlg);
+    check('the CSV review dialog defaults its channel picker to the channel in focus', dlg && dlg.ch === '9', dlg && dlg.ch);
+    check('CSV rows all start ticked (the "Sound N" placeholder heuristic is drum-map-only)',
+      dlg && dlg.ticked.length === 2 && dlg.ticked.every(Boolean), dlg && dlg.ticked);
+    check('the malformed CSV line is surfaced in the dialog with its line number and text',
+      dlg && dlg.errs.length === 1 && dlg.errs[0].includes('line 3') && dlg.errs[0].includes('ZZ,Nope'), dlg && dlg.errs);
+
+    await page.click('#drumMapImportDialog button:has-text("Import")');
+    await page.waitForTimeout(50);
+    const names = await page.evaluate(() => window._TEST_state.pitchNames);
+    check('CSV import writes state.pitchNames keyed channel_note, same key format as the drum map import',
+      names['9_36'] === 'Bass Drum' && names['9_37'] === 'Side Stick' && Object.keys(names).length === 2, names);
+  });
+
+  await withPage(browser, async (page) => {
+    const failed = await page.evaluate(async () => {
+      await window._TEST_handleNoteNameCsvFile('nothing parseable here at all\n', 'bad.csv');
+      await new Promise(r => setTimeout(r, 80));
+      return { dialog: !!document.getElementById('drumMapImportDialog'), names: Object.keys(window._TEST_state.pitchNames).length };
+    });
+    check('a CSV with no usable pairs opens no dialog and writes nothing',
+      !failed.dialog && failed.names === 0, failed);
+  });
+
+  // ---------------- KEY NAMES: Clear Note Names ----------------
+
+  await withPage(browser, async (page) => {
+    const opts = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.channelNames[9] = 'Drums'; s.channelNames[2] = 'Bass';
+      s.viewCh = 9;
+      window._TEST_refreshSetupPanelDynamics();
+      const sel = document.getElementById('clearNamesCh');
+      return { first: sel.options[0].textContent, count: sel.options.length,
+               ch3: sel.options[3].textContent, ch10: sel.options[10].textContent, value: sel.value };
+    });
+    check('Clear Note Names offers ALL plus all 16 channels, labelled with their channel names',
+      opts.first === 'ALL' && opts.count === 17 && opts.ch3 === 'Ch3 (Bass)' && opts.ch10 === 'Ch10 (Drums)', opts);
+    check('the Clear Note Names picker defaults to the currently selected channel (View CH)', opts.value === '9', opts.value);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.pitchNames['9_36'] = 'Bass Drum';
+      s.pitchNames['9_38'] = 'Snare';
+      s.pitchNames['2_40'] = 'Slap';
+      s.viewCh = 9;
+    });
+    // The picker and button only exist on screen with the panel open, and
+    // opening it is also what re-seeds the picker from the live View CH.
+    await page.click('#setupBtn');
+    await page.selectOption('#clearNamesCh', '9');
+    await page.click('#clearNamesBtn');
+    await page.waitForTimeout(50);
+    const cleared = await page.evaluate(() => ({ ...window._TEST_state.pitchNames }));
+    check('Clear Note Names clears only the chosen channel, leaving other channels\' names alone',
+      cleared['9_36'] === undefined && cleared['9_38'] === undefined && cleared['2_40'] === 'Slap', cleared);
+
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(50);
+    const restored = await page.evaluate(() => ({ ...window._TEST_state.pitchNames }));
+    check('Ctrl+Z restores the cleared key names (state.pitchNames is part of the undo snapshot)',
+      restored['9_36'] === 'Bass Drum' && restored['9_38'] === 'Snare' && restored['2_40'] === 'Slap', restored);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.pitchNames['9_36'] = 'Bass Drum';
+      s.pitchNames['2_40'] = 'Slap';
+    });
+    await page.click('#setupBtn');
+    await page.selectOption('#clearNamesCh', 'all');
+    await page.click('#clearNamesBtn');
+    await page.waitForTimeout(50);
+    const cleared = await page.evaluate(() => Object.keys(window._TEST_state.pitchNames).length);
+    check('the ALL option clears every channel\'s key names', cleared === 0, cleared);
+    await page.keyboard.press('Control+z');
+    await page.waitForTimeout(50);
+    const restored = await page.evaluate(() => ({ ...window._TEST_state.pitchNames }));
+    check('Ctrl+Z restores an ALL clear too', restored['9_36'] === 'Bass Drum' && restored['2_40'] === 'Slap', restored);
+  });
+
+  await withPage(browser, async (page) => {
+    // Nothing to clear must not push a useless undo entry.
+    await page.click('#setupBtn');
+    await page.selectOption('#clearNamesCh', '4');
+    await page.click('#clearNamesBtn');
+    await page.waitForTimeout(50);
+    const res = await page.evaluate(() => ({
+      names: Object.keys(window._TEST_state.pitchNames).length,
+      undoDisabled: document.getElementById('undoBtn').disabled,
+    }));
+    check('clearing a channel with no custom names changes nothing and pushes no undo entry',
+      res.names === 0 && res.undoDisabled, res);
   });
 
   await browser.close();
