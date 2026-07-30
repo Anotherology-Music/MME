@@ -130,7 +130,18 @@ function buildTestHtml() {
   );
   html = html.replace(
     'function showISFDialog(header, filename, sourceText){',
-    'window._TEST_showISFDialog=(h,f,s)=>showISFDialog(h,f,s);\n    function showISFDialog(header, filename, sourceText){'
+    [
+      'window._TEST_showISFDialog=(h,f,s)=>showISFDialog(h,f,s);',
+      // These live in the same private IIFE as the ISF code. Exposing them from
+      // the init() call site instead puts them in the OUTER scope, where none of
+      // these names resolve — which is exactly how run 9 died mid-suite.
+      '    window._TEST_isfDiagnose=(msg,info)=>isfDiagnose(msg,info);',
+      '    window._TEST_isfType=(inp)=>isfType(inp);',
+      '    window._TEST_buildMappingRows=(inputs)=>buildMappingRows(inputs);',
+      '    window._TEST_isfPreprocess=(src,inputs,targets,es100)=>isfPreprocess(src,inputs,targets,es100);',
+      '    window._TEST_isfBuildVert=(src,es100)=>isfBuildVert(src,es100);',
+      '    function showISFDialog(header, filename, sourceText){',
+    ].join('\n')
   );
   // Capture the value array of whatever the A/B preview last rendered in the B
   // view, so tests can assert Preview B actually reflects the chosen transform.
@@ -2892,7 +2903,7 @@ async function run() {
       cbs[1].click(); // PB
     });
     await page.waitForTimeout(80);
-    const midiDefaultShown = await page.evaluate(() => document.querySelector('#isfDialog tbody tr').querySelectorAll('td')[7].textContent);
+    const midiDefaultShown = await page.evaluate(() => document.querySelector('#isfDialog tbody tr').querySelector('td[data-col="midiDefault"]').textContent);
     // DEFAULT=90 of MIN=0..MAX=360 is exactly 1/4 of the way up: round(0.25*16383)-8192 = -4096
     check('PB row shows the PB-scaled default (not the CC-scaled one) in the MIDI Default column', midiDefaultShown === '-4096', midiDefaultShown);
 
@@ -6953,6 +6964,278 @@ async function run() {
     check('repeated Alt+clicks accumulate independent tempo pins, all at the inherited BPM',
       map.length === 3 && map.every(s => Math.abs(s.bpm - 70) < 0.01) &&
       map.some(s => s.tick === 2 * ppq * 4) && map.some(s => s.tick === 3 * ppq * 4), map);
+  });
+
+  // ---------------- v0.9.35: ISF preview + effect scan ----------------
+  // Shader sources are inline and deliberately tiny. The renderer was
+  // developed against the author's real 726-shader library (93.7% of it
+  // renders), but a regression suite has to be self-contained, so these
+  // exercise the specific behaviours that broke during that development.
+
+  const PV_SIMPLE = [
+    '/*{',
+    '  "DESCRIPTION": "preview test",',
+    '  "INPUTS": [',
+    '    {"NAME":"amount","TYPE":"float","MIN":0.0,"MAX":1.0,"DEFAULT":0.5},',
+    '    {"NAME":"unused","TYPE":"float","MIN":0.0,"MAX":1.0,"DEFAULT":0.5},',
+    '    {"NAME":"tint","TYPE":"color","DEFAULT":[1.0,0.5,0.25,1.0]}',
+    '  ]',
+    '}*/',
+    'void main(){',
+    '  vec2 uv = gl_FragCoord.xy/RENDERSIZE;',
+    // `unused` is never read, and only tint's BLUE channel is — so the scan
+    // must mark `unused`, tint.R and tint.G inert while `amount` is not.
+    '  gl_FragColor = vec4(uv.x*amount, uv.y, tint.b, 1.0);',
+    '}',
+  ].join('\n');
+
+  const PV_MULTIPASS = [
+    '/*{',
+    '  "INPUTS": [{"NAME":"k","TYPE":"float","MIN":0.0,"MAX":1.0,"DEFAULT":0.5}],',
+    '  "PASSES": [{"TARGET":"bufA"},{}]',
+    '}*/',
+    'void main(){',
+    '  vec2 uv = gl_FragCoord.xy/RENDERSIZE;',
+    '  if (PASSINDEX == 0) { gl_FragColor = vec4(uv.x, uv.y, k, 1.0); }',
+    '  else { gl_FragColor = IMG_NORM_PIXEL(bufA, uv) * vec4(1.0, 0.4, 1.0, 1.0); }',
+    '}',
+  ].join('\n');
+
+  const PV_BROKEN = [
+    '/*{"INPUTS":[{"NAME":"a","TYPE":"float","MIN":0.0,"MAX":1.0,"DEFAULT":0.5}]}*/',
+    'void main( { this is definitely not glsl',
+  ].join('\n');
+
+  await withPage(browser, async (page) => {
+    // ---- preprocessor / classifier, no GPU required ----
+    const types = await page.evaluate(() => [
+      window._TEST_isfType({ TYPE: 'FLOAT' }),
+      window._TEST_isfType({ TYPE: 'COLOR' }),
+      window._TEST_isfType({ TYPE: 'point2d' }),
+      window._TEST_isfType({ TYPE: 'float' }),
+    ]);
+    check('isfType normalises the uppercase TYPE spellings that occur in real ISF files',
+      JSON.stringify(types) === JSON.stringify(['float', 'color', 'point2D', 'float']), types);
+
+    // The live library has 5 inputs typed "FLOAT" and 2 typed "COLOR". Before
+    // this fix they produced no row AND no "unsupported type" warning — they
+    // silently vanished from the import.
+    const upper = await page.evaluate(() => window._TEST_buildMappingRows([
+      { NAME: 'Amt', TYPE: 'FLOAT', MIN: 0, MAX: 1, DEFAULT: 0.5 },
+      { NAME: 'Col', TYPE: 'COLOR', DEFAULT: [1, 0, 0, 1] },
+    ]).map(r => r.name));
+    check('an uppercase-TYPE float and color still become mappable lanes (1 + 4 channels)',
+      upper.length === 5 && upper[0] === 'Amt' && upper[4] === 'Col.A', upper);
+
+    // RENDERSIZE is reached only through the IMG_* macro expansion here, never
+    // mentioned literally — the bug this guards against silently broke 349
+    // filters in the original tool.
+    const pre = await page.evaluate(() => window._TEST_isfPreprocess(
+      'void main(){ gl_FragColor = IMG_THIS_NORM_PIXEL(inputImage); }',
+      [{ NAME: 'inputImage', TYPE: 'image' }], [], false));
+    check('isfPreprocess declares RENDERSIZE even when only an IMG_* macro reaches it',
+      /uniform\s+vec2\s+RENDERSIZE/.test(pre), pre.split('\n').filter(l => /RENDERSIZE/.test(l)).slice(0, 2));
+
+    const noDupe = await page.evaluate(() => window._TEST_isfPreprocess(
+      'uniform vec2 RENDERSIZE;\nuniform float TIME;\nvoid main(){ gl_FragColor = vec4(TIME); }',
+      [], [], false));
+    check('isfPreprocess does not re-declare a uniform the shader already declares',
+      (noDupe.match(/uniform\s+vec2\s+RENDERSIZE/g) || []).length === 1
+      && (noDupe.match(/uniform\s+float\s+TIME/g) || []).length === 1,
+      { rs: (noDupe.match(/uniform\s+vec2\s+RENDERSIZE/g) || []).length, time: (noDupe.match(/uniform\s+float\s+TIME/g) || []).length });
+
+    // Real ISF files declare each varying twice, guarded by
+    // `#if __VERSION__ <= 120 / varying / #else / in / #endif`. Only one branch
+    // is live, but a regex sees both — and emitting the name twice on the vertex
+    // side is a redefinition error that reads as a fault in the shader. This is
+    // what made 17 working filters look broken mid-development.
+    const vert = await page.evaluate(() => window._TEST_isfBuildVert([
+      '#if __VERSION__ <= 120',
+      'varying vec2 left_coord;',
+      '#else',
+      'in vec2 left_coord;',
+      '#endif',
+      'void main(){ gl_FragColor = vec4(left_coord, 0.0, 1.0); }',
+    ].join('\n'), false));
+    check('the generated vertex shader declares a dual-declared varying exactly once',
+      (vert.match(/\bleft_coord\b/g) || []).length === 2, vert);
+
+    // The trust-critical one. Every string below is what a driver actually
+    // emitted while compiling the real library; the previous generation of this
+    // classifier missed four of the five and badged them red "broken", which is
+    // the single fastest way to make the tool untrustworthy.
+    const diags = await page.evaluate(() => {
+      const real = [
+        "ERROR: 0:12: '%' : integer modulus operator supported in GLSL ES 3.00 and above only",
+        "ERROR: 0:12: '[]' : Index expression must be constant",
+        "ERROR: 0:12: 'round' : no matching overloaded function found",
+        "ERROR: 0:12: 'while' : Invalid condition",
+        "ERROR: 0:12: 'x' : global variable initializers must be constant expressions",
+        "ERROR: 0:12: 'iSampleRate' : undeclared identifier",
+      ];
+      return real.map(m => window._TEST_isfDiagnose(m, { passes: 1 }).cls);
+    });
+    check('every real driver message for a browser-only GLSL limit is amber, never red "broken"',
+      diags.every(c => c === 'warn'), diags);
+
+    const genuinelyBad = await page.evaluate(() =>
+      window._TEST_isfDiagnose("ERROR: 0:2: '' : syntax error", { passes: 1 }));
+    check('a genuine GLSL syntax error is still classified red', genuinelyBad.cls === 'err', genuinelyBad);
+
+    // A long cascade whose FIRST error is a browser limit must not be reclassified
+    // as malformed by a stray "syntax error" further down the log.
+    const cascade = await page.evaluate(() => window._TEST_isfDiagnose([
+      "ERROR: 0:9: 'iSampleRate' : undeclared identifier",
+      "ERROR: 0:40: '' : syntax error",
+    ].join('\n'), { passes: 1 }));
+    check('classification follows the FIRST compiler error, not a later cascade line',
+      cascade.cls === 'warn', cascade);
+  });
+
+  // ---- the dialog, driven for real ----
+  await withPage(browser, async (page) => {
+    const header = JSON.parse(PV_SIMPLE.match(/\/\*([\s\S]*?)\*\//)[1]);
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'preview-test.fs', s), { h: header, s: PV_SIMPLE });
+    await page.waitForTimeout(400);
+
+    const start = await page.evaluate(() => {
+      const trs = Array.from(document.querySelectorAll('#isfDialog tbody tr'));
+      return {
+        rows: trs.length,
+        canvas: !!document.querySelector('#isfPreviewPane canvas'),
+        controls: document.querySelectorAll('#isfPreviewControls input,#isfPreviewControls select').length,
+        allUnscanned: trs.every(tr => /not scanned/.test(tr.textContent)),
+        topDisabled: document.getElementById('isfTopMoversBtn').disabled,
+      };
+    });
+    check('the import dialog shows a live preview canvas and one control per ISF input',
+      start.canvas && start.rows === 6 && start.controls >= 6, start);
+    // An unscanned parameter must not be visually indistinguishable from one
+    // that was scanned and found to do nothing.
+    check('every row reads "not scanned" before a scan, and Tick-top-movers is disabled',
+      start.allUnscanned && start.topDisabled === true, start);
+
+    const painted = await page.evaluate(() => {
+      const c = document.querySelector('#isfPreviewPane canvas');
+      const g = c.getContext('webgl2');
+      const px = new Uint8Array(c.width * c.height * 4);
+      g.readPixels(0, 0, c.width, c.height, g.RGBA, g.UNSIGNED_BYTE, px);
+      let mn = 255, mx = 0;
+      for (let i = 0; i < px.length; i += 4) for (let k = 0; k < 3; k++) { if (px[i + k] < mn) mn = px[i + k]; if (px[i + k] > mx) mx = px[i + k]; }
+      return mx - mn;
+    });
+    check('the preview actually renders a non-flat frame', painted > 8, painted);
+
+    await page.click('#isfScanBtn');
+    for (let i = 0; i < 80; i++) {
+      const t = await page.evaluate(() => document.getElementById('isfScanBtn').textContent);
+      if (t === 'Rescan effect') break;
+      await page.waitForTimeout(120);
+    }
+    const scanned = await page.evaluate(() => {
+      const byName = {};
+      Array.from(document.querySelectorAll('#isfDialog tbody tr')).forEach(tr => {
+        byName[tr.querySelector('td[data-col="param"]').textContent] = tr.querySelector('td[data-col="effect"]').textContent;
+      });
+      return { byName, stillUnscanned: Object.values(byName).filter(v => /not scanned/.test(v)).length,
+        topDisabled: document.getElementById('isfTopMoversBtn').disabled };
+    });
+    check('a scan fills in every row', scanned.stillUnscanned === 0 && scanned.topDisabled === false, scanned);
+    check('the scan marks a parameter the shader never reads as having no effect',
+      /no effect here/.test(scanned.byName['unused']), scanned.byName);
+    check('the scan does NOT mark a parameter the shader does read as inert',
+      !/no effect here/.test(scanned.byName['amount']), scanned.byName);
+    // Only tint.b is read by this shader, so R and G are genuinely inert while
+    // B is not — the reason impact is scored per flattened lane rather than per
+    // ISF input.
+    check('colour channels are scored independently: only the channel the shader reads registers',
+      /no effect here/.test(scanned.byName['tint.R']) && !/no effect here/.test(scanned.byName['tint.B']), scanned.byName);
+
+    await page.click('#isfTopMoversBtn');
+    await page.waitForTimeout(150);
+    const ticked = await page.evaluate(() => {
+      const on = Array.from(document.querySelectorAll('#isfDialog tbody tr'))
+        .filter(tr => tr.querySelector('input[type=checkbox]').checked)
+        .map(tr => tr.querySelector('td[data-col="param"]').textContent);
+      return on;
+    });
+    check('"Tick top movers" ticks the parameters that matter and leaves the inert ones alone',
+      ticked.indexOf('amount') !== -1 && ticked.indexOf('unused') === -1 && ticked.indexOf('tint.R') === -1, ticked);
+
+    // Defaults from the preview sliders must quantize through exactly the same
+    // path as file-derived defaults.
+    const defaults = await page.evaluate(() => {
+      const rng = document.querySelectorAll('#isfPreviewControls input[type=range]')[0];
+      rng.value = rng.max;
+      rng.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('isfUseValsBtn').click();
+      const tr = Array.from(document.querySelectorAll('#isfDialog tbody tr')).find(x => x.querySelector('td[data-col="param"]').textContent === 'amount');
+      return { nativeCell: tr.querySelector('td[data-col="default"]').textContent,
+        midiCell: tr.querySelector('td[data-col="midiDefault"]').textContent };
+    });
+    check('"Defaults from preview" writes the slider value into both the native and MIDI default cells',
+      defaults.nativeCell === '1' && defaults.midiCell === '127', defaults);
+
+    // Tearing the context down on close matters: browsers cap live WebGL
+    // contexts and silently kill the oldest, which would break a preview that
+    // had been working.
+    // What matters on close is that the WebGL context and its canvas are
+    // released — browsers cap how many live contexts exist and silently kill the
+    // oldest, which would break a preview that had been working a moment ago.
+    // The dialog ELEMENT is removed by the real exits (Cancel, Escape, Import),
+    // not by close() on its own, so that is asserted separately below.
+    await page.evaluate(() => document.getElementById('isfDialog').close());
+    await page.waitForTimeout(150);
+    const closed = await page.evaluate(() => ({ canvas: !!document.querySelector('#isfPreviewPane canvas') }));
+    check('closing the dialog releases the preview canvas and its WebGL context',
+      closed.canvas === false, closed);
+
+    const cancelled = await page.evaluate(() => {
+      Array.from(document.querySelectorAll('#isfDialog button')).find(b => b.textContent === 'Cancel').click();
+      return { dialog: !!document.getElementById('isfDialog') };
+    });
+    check('Cancel removes the whole dialog, preview pane included', cancelled.dialog === false, cancelled);
+  });
+
+  await withPage(browser, async (page) => {
+    // Multi-pass: PASSES with a TARGET the second pass samples, plus PASSINDEX.
+    // The tool this renderer descends from did not attempt multi-pass at all.
+    const header = JSON.parse(PV_MULTIPASS.match(/\/\*([\s\S]*?)\*\//)[1]);
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'multipass.fs', s), { h: header, s: PV_MULTIPASS });
+    await page.waitForTimeout(450);
+    const mp = await page.evaluate(() => {
+      const c = document.querySelector('#isfPreviewPane canvas');
+      const g = c && c.getContext('webgl2');
+      let spread = -1;
+      if (g) {
+        const px = new Uint8Array(c.width * c.height * 4);
+        g.readPixels(0, 0, c.width, c.height, g.RGBA, g.UNSIGNED_BYTE, px);
+        let mn = 255, mx = 0;
+        for (let i = 0; i < px.length; i += 4) for (let k = 0; k < 3; k++) { if (px[i + k] < mn) mn = px[i + k]; if (px[i + k] > mx) mx = px[i + k]; }
+        spread = mx - mn;
+      }
+      return { status: document.getElementById('isfPreviewStatus').textContent, spread,
+        scanEnabled: !document.getElementById('isfScanBtn').disabled };
+    });
+    check('a two-pass shader that samples its own TARGET renders, and the status says so',
+      mp.spread > 8 && /2 passes/.test(mp.status) && mp.scanEnabled, mp);
+  });
+
+  await withPage(browser, async (page) => {
+    // A shader that genuinely will not compile must not disable the dialog —
+    // the preview is an aid, not a gate on importing lanes.
+    const header = JSON.parse(PV_BROKEN.match(/\/\*([\s\S]*?)\*\//)[1]);
+    await page.evaluate(({ h, s }) => window._TEST_showISFDialog(h, 'broken.fs', s), { h: header, s: PV_BROKEN });
+    await page.waitForTimeout(350);
+    const broke = await page.evaluate(() => ({
+      status: document.getElementById('isfPreviewStatus').textContent,
+      scanDisabled: document.getElementById('isfScanBtn').disabled,
+      rows: document.querySelectorAll('#isfDialog tbody tr').length,
+      importable: !!Array.from(document.querySelectorAll('#isfDialog button')).find(b => b.textContent === 'Import Lanes'),
+    }));
+    check('an uncompilable shader reports why, disables only the scan, and still lets you import lanes',
+      /Cannot preview|Preview unavailable/.test(broke.status) && broke.scanDisabled === true
+      && broke.rows === 1 && broke.importable, broke);
   });
 
   // ---------------- Drum Map (.drm) import ----------------

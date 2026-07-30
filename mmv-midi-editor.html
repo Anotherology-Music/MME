@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.34
+  MMV MIDI & CC Curve Editor v0.9.35
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -736,6 +736,55 @@
   carry the lane pane's and piano roll's vertical scroll across the rebuild,
   and focus is restored with preventScroll so re-focusing a field inside the
   lane pane cannot scroll it into view either.
+
+  v0.9.35 Live shader preview and an effect scan in the ISF import dialog. A
+  shader with forty inputs is not hard to look at, it is hard to CHOOSE from:
+  which six of the forty are worth a CC lane? So the dialog now renders the
+  shader in WebGL2 beside the parameter table, with a control per ISF input, and
+  a "Scan effect" button that renders the shader once per parameter, measures
+  how much the picture actually changes, and ranks them. Parameters that do
+  nothing are labelled as such; "Tick top movers" selects the ones that matter
+  and unticks the rest; "Defaults from preview" takes the values you liked on
+  the sliders and uses them as each lane's starting MIDI value. Effect is scored
+  per lane rather than per input, so a colour whose alpha is inert but whose
+  blue channel is not reports that honestly. Because impact depends on state, a
+  control gated behind a mode switch reads as "no effect here" until you turn
+  that mode on — the wording says "at these settings" and rescanning uses the
+  current slider positions, not the file defaults.
+
+  The renderer's preprocessor descends from Matt's own ISF Catalogue, which had
+  already solved the parts that look trivial and are not — declaring RENDERSIZE
+  unconditionally because the IMG_* macros reach it through expansion rather
+  than by name (a literal-mention test silently broke 349 filters there), and
+  de-duplicating emitted uniforms against both the shader's own declarations and
+  what has already been emitted. Both are kept, with credit, and both are now
+  covered by tests. A fourth defect surfaced only once multi-pass existed: one
+  compiled program serves every pass (ISF distinguishes them by PASSINDEX), so a
+  pass rendering INTO a buffer still had that buffer bound as a sampler — a
+  framebuffer feedback loop, which WebGL resolves by drawing nothing. Every
+  buffered shader's first pass was silently black until the renderer stopped
+  binding whatever texture the current pass writes to. Three things are new: it targets WebGL2 / GLSL ES 3.00 with
+  an automatic ES 1.00 fallback (ES 3.00 promoted names like round() to
+  built-ins, so shaders that legally defined their own fail there and must not
+  be called broken for it); it implements ISF PASSES and PERSISTENT multi-pass,
+  which the original did not attempt; and failure classification is driven by
+  the strings drivers actually emit. Measured over the 726-shader library: 69.7%
+  of shaders previewed before, 93.7% now (91.2% of them showing something rather
+  than a flat frame), and multi-pass went from 1 of 81 rendering to 69, of which
+  64 show something. Not one shader in the library is now reported as genuinely
+  broken, down from 83 — the rest were WebGL1 casualties wearing a red badge,
+  which is the fastest possible way to stop trusting a tool. Amber now means
+  "your browser cannot, MMV probably can" and red means "this file does not
+  parse", and the classifier reads the FIRST compiler error rather than the
+  whole cascade, because one stray late "syntax error" was outvoting thirty
+  earlier lines naming the real cause.
+
+  Also fixed: ISF TYPE is matched case-insensitively. The spec spells these
+  lowercase but real files do not, and an input typed "FLOAT" or "COLOR" was
+  dropped from the import with no row and no "unsupported type" warning either,
+  because the skip-detection shared the same blind spot. Seven such inputs exist
+  in the live library.
+
 -->
 
 
@@ -6821,6 +6870,844 @@
     }
 
     // Parse the ISF JSON block from a GLSL/ISF shader string
+    // ===== ISF preview renderer =====================================
+    // Added v0.9.35. See the block comment below for lineage and for the
+    // measurements behind each departure from the tool it was derived from.
+    // ===========================================================================
+    // ISF -> WebGL2 preview renderer.
+    //
+    // Lineage: the preprocessor's structure and several specific decisions are
+    // taken from Matt's ISF Catalogue (see MMEHANDOVER.md), which had already paid
+    // for them the hard way — notably declaring RENDERSIZE/TIME unconditionally
+    // (the IMG_* macros expand to RENDERSIZE, so a literal-mention test misses
+    // every filter that only reaches it through a macro, which silently broke 349
+    // of them), and de-duplicating emitted uniforms against BOTH what the shader
+    // already declares and what we have emitted already (an ISF input named
+    // `iMouse` collides with the Shadertoy shim, and a repeat declaration is a
+    // GLSL redefinition error).
+    //
+    // Departures from that original, all measured against the 726-shader library:
+    //   * targets WebGL2 / GLSL ES 3.00 rather than WebGL1 / ES 1.00. A crude
+    //     mechanical port recovered 91 of 125 previously-failing shaders, 65 of
+    //     which the WebGL1 build had badged red "broken". They were never broken.
+    //   * implements ISF PASSES / PERSISTENT multi-pass, which the original did
+    //     not attempt at all (81 shaders in the library declare >1 pass, 66
+    //     mention PERSISTENT).
+    //   * failure classification is driven by the strings the driver actually
+    //     emits, captured from a full corpus run, rather than plausible guesses.
+    //     Four of the five real messages missed the original's regexes and landed
+    //     on a red "broken" badge — including one whose text literally reads
+    //     "supported in GLSL ES 3.00 and above only".
+    // ===========================================================================
+
+    const ISF_GLSL_TYPE = { float:'float', bool:'bool', long:'int', color:'vec4', point2D:'vec2',
+      image:'sampler2D', audio:'sampler2D', audioFFT:'sampler2D', event:'bool' };
+    // Shadertoy ports are common in this collection; shim their globals so a
+    // straight copy-paste shader still runs.
+    const ISF_SHADERTOY = [['vec3','iResolution'],['float','iTime'],['float','iGlobalTime'],
+      ['float','iTimeDelta'],['int','iFrame'],['vec4','iMouse'],['vec4','iDate'],
+      // Audio-oriented Shadertoy globals. Unshimmed they read as "undeclared
+      // identifier", which is indistinguishable from a genuinely broken file.
+      ['float','iSampleRate'],['float','iFrameRate']];
+
+    // ISF TYPE is case-sensitive in the spec but not in the wild: the library has
+    // inputs typed "FLOAT" and "COLOR". Normalise before dispatching on it.
+    function isfType(inp){
+      const t=String(inp&&(inp.TYPE!=null?inp.TYPE:inp.type)||'');
+      const lower=t.toLowerCase();
+      if(lower==='point2d') return 'point2D';
+      if(lower==='audiofft') return 'audioFFT';
+      return lower;
+    }
+    function isfName(inp){ return (inp&&(inp.NAME!=null?inp.NAME:inp.name))||''; }
+
+    // ISF header = the first /* */ block that parses as a JSON object. Not simply
+    // the first comment: a few files open with a licence or credit block.
+    function isfParseHeader(text){
+      const re=/\/\*([\s\S]*?)\*\//g;
+      let m,tried=0;
+      while((m=re.exec(text))){
+        if(++tried>6) break;
+        const body=m[1].trim();
+        if(body.charAt(0)!=='{') continue;
+        try{ return JSON.parse(body); }catch(e){ /* not the header — keep looking */ }
+      }
+      return null;
+    }
+
+    // ISF filters declare varyings that live in a companion .vs we do not have.
+    // Generate a vertex shader matching whatever the fragment side declares,
+    // feeding each one the base UV so the program at least links and renders.
+    // Collect the fragment shader's varyings, de-duplicated by name. Real ISF
+    // files routinely declare each one TWICE, guarded by
+    // `#if __VERSION__ <= 120 / varying ... / #else / in ... / #endif`, so that one
+    // file serves both GLSL generations. Only one branch is ever live, but a plain
+    // regex sees both — and emitting the same name twice on the vertex side is a
+    // redefinition error that looks, misleadingly, like a fault in the shader.
+    function isfVaryings(fragSrc){
+      const vars=[], seen={};
+      const re=/^[ \t]*(?:varying|in)\s+(?:(?:lowp|mediump|highp)\s+)?(\w+)\s+(\w+)\s*;/gm;
+      let m;
+      while((m=re.exec(fragSrc))){
+        if(seen[m[2]]) continue;
+        seen[m[2]]=1;
+        vars.push([m[1],m[2]]);
+      }
+      return vars;
+    }
+
+    function isfBuildVert(fragSrc,es100){
+      const vars=isfVaryings(fragSrc);
+      let s=es100?'attribute vec2 aPos;\n':'#version 300 es\nin vec2 aPos;\n';
+      for(const v of vars) s+=(es100?'varying ':'out ')+v[0]+' '+v[1]+';\n';
+      s+='void main(){\n  vec2 uv=aPos*0.5+0.5;\n';
+      for(const v of vars){
+        const t=v[0];
+        const fill=t==='vec2'?'uv':t==='vec3'?'vec3(uv,0.0)':t==='vec4'?'vec4(uv,0.0,1.0)':t==='float'?'uv.x':t+'(0)';
+        s+='  '+v[1]+'='+fill+';\n';
+      }
+      return s+'  gl_Position=vec4(aPos,0.0,1.0);\n}';
+    }
+
+    // targets: names of PASSES render targets, which become sampler2D uniforms
+    // visible to later passes (and to a PERSISTENT pass reading its own history).
+    //
+    // es100 selects the GLSL generation to emit. ES 3.00 is tried first because it
+    // recovers 91 shaders in this library that ES 1.00 rejects outright. But ES 3.00
+    // is not a superset: it PROMOTED names like round() and trunc() to built-ins,
+    // so a shader that legally defined its own round() under ES 1.00 fails on ES 3.00
+    // with "Name of a built-in function cannot be redeclared". Those shaders are
+    // fine — just older — so a failed ES 3.00 compile falls back to ES 1.00 rather
+    // than being reported as broken.
+    function isfPreprocess(src,inputs,targets,es100){
+      src=src.replace(/^\s*#version[^\n]*\r?\n/m,'');
+      // precision declarations must come first in GLSL ES, so hoist any the
+      // shader wrote itself rather than leaving them stranded mid-file.
+      const prec=[];
+      src=src.replace(/^[ \t]*precision\s+(lowp|mediump|highp)\s+\w+\s*;[ \t]*\r?\n?/gm,function(m){ prec.push(m.trim()); return ''; });
+
+      let usesFragColor=false;
+      if(es100){
+        // Keep ES 1.00 spellings, and shim the ES 3.00 one in case the shader used it.
+        src=src.replace(/\btexture2DRect\s*\(/g,'texture2D(');
+      } else {
+        // ES 1.00 spellings -> ES 3.00. Word-boundary replacements only; these names
+        // are reserved so there is nothing else they could legitimately be.
+        src=src.replace(/\bvarying\b/g,'in').replace(/\battribute\b/g,'in');
+        src=src.replace(/\btexture2DRect\s*\(/g,'texture(');
+        src=src.replace(/\btexture2D\s*\(/g,'texture(');
+        src=src.replace(/\btextureCube\s*\(/g,'texture(');
+        usesFragColor=/\bgl_FragColor\b/.test(src);
+        src=src.replace(/\bgl_FragColor\b/g,'isf_FragColor');
+      }
+
+      let macros='';
+      if(es100&&/\btexture\s*\(/.test(src)&&!/#define\s+texture\b/.test(src)){
+        macros+='\n#define texture(s,c) texture2D(s,c)\n';
+      }
+      // IMG_SIZE resolves to RENDERSIZE. That is exact whenever every buffer is
+      // full-size (the overwhelming majority) and approximate for a pass that
+      // declares a smaller WIDTH/HEIGHT. Getting it exact needs a per-sampler size,
+      // which a GLSL macro cannot look up from its argument; since the preview's
+      // job is ranking which parameters matter rather than matching MMV pixel for
+      // pixel, the approximation is the right trade.
+      if(/IMG_PIXEL|IMG_NORM_PIXEL|IMG_THIS_PIXEL|IMG_THIS_NORM_PIXEL|IMG_SIZE/.test(src)){
+        const tex=es100?'texture2D':'texture';
+        macros+='\n#define IMG_PIXEL(i,c) '+tex+'(i,(c)/RENDERSIZE)\n'
+          +'#define IMG_NORM_PIXEL(i,c) '+tex+'(i,(c))\n'
+          +'#define IMG_THIS_PIXEL(i) '+tex+'(i,gl_FragCoord.xy/RENDERSIZE)\n'
+          +'#define IMG_THIS_NORM_PIXEL(i) '+tex+'(i,gl_FragCoord.xy/RENDERSIZE)\n'
+          +'#define IMG_SIZE(i) (RENDERSIZE)\n';
+      }
+      if(/isf_FragNormCoord|vv_FragNormCoord/.test(src)){
+        macros+='\n#define isf_FragNormCoord (gl_FragCoord.xy/RENDERSIZE)\n'
+          +'#define vv_FragNormCoord (gl_FragCoord.xy/RENDERSIZE)\n';
+      }
+
+      let uni='';
+      const emitted={};
+      const declared=function(n){ return new RegExp('uniform\\s+(?:(?:lowp|mediump|highp)\\s+)?\\w+\\s+'+n+'\\b').test(src); };
+      const emit=function(t,n){
+        if(!n||emitted[n]||declared(n)) return;
+        emitted[n]=1;
+        uni+='uniform '+t+' '+n+';\n';
+      };
+      // Unconditional: the IMG_* macros above expand to RENDERSIZE, so testing
+      // whether the shader mentions it literally misses every filter that reaches
+      // it only through a macro.
+      emit('vec2','RENDERSIZE'); emit('float','TIME');
+      const probe=src+macros;
+      const ifUsed=function(t,n){ if(new RegExp('\\b'+n+'\\b').test(probe)) emit(t,n); };
+      ifUsed('float','TIMEDELTA'); ifUsed('int','PASSINDEX');
+      ifUsed('int','FRAMEINDEX'); ifUsed('vec4','DATE');
+      // INPUTS before the Shadertoy shim: a declared ISF type beats the shim's guess.
+      for(const inp of (inputs||[])) emit(ISF_GLSL_TYPE[isfType(inp)]||'float',isfName(inp));
+      // Pass targets are samplers to whoever reads them.
+      for(const t of (targets||[])) ifUsed('sampler2D',t);
+      for(const st of ISF_SHADERTOY) ifUsed(st[0],st[1]);
+      for(let i=0;i<4;i++) ifUsed('sampler2D','iChannel'+i);
+
+      const precision=prec.length?prec.join('\n')+'\n':'precision highp float;\n';
+      const outDecl=usesFragColor?'out vec4 isf_FragColor;\n':'';
+      const version=es100?'':'#version 300 es\n';
+      return version+precision+outDecl+uni+macros+'\n'+src;
+    }
+
+    function isfDefaultFor(inp){
+      const d=inp.DEFAULT!==undefined?inp.DEFAULT:inp.default;
+      switch(isfType(inp)){
+        case 'bool': case 'event': return d?1:0;
+        case 'long': {
+          const vals=inp.VALUES||inp.values;
+          return d!=null?d:(vals&&vals.length?vals[0]:0);
+        }
+        case 'color': {
+          if(Array.isArray(d)&&d.length>=3) return [d[0],d[1],d[2],d.length>3?d[3]:1];
+          return [1,1,1,1];
+        }
+        case 'point2D': return Array.isArray(d)?[d[0],d[1]]:[0.5,0.5];
+        case 'image': case 'audio': case 'audioFFT': return null;
+        default: {
+          if(typeof d==='number') return d;
+          const lo=typeof inp.MIN==='number'?inp.MIN:0, hi=typeof inp.MAX==='number'?inp.MAX:1;
+          return (lo+hi)/2;
+        }
+      }
+    }
+
+    // A synthetic input frame so image-input filters render something legible:
+    // a colour ramp for hue/gradient ops, a checkerboard for displacement and
+    // tiling, a circle for anything radial, and fine lines so blurs and sharpens
+    // visibly change something.
+    function isfTestTexture(gl){
+      const c=document.createElement('canvas'); c.width=c.height=256;
+      const x=c.getContext('2d');
+      const g=x.createLinearGradient(0,0,256,256);
+      g.addColorStop(0,'#2b6cff'); g.addColorStop(0.5,'#ff4ec4'); g.addColorStop(1,'#ffd24e');
+      x.fillStyle=g; x.fillRect(0,0,256,256);
+      x.fillStyle='rgba(0,0,0,0.28)';
+      for(let i=0;i<8;i++) for(let j=0;j<8;j++) if((i+j)%2) x.fillRect(i*32,j*32,32,32);
+      x.strokeStyle='#fff'; x.lineWidth=3;
+      x.beginPath(); x.arc(128,128,70,0,Math.PI*2); x.stroke();
+      x.lineWidth=1;
+      for(let i=0;i<256;i+=6){ x.beginPath(); x.moveTo(i,0); x.lineTo(i,24); x.stroke(); }
+      const tex=gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D,tex);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,c);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+      return tex;
+    }
+
+    // PASSES WIDTH/HEIGHT may be an arithmetic expression over $WIDTH, $HEIGHT and
+    // input values, e.g. "$WIDTH/4". Substitute the numbers, then refuse to
+    // evaluate anything that is not plain arithmetic — so a malformed or hostile
+    // expression falls back to full size instead of running as code.
+    function isfEvalDim(expr,vars,fallback){
+      if(expr==null) return fallback;
+      if(typeof expr==='number') return Math.max(1,Math.round(expr));
+      let s=String(expr);
+      s=s.replace(/\$?\b(\w+)\b/g,function(m,name){
+        if(vars[name]!=null&&isFinite(vars[name])) return '('+Number(vars[name])+')';
+        return m;
+      });
+      s=s.replace(/\$/g,'');
+      if(!/^[0-9+\-*/(). \t]+$/.test(s)) return fallback;
+      try{
+        const v=Function('"use strict";return ('+s+')')();
+        return isFinite(v)&&v>=1?Math.max(1,Math.round(v)):fallback;
+      }catch(e){ return fallback; }
+    }
+
+    // Separate "this preview cannot do it" from "this shader is broken". Every
+    // pattern below was taken from a message a real driver emitted while compiling
+    // this library, not from guesswork — the previous generation of this function
+    // guessed, and mislabelled 65 working shaders as broken.
+    function isfDiagnose(msg,info){
+      const full=String(msg||'');
+      // Classify on the FIRST error the compiler reported, not the whole log.
+      // Everything after the first error is usually cascade noise, and a single
+      // late "syntax error" in a 30-line cascade would otherwise outvote thirty
+      // earlier lines naming the real cause — which is exactly how two shaders
+      // whose only problem was an unshimmed Shadertoy global came to be labelled
+      // "malformed". Fall back to the whole log when there is no ERROR: line.
+      const firstErr=(full.match(/ERROR:[^\n]*/)||[])[0];
+      const m=firstErr||full;
+      // Genuine GLSL parse failures. Checked first: a malformed file often also
+      // trips the "undeclared identifier" path further down, and calling it a
+      // host-support issue would be the wrong story.
+      if(/syntax error|Missing main|missing main|'\{' : syntax|unexpected \$end|Invalid (?:field|type)/i.test(m)){
+        return {cls:'err',short:'malformed',note:'The GLSL itself does not parse. This is usually a genuinely broken file — often an incomplete AI conversion — rather than a preview limitation. MMV will reject it too.'};
+      }
+      // Version / dialect limits. Reachable even on ES 3.00: these shaders want
+      // desktop OpenGL, which MMV has and a browser does not.
+      if(/supported in GLSL ES|and above only|only supported in|is not supported|requires .* extension|No precision specified/i.test(m)){
+        return {cls:'warn',short:'desktop GL only',note:'Uses a GLSL feature the browser\'s GLSL ES does not include, even at ES 3.00. Desktop OpenGL — which MMV uses — has no such restriction, so this is a limit of the in-browser preview, not a fault in the shader.'};
+      }
+      if(/Index expression must be constant|Index expression can only contain const or loop symbols|Loop index cannot be|Invalid init declaration|Invalid condition|Array size must be|integer overflow in array/i.test(m)){
+        return {cls:'warn',short:'browser GLSL limit',note:'Indexes an array or writes a loop in a form the browser\'s GLSL will not accept. Desktop OpenGL is more permissive, so it very probably runs fine in MMV.'};
+      }
+      // Desktop GL happily initialises a global from a uniform or a function call;
+      // GLSL ES requires a constant expression there. Common in Shadertoy ports,
+      // and never a fault in the shader itself.
+      if(/global variable initializers must be constant/i.test(m)){
+        return {cls:'warn',short:'desktop GL only',note:'Initialises a global variable from something the browser cannot evaluate at compile time (a uniform, or a function call). Desktop OpenGL allows this, so it should run in MMV.'};
+      }
+      // A name that ES 3.00 promoted to a built-in but the shader defines itself.
+      // Reaching here means the ES 1.00 fallback ALSO failed, so report it as a
+      // preview limit rather than a defect.
+      if(/cannot be redeclared|redefinition/i.test(m)){
+        return {cls:'warn',short:'name clash',note:'Defines a function or variable whose name collides with one this GLSL version reserves. Older or desktop GL has no such reservation, so this is very likely fine in MMV.'};
+      }
+      if(/l-value required|wrong operand types|vector field selection out of range|illegal vector field selection/i.test(m)){
+        return {cls:'warn',short:'desktop GL only',note:'Uses an assignment or type combination the browser\'s GLSL rejects but desktop OpenGL accepts. Worth trying in MMV before assuming it is broken.'};
+      }
+      // Overwhelmingly a function that exists in desktop GL or a later ES version
+      // and not here, or one called with desktop-only argument types.
+      if(/no matching overloaded function found|cannot convert from|dimension mismatch|field selection requires/i.test(m)){
+        return {cls:'warn',short:'desktop GL only',note:'Calls a function, or a type combination, that this browser\'s GLSL does not provide. Common in shaders written for desktop OpenGL or a newer GLSL than browsers expose — usually fine in MMV.'};
+      }
+      if(/undeclared identifier/.test(m)){
+        return {cls:'warn',short:'needs host',note:'References a name an ISF host supplies that this preview does not — usually a render-pass target or an imported image.'};
+      }
+      if(/does not match any VERTEX|varying/i.test(m)){
+        return {cls:'warn',short:'needs .vs',note:'Expects a companion vertex shader (.vs) for its varyings. The preview generates one, which did not satisfy this shader.'};
+      }
+      if(info&&info.passes>1){
+        return {cls:'warn',short:'multi-pass',note:'Renders in '+info.passes+' passes and did not complete here. Multi-pass is supported, so this is a genuine failure in one of the passes rather than a missing feature — but MMV may still run it.'};
+      }
+      return {cls:'err',short:'preview failed',note:'Would not compile, and the reason does not match a known browser-only restriction. Worth opening in MMV before assuming it is broken.'};
+    }
+
+    // ---------------------------------------------------------------------------
+    // The renderer proper. One WebGL2 context, one shader loaded at a time.
+    //
+    // The context is recycled on a NEW canvas every so often: a single context
+    // starts rejecting shaders that compile perfectly in a fresh one after a few
+    // hundred compile/delete cycles, and getContext() on the same canvas hands
+    // back the SAME context, which makes naive recycling a silent no-op. Not
+    // reproduced on this machine's software rasteriser, but it cost the catalogue
+    // days of bogus "compile error" badges on real hardware, so the mitigation
+    // stays.
+    // ---------------------------------------------------------------------------
+    function IsfRenderer(w,h){
+      this.w=w||320; this.h=h||200;
+      this.canvas=null; this.gl=null; this.compiles=0;
+      this.entry=null; this.passes=null; this.buffers={}; this.testTex=null;
+      this.frame=0; this.error=null; this.diag=null;
+      this._freshContext();
+    }
+    IsfRenderer.CONTEXT_BUDGET=150;
+
+    IsfRenderer.prototype._freshContext=function(){
+      this._releaseBuffers();
+      this.canvas=document.createElement('canvas');
+      this.canvas.width=this.w; this.canvas.height=this.h;
+      this.gl=this.canvas.getContext('webgl2',{antialias:false,preserveDrawingBuffer:true,premultipliedAlpha:false});
+      this.compiles=0; this.testTex=null; this.blackTex=null; this.passes=null; this.buffers={};
+      if(!this.gl) return false;
+      const gl=this.gl;
+      this.quad=gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER,this.quad);
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+      // Float render targets for PASSES that ask for FLOAT. Optional: without it
+      // those passes fall back to 8-bit, which is a fidelity loss, not a failure.
+      this.floatOK=!!gl.getExtension('EXT_color_buffer_float');
+      return true;
+    };
+
+    IsfRenderer.prototype._releaseBuffers=function(){
+      if(!this.gl) return;
+      const gl=this.gl;
+      for(const k in this.buffers){
+        const b=this.buffers[k];
+        if(b.fbo) gl.deleteFramebuffer(b.fbo);
+        if(b.fboB) gl.deleteFramebuffer(b.fboB);
+        if(b.tex) gl.deleteTexture(b.tex);
+        if(b.texB) gl.deleteTexture(b.texB);
+      }
+      this.buffers={};
+    };
+
+    IsfRenderer.prototype._compile=function(src,type){
+      const gl=this.gl;
+      const s=gl.createShader(type);
+      gl.shaderSource(s,src); gl.compileShader(s);
+      if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+        const log=gl.getShaderInfoLog(s)||'unknown compile error';
+        gl.deleteShader(s);
+        throw new Error(log.trim());
+      }
+      return s;
+    };
+
+    IsfRenderer.prototype._program=function(fragSrc,vertSrc){
+      const gl=this.gl;
+      const f=this._compile(fragSrc,gl.FRAGMENT_SHADER);
+      const v=this._compile(vertSrc,gl.VERTEX_SHADER);
+      const p=gl.createProgram();
+      gl.attachShader(p,v); gl.attachShader(p,f);
+      gl.linkProgram(p);
+      gl.deleteShader(f); gl.deleteShader(v);
+      if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+        const log=gl.getProgramInfoLog(p);
+        gl.deleteProgram(p);
+        throw new Error('link failed: '+log);
+      }
+      this.compiles++;
+      return p;
+    };
+
+    // entry: {src, inputs, header}. Returns true on success; on failure sets
+    // .error and .diag and returns false.
+    IsfRenderer.prototype.load=function(entry){
+      this.error=null; this.diag=null; this.frame=0;
+      if(!this.gl||this.gl.isContextLost()||this.compiles>=IsfRenderer.CONTEXT_BUDGET){
+        if(!this._freshContext()){ this.error='WebGL2 unavailable'; this.diag={cls:'err',short:'no WebGL2',note:'This browser did not provide a WebGL2 context, so no preview is possible.'}; return false; }
+      }
+      if(this.program){ this.gl.deleteProgram(this.program); this.program=null; }
+      if(this.passPrograms){ for(const p of this.passPrograms) if(p&&p!==this.program) this.gl.deleteProgram(p); }
+      this.passPrograms=null;
+      this._releaseBuffers();
+
+      const header=entry.header||{};
+      const declared=Array.isArray(header.PASSES)?header.PASSES:[];
+      // A pass with no TARGET draws to the screen. Give every intermediate pass a
+      // target name so later passes can sample it, which is what ISF guarantees.
+      const passes=(declared.length?declared:[{}]).map(function(p,i){
+        return {target:p.TARGET||null, width:p.WIDTH!=null?p.WIDTH:null, height:p.HEIGHT!=null?p.HEIGHT:null,
+          persistent:!!p.PERSISTENT, float:!!p.FLOAT, index:i};
+      });
+      const targets=passes.map(function(p){ return p.target; }).filter(Boolean);
+      this.entry=entry; this.passes=passes; this.targets=targets;
+
+      // One program serves every pass: ISF distinguishes passes by PASSINDEX at
+      // run time, not by separate source. Compiling once is both faster and what
+      // keeps a shader that branches on PASSINDEX behaving correctly.
+      //
+      // ES 3.00 first, ES 1.00 on failure — see isfPreprocess. The ES 3.00 error is
+      // the one reported if BOTH fail, since it is almost always the more
+      // informative of the two.
+      let firstErr=null;
+      for(const es100 of [false,true]){
+        try{
+          const fragSrc=isfPreprocess(entry.src,entry.inputs,targets,es100);
+          const vertSrc=isfBuildVert(entry.src,es100);
+          this.program=this._program(fragSrc,vertSrc);
+          this.fragSrc=fragSrc; this.es100=es100;
+          break;
+        }catch(e){
+          if(firstErr==null) firstErr=String(e.message||e);
+          this.program=null;
+        }
+      }
+      if(!this.program){
+        this.error=firstErr;
+        this.diag=isfDiagnose(this.error,{passes:passes.length});
+        return false;
+      }
+      if(!this.testTex) this.testTex=isfTestTexture(this.gl);
+      return true;
+    };
+
+    IsfRenderer.prototype._buffer=function(name,w,h,wantFloat,persistent){
+      const gl=this.gl;
+      let b=this.buffers[name];
+      if(!b){ b={tex:null,fbo:null,texB:null,fboB:null,w:0,h:0,persistent:persistent}; this.buffers[name]=b; }
+      if(b.w===w&&b.h===h&&b.float===wantFloat) return b;
+      const mk=function(){
+        const tex=gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D,tex);
+        const useFloat=wantFloat&&this.floatOK;
+        if(useFloat) gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);
+        else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+        gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+        const fbo=gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+        gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+        return {tex:tex,fbo:fbo};
+      }.bind(this);
+      if(b.tex){ gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo); }
+      if(b.texB){ gl.deleteTexture(b.texB); gl.deleteFramebuffer(b.fboB); }
+      const a=mk(); b.tex=a.tex; b.fbo=a.fbo;
+      // A PERSISTENT pass may sample its own previous contents. Reading and
+      // writing one texture in a single draw is undefined, so persistent targets
+      // get a second buffer and swap each frame.
+      if(persistent){ const bb=mk(); b.texB=bb.tex; b.fboB=bb.fbo; }
+      b.w=w; b.h=h; b.float=wantFloat;
+      return b;
+    };
+
+    // A 1x1 black texture, for wherever a sampler must be bound but there is
+    // nothing legitimate to bind — which is also what ISF semantics give you for
+    // a render target nothing has drawn to yet.
+    IsfRenderer.prototype._black=function(){
+      if(this.blackTex) return this.blackTex;
+      const gl=this.gl;
+      const t=gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D,t);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      this.blackTex=t;
+      return t;
+    };
+
+    IsfRenderer.prototype._setUniforms=function(prog,vals,time,passIndex,w,h){
+      const gl=this.gl, self=this;
+      const U=function(n){ return gl.getUniformLocation(prog,n); };
+      let l;
+      if((l=U('RENDERSIZE'))) gl.uniform2f(l,w,h);
+      if((l=U('TIME'))) gl.uniform1f(l,time);
+      if((l=U('TIMEDELTA'))) gl.uniform1f(l,1/60);
+      if((l=U('PASSINDEX'))) gl.uniform1i(l,passIndex);
+      if((l=U('FRAMEINDEX'))) gl.uniform1i(l,this.frame);
+      const dnow=new Date();
+      const dateVec=[dnow.getFullYear(),dnow.getMonth()+1,dnow.getDate(),
+        dnow.getHours()*3600+dnow.getMinutes()*60+dnow.getSeconds()];
+      if((l=U('DATE'))) gl.uniform4f(l,dateVec[0],dateVec[1],dateVec[2],dateVec[3]);
+      if((l=U('iResolution'))) gl.uniform3f(l,w,h,1);
+      if((l=U('iTime'))) gl.uniform1f(l,time);
+      if((l=U('iGlobalTime'))) gl.uniform1f(l,time);
+      if((l=U('iTimeDelta'))) gl.uniform1f(l,1/60);
+      if((l=U('iFrame'))) gl.uniform1i(l,this.frame);
+      if((l=U('iMouse'))) gl.uniform4f(l,w*0.5,h*0.5,0,0);
+      if((l=U('iDate'))) gl.uniform4f(l,dateVec[0],dateVec[1],dateVec[2],dateVec[3]);
+
+      let unit=0;
+      const bindTex=function(loc,tex){
+        gl.activeTexture(gl.TEXTURE0+unit);
+        gl.bindTexture(gl.TEXTURE_2D,tex);
+        gl.uniform1i(loc,unit);
+        unit++;
+      };
+      for(let i=0;i<4;i++){ const cl=U('iChannel'+i); if(cl) bindTex(cl,this.testTex); }
+      // Pass targets, so a later pass can read an earlier one. On a persistent
+      // buffer, hand over the FRONT texture — the one holding last frame's result.
+      for(const name of (this.targets||[])){
+        const loc=U(name); if(!loc) continue;
+        const b=this.buffers[name];
+        let tex=b?(b.readTex||b.tex):null;
+        // Never bind the texture this pass is writing to. One program serves
+        // every pass, so a pass rendering INTO bufA still has bufA declared as a
+        // sampler — and sampling the texture you are drawing to is a framebuffer
+        // feedback loop, which WebGL resolves by drawing nothing at all. That
+        // silently blacked out the first pass of every buffered shader.
+        // A PERSISTENT target is exempt: it writes its back buffer while reading
+        // the front, so those are genuinely two different textures.
+        if(tex&&tex===this._writeTex) tex=null;
+        bindTex(loc,tex||this._black());
+      }
+      for(const inp of (this.entry.inputs||[])){
+        const nm=isfName(inp);
+        const loc=U(nm); if(!loc) continue;
+        const v=vals[nm];
+        switch(isfType(inp)){
+          case 'bool': case 'event': gl.uniform1i(loc,v?1:0); break;
+          case 'long': gl.uniform1i(loc,v|0); break;
+          case 'color': gl.uniform4f(loc,v[0],v[1],v[2],v.length>3?v[3]:1); break;
+          case 'point2D': gl.uniform2f(loc,v[0],v[1]); break;
+          case 'image': case 'audio': case 'audioFFT': bindTex(loc,this.testTex); break;
+          default: gl.uniform1f(loc,Number(v)||0);
+        }
+      }
+    };
+
+    IsfRenderer.prototype._drawPass=function(prog,vals,time,passIndex,w,h){
+      const gl=this.gl;
+      gl.viewport(0,0,w,h);
+      gl.useProgram(prog);
+      const a=gl.getAttribLocation(prog,'aPos');
+      gl.bindBuffer(gl.ARRAY_BUFFER,this.quad);
+      gl.enableVertexAttribArray(a);
+      gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);
+      this._setUniforms(prog,vals,time,passIndex,w,h);
+      gl.clearColor(0,0,0,1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.drawArrays(gl.TRIANGLES,0,3);
+    };
+
+    // Render one frame: every declared pass in order, the last one to the screen.
+    IsfRenderer.prototype.draw=function(vals,time){
+      if(!this.program) return false;
+      const gl=this.gl, W=this.w, H=this.h;
+      const dimVars={WIDTH:W,HEIGHT:H};
+      for(const inp of (this.entry.inputs||[])){
+        const v=vals[isfName(inp)];
+        if(typeof v==='number') dimVars[isfName(inp)]=v;
+      }
+      // Point every persistent buffer's sampler at the texture holding last
+      // frame's result before anything draws this frame.
+      for(const name in this.buffers){
+        const b=this.buffers[name];
+        b.readTex=b.tex;
+      }
+      for(let i=0;i<this.passes.length;i++){
+        const p=this.passes[i];
+        const last=i===this.passes.length-1;
+        const pw=isfEvalDim(p.width,dimVars,W), ph=isfEvalDim(p.height,dimVars,H);
+        if(p.target){
+          const b=this._buffer(p.target,pw,ph,p.float,p.persistent);
+          // Persistent: draw into the BACK buffer while sampling the front, then
+          // swap so the result becomes next frame's history.
+          const persistent=p.persistent&&b.fboB;
+          const writeFbo=persistent?b.fboB:b.fbo;
+          b.readTex=b.tex;
+          this._writeTex=persistent?b.texB:b.tex;
+          gl.bindFramebuffer(gl.FRAMEBUFFER,writeFbo);
+          this._drawPass(this.program,vals,time,i,pw,ph);
+          gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+          this._writeTex=null;
+          if(p.persistent&&b.fboB){
+            const t=b.tex, f=b.fbo;
+            b.tex=b.texB; b.fbo=b.fboB; b.texB=t; b.fboB=f;
+          }
+          b.readTex=b.tex;
+          // A final pass that declares a TARGET still has to reach the screen, or
+          // a multi-pass shader whose last pass is buffered would preview black.
+          if(last) this._blit(b.tex);
+        } else {
+          gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+          this._drawPass(this.program,vals,time,i,W,H);
+        }
+      }
+      this.frame++;
+      return true;
+    };
+
+    // Copy a texture to the default framebuffer.
+    IsfRenderer.prototype._blit=function(tex){
+      const gl=this.gl;
+      if(!this.blitProg){
+        this.blitProg=this._program(
+          '#version 300 es\nprecision highp float;\nuniform sampler2D src;\nuniform vec2 RENDERSIZE;\nout vec4 o;\n'
+          +'void main(){ o=texture(src,gl_FragCoord.xy/RENDERSIZE); }',
+          '#version 300 es\nin vec2 aPos;\nvoid main(){ gl_Position=vec4(aPos,0.0,1.0); }');
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+      gl.viewport(0,0,this.w,this.h);
+      gl.useProgram(this.blitProg);
+      const a=gl.getAttribLocation(this.blitProg,'aPos');
+      gl.bindBuffer(gl.ARRAY_BUFFER,this.quad);
+      gl.enableVertexAttribArray(a);
+      gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D,tex);
+      gl.uniform1i(gl.getUniformLocation(this.blitProg,'src'),0);
+      gl.uniform2f(gl.getUniformLocation(this.blitProg,'RENDERSIZE'),this.w,this.h);
+      gl.drawArrays(gl.TRIANGLES,0,3);
+    };
+
+    // Free everything and drop the context. Called when the dialog closes, so
+    // repeatedly opening the import dialog cannot accumulate live WebGL
+    // contexts — browsers cap how many exist at once and silently kill the
+    // oldest, which would break a preview that was working a moment ago.
+    IsfRenderer.prototype.dispose=function(){
+      if(!this.gl) return;
+      const gl=this.gl;
+      this._releaseBuffers();
+      if(this.program) gl.deleteProgram(this.program);
+      if(this.blitProg) gl.deleteProgram(this.blitProg);
+      if(this.testTex) gl.deleteTexture(this.testTex);
+      if(this.blackTex) gl.deleteTexture(this.blackTex);
+      if(this.quad) gl.deleteBuffer(this.quad);
+      this.program=null; this.blitProg=null; this.testTex=null; this.blackTex=null; this.quad=null;
+      const lose=gl.getExtension('WEBGL_lose_context');
+      if(lose) lose.loseContext();
+      this.gl=null;
+      if(this.canvas&&this.canvas.parentNode) this.canvas.parentNode.removeChild(this.canvas);
+    };
+
+    IsfRenderer.prototype.readPixels=function(){
+      const gl=this.gl;
+      const px=new Uint8Array(this.w*this.h*4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+      gl.readPixels(0,0,this.w,this.h,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      return px;
+    };
+
+    // Does the frame contain anything to look at? A shader can compile, run, and
+    // still produce a flat field — invisible in a thumbnail, and worth saying so
+    // rather than showing an apparently-blank preview.
+    IsfRenderer.prototype.frameSpread=function(px){
+      let mn=[255,255,255], mx=[0,0,0];
+      for(let i=0;i<px.length;i+=4){
+        for(let c=0;c<3;c++){ if(px[i+c]<mn[c]) mn[c]=px[i+c]; if(px[i+c]>mx[c]) mx[c]=px[i+c]; }
+      }
+      return Math.max(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2]);
+    };
+
+    // ---------------------------------------------------------------------------
+    // Visual impact scan.
+    //
+    // The actual problem with a 40-input shader is not that you cannot see it — it
+    // is that you cannot tell which six of the forty are worth automating. So:
+    // render a baseline at the defaults, then for each mappable scalar push it to
+    // each end of its declared range and measure how much the frame changes. That
+    // turns "read the GLSL and guess" into a ranked list, and it identifies the
+    // inputs that do nothing at all, which in a hand-grown shader library is a
+    // real and common category.
+    //
+    // Deliberately measured at low resolution and a fixed TIME: we are ranking
+    // parameters against each other, not judging image quality, and a fixed clock
+    // keeps an animated shader's own motion out of the comparison.
+    // ---------------------------------------------------------------------------
+
+    // Mean absolute per-channel difference between two frames, 0..1.
+    function isfFrameDelta(a,b){
+      let sum=0, n=0;
+      for(let i=0;i<a.length;i+=4){
+        sum+=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);
+        n+=3;
+      }
+      return n?sum/n/255:0;
+    }
+
+    // rows: the flattened, automatable scalars — MME's own buildMappingRows output
+    // shape, i.e. {srcName, min, max, isColor, colorCh, isPoint2D, pointAxis}.
+    // Scoring the flattened rows rather than the raw INPUTS matters: a colour's
+    // alpha channel is frequently inert while its RGB is not, and those are
+    // separate lanes and separate decisions.
+    //
+    // Returns a parallel array of {score, dead} where score is 0..1.
+    // Split into begin/step so the caller can drive it against a per-frame time
+    // budget instead of blocking. A 49-lane raymarcher costs ~150 renders and
+    // measured 6.5s in one go, which would lock the dialog solid; the same work
+    // spread over frames stays interactive and can show progress.
+    IsfRenderer.prototype.impactBegin=function(rows,opts){
+      const ctx=this._impactCtx(rows,opts);
+      ctx.i=0; ctx.results=[];
+      return ctx;
+    };
+    IsfRenderer.prototype.impactStep=function(ctx,budgetMs){
+      const t0=(typeof performance!=='undefined'?performance.now():Date.now());
+      const now=function(){ return (typeof performance!=='undefined'?performance.now():Date.now()); };
+      while(ctx.i<ctx.rows.length){
+        ctx.results.push(this._impactOne(ctx,ctx.rows[ctx.i]));
+        ctx.i++;
+        // Always complete at least one row per call, or a shader slower than the
+        // budget would never advance at all.
+        if(budgetMs&&now()-t0>=budgetMs) break;
+      }
+      return {done:ctx.i>=ctx.rows.length,progress:ctx.i/ctx.rows.length,results:ctx.results};
+    };
+
+    // Blocking convenience wrapper, used by the tests.
+    IsfRenderer.prototype.impactScan=function(rows,opts){
+      const ctx=this.impactBegin(rows,opts);
+      let r;
+      do{ r=this.impactStep(ctx,0); }while(!r.done);
+      return r.results;
+    };
+
+    IsfRenderer.prototype._impactCtx=function(rows,opts){
+      opts=opts||{};
+      const time=opts.time!=null?opts.time:1.7;
+      const settle=opts.settle||1;
+      const inputs=this.entry.inputs||[];
+      // opts.base lets the caller scan from the CURRENT slider positions instead of
+      // the defaults. That matters because impact is a property of a parameter *in
+      // a given state*: a control gated behind a mode switch or an intensity that
+      // is zero at the default reads as inert until you turn the thing on. The UI
+      // exposes this as a rescan, and the "no visible effect" wording says "at
+      // these settings" rather than claiming the control is useless.
+      const base=opts.base?opts.base:isfDefaultVals(inputs);
+      const self=this;
+
+      const renderWith=function(vals){
+        // A feedback/accumulation shader has no meaningful single frame; run it a
+        // few times so there is something accumulated to compare.
+        self.frame=0;
+        for(const name in self.buffers){
+          const b=self.buffers[name];
+          // Wipe history so one probe cannot leak into the next.
+          if(b.fbo){ self.gl.bindFramebuffer(self.gl.FRAMEBUFFER,b.fbo); self.gl.clearColor(0,0,0,1); self.gl.clear(self.gl.COLOR_BUFFER_BIT); }
+          if(b.fboB){ self.gl.bindFramebuffer(self.gl.FRAMEBUFFER,b.fboB); self.gl.clearColor(0,0,0,1); self.gl.clear(self.gl.COLOR_BUFFER_BIT); }
+        }
+        self.gl.bindFramebuffer(self.gl.FRAMEBUFFER,null);
+        for(let i=0;i<settle;i++) self.draw(vals,time+i/60);
+        return self.readPixels();
+      };
+
+      const clone=function(v){
+        const o={};
+        for(const k in v) o[k]=Array.isArray(v[k])?v[k].slice():v[k];
+        return o;
+      };
+      const baseline=renderWith(clone(base));
+      return {rows:rows,base:base,baseline:baseline,renderWith:renderWith,clone:clone};
+    };
+
+    // Reading one scalar out of, and back into, whatever container the input uses.
+    function isfSetScalar(vals,row,x){
+      const nm=row.srcName;
+      if(row.isColor) vals[nm][row.colorCh]=x;
+      else if(row.isPoint2D) vals[nm][row.pointAxis]=x;
+      else vals[nm]=x;
+    }
+    function isfGetScalar(vals,row){
+      const nm=row.srcName;
+      if(row.isColor) return vals[nm][row.colorCh];
+      if(row.isPoint2D) return vals[nm][row.pointAxis];
+      return vals[nm];
+    }
+
+    IsfRenderer.prototype._impactOne=function(ctx,row){
+      const base=ctx.base, baseline=ctx.baseline, renderWith=ctx.renderWith, clone=ctx.clone;
+      const setScalar=isfSetScalar, getScalar=isfGetScalar;
+      {
+        const cur=getScalar(base,row);
+        let lo=row.min, hi=row.max;
+        if(!isFinite(lo)||!isFinite(hi)||lo===hi){ return {score:0,dead:true,untestable:true}; }
+        let best=0;
+        // Probe INTERIOR points, not the raw endpoints. A parameter driven to its
+        // declared extreme frequently pushes the shader into a degenerate state —
+        // a blown-out white frame, a divide-by-zero, geometry behind the camera —
+        // and the resulting enormous frame delta scores it identically to a
+        // parameter that genuinely transforms the image. Measured on
+        // "Complex Diamond Shapes 2", endpoint probing gave five unrelated inputs
+        // the same 0.655 score, which is a ranking that tells you nothing.
+        // Quarter/half/three-quarter covers real travel without courting the
+        // degenerate ends.
+        const span=hi-lo;
+        for(const frac of [0.25,0.5,0.75]){
+          const probe=lo+span*frac;
+          if(probe===cur) continue;
+          const vals=clone(base);
+          setScalar(vals,row,probe);
+          best=Math.max(best,isfFrameDelta(baseline,renderWith(vals)));
+        }
+        // A stepped/boolean input has no meaningful interior, so for those the
+        // ends ARE the parameter.
+        if(row.type==='bool'||row.steps===2||span<=1.0001&&(row.type==='long'||row.type==='bool')){
+          for(const probe of [lo,hi]){
+            if(probe===cur) continue;
+            const vals=clone(base);
+            setScalar(vals,row,probe);
+            best=Math.max(best,isfFrameDelta(baseline,renderWith(vals)));
+          }
+        }
+        // 0.002 is about half a level of 8-bit output averaged over the frame —
+        // below that, nothing a person would notice has happened.
+        return {score:best,dead:best<0.002};
+      }
+    };
+
+    // Build the default value set for an entry.
+    function isfDefaultVals(inputs){
+      const vals={};
+      for(const inp of (inputs||[])) vals[isfName(inp)]=isfDefaultFor(inp);
+      return vals;
+    }
+
     function parseISFHeader(text){
       const m=text.match(/\/\*\s*([\s\S]*?)\s*\*\//);
       if(!m) return null;
@@ -6832,8 +7719,14 @@
       const rows=[];
       if(!Array.isArray(inputs)) return rows;
       for(const inp of inputs){
-        const t=inp.TYPE||inp.type||'';
-        const nm=inp.NAME||inp.name||'?';
+        // Normalise the declared TYPE before dispatching on it. ISF's spec
+        // spells these lowercase, but the wild does not: the live library has
+        // inputs typed "FLOAT" and "COLOR", and comparing against lowercase
+        // literals dropped them with no row AND no "unsupported type" warning,
+        // because the skip-detection below shares the same blind spot. They
+        // just silently vanished from the import.
+        const t=isfType(inp);
+        const nm=isfName(inp)||'?';
         if(t==='image'||t==='audio'||t==='audioFFT'||t==='event') continue;
         if(t==='color'){
           const def=inp.DEFAULT||inp.default||[0,0,0,1];
@@ -6994,8 +7887,7 @@
       const mappedSrc=new Set(rows.map(function(r){ return r.srcName; }));
       const INTENTIONALLY_UNMAPPABLE=['image','audio','audioFFT','event'];
       const skipped=inputs.filter(function(inp){
-        const t=inp.TYPE||inp.type||'';
-        return INTENTIONALLY_UNMAPPABLE.indexOf(t)===-1 && !mappedSrc.has(inp.NAME||inp.name||'?');
+        return INTENTIONALLY_UNMAPPABLE.indexOf(isfType(inp))===-1 && !mappedSrc.has(isfName(inp)||'?');
       });
 
       const existing=document.getElementById('isfDialog');
@@ -7004,7 +7896,7 @@
       const dlg=document.createElement('dialog');
       dlg.id='isfDialog';
       dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
-        +'width:min(960px,95vw);max-height:90vh;overflow:hidden;display:flex;flex-direction:column;';
+        +'width:min(1340px,97vw);max-height:92vh;overflow:hidden;display:flex;flex-direction:column;';
 
       // ── Title header ────────────────────────────────────────────
       const shaderTitle=header.LABEL||header.label||header.DESCRIPTION||filename||'ISF Shader';
@@ -7037,7 +7929,7 @@
         const warnRow=document.createElement('div');
         warnRow.style.cssText='padding:6px 18px;border-bottom:1px solid #2c313b;flex-shrink:0;font-size:11px;color:#ffb454;';
         warnRow.textContent='Not shown (unsupported input type): '+skipped.map(function(inp){
-          return (inp.NAME||inp.name||'?')+' ('+(inp.TYPE||inp.type||'?')+')';
+          return (isfName(inp)||'?')+' ('+(inp.TYPE||inp.type||'?')+')';
         }).join(', ');
         dlg.appendChild(warnRow);
       }
@@ -7092,6 +7984,9 @@
       thr.appendChild(th('Min','right'));
       thr.appendChild(th('Max','right'));
       thr.appendChild(th('Default','right'));
+      const thImpact=th('Effect','left','min-width:74px;');
+      thImpact.title='How much the picture changes when this parameter moves, measured by rendering the shader. Run "Scan effect" to fill this in.';
+      thr.appendChild(thImpact);
       thr.appendChild(thEl(hdrImport,'center'));
       const thPb=th('PB','center');
       thPb.title='Pitch Bend — real 14-bit resolution instead of CC\'s 7-bit, for a parameter that looks stepped/jerky at plain CC precision. One per MIDI channel (it\'s a whole channel\'s pitch-bend stream, not a numbered CC).';
@@ -7119,8 +8014,8 @@
           :row.type==='bool'?'bool'
           :row.type==='long'?'int/enum':'float';
 
-        const defCV=defaultCCVal(row);
-        const defPV=defaultPbVal(row);
+        let defCV=defaultCCVal(row);
+        let defPV=defaultPbVal(row);
 
         // Assign initial CC: next free from 14
         while(initUsed.has('0_'+runningCC)&&runningCC<=127) runningCC++;
@@ -7159,6 +8054,7 @@
         }
 
         const tdDefCC=document.createElement('td');
+        tdDefCC.dataset.col='midiDefault';
         tdDefCC.style.cssText='padding:5px 6px;text-align:center;color:#c8cdd8;font-variant-numeric:tabular-nums;';
 
         function checkConflict(){
@@ -7208,30 +8104,52 @@
         chInput.addEventListener('blur',checkConflict);
 
         const tdName=document.createElement('td');
+        tdName.dataset.col='param';
         tdName.style.cssText='padding:5px 6px 5px 14px;color:#e0e4ef;';
         tdName.textContent=row.name;
 
         const tdType=document.createElement('td');
+        tdType.dataset.col='type';
         tdType.style.cssText='padding:5px 6px;color:#7a8099;white-space:nowrap;';
         tdType.textContent=typeLabel;
 
         const tdMin=document.createElement('td');
+        tdMin.dataset.col='min';
         tdMin.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
         tdMin.textContent=fmtNum(row.min);
 
         const tdMax=document.createElement('td');
+        tdMax.dataset.col='max';
         tdMax.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
         tdMax.textContent=fmtNum(row.max);
 
         const tdDef=document.createElement('td');
+        tdDef.dataset.col='default';
         tdDef.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
         tdDef.textContent=fmtNum(row.defaultVal);
 
+        // Effect cell: a bar plus a word. Empty until a scan has run — an
+        // unscanned parameter must not look like a scanned-and-inert one.
+        const tdImpact=document.createElement('td');
+        tdImpact.dataset.col='effect';
+        tdImpact.style.cssText='padding:5px 6px;';
+        const impactBar=document.createElement('div');
+        impactBar.style.cssText='height:6px;border-radius:3px;background:#2c313b;overflow:hidden;';
+        const impactFill=document.createElement('div');
+        impactFill.style.cssText='height:100%;width:0;background:#4fa3ff;transition:width .15s;';
+        impactBar.appendChild(impactFill);
+        const impactLbl=document.createElement('div');
+        impactLbl.style.cssText='font-size:9px;color:#5a6075;margin-top:2px;white-space:nowrap;';
+        impactLbl.textContent='not scanned';
+        tdImpact.appendChild(impactBar); tdImpact.appendChild(impactLbl);
+
         const tdImport=document.createElement('td');
+        tdImport.dataset.col='import';
         tdImport.style.cssText='padding:5px 6px;text-align:center;';
         tdImport.appendChild(importCb);
 
         const tdPb=document.createElement('td');
+        tdPb.dataset.col='pb';
         tdPb.style.cssText='padding:5px 6px;text-align:center;';
         tdPb.appendChild(pbCb);
         dimmableCells.push(tdPb);
@@ -7240,29 +8158,97 @@
         dimmableCells.push(tdDefCC);
 
         const tdCC=document.createElement('td');
+        tdCC.dataset.col='cc';
         tdCC.style.cssText='padding:5px 6px;text-align:center;';
         tdCC.appendChild(ccInput);
         tdCC.appendChild(conflictLbl);
         dimmableCells.push(tdCC);
 
         const tdCh=document.createElement('td');
+        tdCh.dataset.col='ch';
         tdCh.style.cssText='padding:5px 6px;text-align:center;';
         tdCh.appendChild(chInput);
         dimmableCells.push(tdCh);
 
         tr.appendChild(tdName); tr.appendChild(tdType);
         tr.appendChild(tdMin); tr.appendChild(tdMax); tr.appendChild(tdDef);
+        tr.appendChild(tdImpact);
         tr.appendChild(tdImport); tr.appendChild(tdPb); tr.appendChild(tdDefCC);
         tr.appendChild(tdCC); tr.appendChild(tdCh);
         tbody.appendChild(tr);
 
-        const thisRef={importCb, pbCb, ccInput, chInput, defCCVal:defCV, defPbVal:defPV, row, setDimmed, checkConflict, tr};
+        // Re-derive this row's MIDI default from a new shader-native value,
+        // reusing defaultCCVal/defaultPbVal so a preview-derived default
+        // quantizes by exactly the same path as a file-derived one.
+        function applyNativeDefault(v){
+          row.defaultVal=v;
+          defCV=defaultCCVal(row); defPV=defaultPbVal(row);
+          thisRef.defCCVal=defCV; thisRef.defPbVal=defPV;
+          tdDef.textContent=fmtNum(v);
+          checkConflict();
+        }
+
+        const thisRef={importCb, pbCb, ccInput, chInput, defCCVal:defCV, defPbVal:defPV, row, setDimmed, checkConflict, tr,
+          impactFill, impactLbl, tdDefCC, impact:null, applyNativeDefault};
         rowRefs.push(thisRef);
       });
 
       tbl.appendChild(tbody);
       tableWrap.appendChild(tbl);
-      dlg.appendChild(tableWrap);
+
+      // ── Live preview pane ────────────────────────────────────────
+      // The point of this pane is not fidelity — MMV renders these shaders
+      // properly and always will. It is to answer "which of these 40 controls
+      // actually does something", which is the decision this dialog exists to
+      // make. That is why the effect scan, not the picture, is the centrepiece.
+      const bodyRow=document.createElement('div');
+      bodyRow.style.cssText='display:flex;flex:1;min-height:0;overflow:hidden;';
+      tableWrap.style.flex='1';
+      bodyRow.appendChild(tableWrap);
+
+      const pv=document.createElement('div');
+      pv.id='isfPreviewPane';
+      pv.style.cssText='width:344px;flex:0 0 344px;border-left:1px solid #2c313b;display:flex;'
+        +'flex-direction:column;overflow:hidden;';
+      const pvHdr=document.createElement('div');
+      pvHdr.style.cssText='padding:8px 12px 6px;flex-shrink:0;';
+      pvHdr.innerHTML='<b style="color:#e0e4ef;font-size:12px;">Live preview</b>';
+      pv.appendChild(pvHdr);
+
+      const pvCanvasWrap=document.createElement('div');
+      pvCanvasWrap.style.cssText='padding:0 12px;flex-shrink:0;';
+      pv.appendChild(pvCanvasWrap);
+
+      const pvStatus=document.createElement('div');
+      pvStatus.id='isfPreviewStatus';
+      pvStatus.style.cssText='padding:6px 12px;font-size:10.5px;line-height:1.45;color:#7a8099;flex-shrink:0;';
+      pv.appendChild(pvStatus);
+
+      const pvScanRow=document.createElement('div');
+      pvScanRow.style.cssText='padding:2px 12px 8px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;';
+      const scanBtn=document.createElement('button');
+      scanBtn.id='isfScanBtn'; scanBtn.textContent='Scan effect';
+      scanBtn.title='Render the shader once per parameter to measure how much each one changes the picture, then rank them.';
+      scanBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;';
+      const topBtn=document.createElement('button');
+      topBtn.id='isfTopMoversBtn'; topBtn.textContent='Tick top movers';
+      topBtn.title='Tick the parameters that visibly change the picture, and untick the ones that do nothing.';
+      topBtn.disabled=true;
+      topBtn.style.cssText=scanBtn.style.cssText;
+      const useValsBtn=document.createElement('button');
+      useValsBtn.id='isfUseValsBtn'; useValsBtn.textContent='Defaults from preview';
+      useValsBtn.title='Use the values currently set on the preview sliders as each lane\u2019s starting MIDI value.';
+      useValsBtn.style.cssText=scanBtn.style.cssText;
+      pvScanRow.appendChild(scanBtn); pvScanRow.appendChild(topBtn); pvScanRow.appendChild(useValsBtn);
+      pv.appendChild(pvScanRow);
+
+      const pvCtls=document.createElement('div');
+      pvCtls.id='isfPreviewControls';
+      pvCtls.style.cssText='flex:1;overflow-y:auto;padding:8px 12px 12px;border-top:1px solid #23272f;';
+      pv.appendChild(pvCtls);
+
+      bodyRow.appendChild(pv);
+      dlg.appendChild(bodyRow);
 
       // ── Footer ────────────────────────────────────────────────────
       const footer=document.createElement('div');
@@ -7392,6 +8378,268 @@
         flash('Imported '+toImport.length+' lane'+(toImport.length!==1?'s':'')+
           (pbCount?' ('+pbCount+' as Pitch Bend)':'')+' from '+filename+'.');
       });
+
+      // ── Preview + effect scan wiring ─────────────────────────────
+      // Everything below is an aid. If WebGL2 is missing, or this particular
+      // shader will not compile in a browser, the dialog stays fully usable —
+      // the preview says so plainly and the import table is untouched.
+      const previewEntry={src:sourceText||'',inputs:inputs,header:header};
+      let renderer=null, liveVals=null, rafId=0, scanCtx=null, scanRaf=0, startedAt=0;
+
+      function pvNote(text,colour){
+        pvStatus.textContent=text;
+        pvStatus.style.color=colour||'#7a8099';
+      }
+
+      function stopPreview(){
+        if(rafId) cancelAnimationFrame(rafId);
+        if(scanRaf) cancelAnimationFrame(scanRaf);
+        rafId=0; scanRaf=0; scanCtx=null;
+        if(renderer) renderer.dispose();
+        renderer=null;
+      }
+
+      function startPreview(){
+        if(!sourceText){
+          pvNote('No shader source available for this import, so there is nothing to preview. The parameter table is unaffected.');
+          scanBtn.disabled=true; useValsBtn.disabled=true;
+          return;
+        }
+        renderer=new IsfRenderer(320,200);
+        if(!renderer.gl){
+          pvNote('This browser did not provide a WebGL2 context, so the preview and effect scan are unavailable. Everything else in this dialog works as usual.','#ffb454');
+          scanBtn.disabled=true; useValsBtn.disabled=true;
+          renderer=null;
+          return;
+        }
+        renderer.canvas.style.cssText='width:320px;height:200px;display:block;border-radius:4px;background:#0d0f14;border:1px solid #2c313b;';
+        pvCanvasWrap.appendChild(renderer.canvas);
+        if(!renderer.load(previewEntry)){
+          const d=renderer.diag||{cls:'err',short:'preview failed',note:''};
+          // Amber, not red, unless the shader genuinely will not parse. Telling
+          // someone a working shader is broken is the fastest way to make them
+          // stop believing the tool.
+          pvNote((d.cls==='err'?'Cannot preview — ':'Preview unavailable ('+d.short+') — ')+d.note,
+            d.cls==='err'?'#ff6b6b':'#ffb454');
+          scanBtn.disabled=true; useValsBtn.disabled=true;
+          renderer.canvas.style.opacity='0.25';
+          return;
+        }
+        liveVals=isfDefaultVals(inputs);
+        const nPasses=(Array.isArray(header.PASSES)?header.PASSES.length:0)||1;
+        pvNote(nPasses>1
+          ? ('Rendering '+nPasses+' passes. Approximate — MMV is the real thing; this is here to show you which controls matter.')
+          : 'Approximate — MMV is the real thing; this is here to show you which controls matter.');
+        buildPreviewControls();
+        // A shader can compile, run, and render a completely flat frame at its
+        // own default settings — several "stage effect" shaders draw nothing
+        // until a level or trigger is raised. Saying so beats showing what
+        // looks like a broken preview.
+        try{
+          renderer.draw(liveVals,1.7);
+          if(renderer.frameSpread(renderer.readPixels())<4){
+            pvNote('This shader renders an empty frame at its default settings — that is the shader, not a preview failure. Raise a level or switch on a mode below, then press "Scan effect".','#ffb454');
+          }
+        }catch(e){ /* the animation loop below reports draw failures */ }
+        startedAt=performance.now();
+        const tick=function(){
+          if(!renderer) return;
+          // Hold the clock still during a scan: the measurement compares frames,
+          // and a moving TIME would be indistinguishable from the parameter.
+          if(!scanCtx){
+            const t=(performance.now()-startedAt)/1000;
+            try{ renderer.draw(liveVals,t); }
+            catch(e){ pvNote('Preview stopped: '+e.message,'#ffb454'); return; }
+          }
+          rafId=requestAnimationFrame(tick);
+        };
+        tick();
+      }
+
+      // One control per ISF input, matching the type: a slider for float, a
+      // dropdown honouring VALUES/LABELS for an enum, a checkbox for bool, two
+      // sliders for point2D, four for a colour (so alpha is reachable, which a
+      // colour swatch hides).
+      function buildPreviewControls(){
+        pvCtls.innerHTML='';
+        const lbl=document.createElement('div');
+        lbl.style.cssText='font-size:10px;color:#5a6075;margin-bottom:6px;';
+        lbl.textContent='Move a control to see what it does. These values do not affect the import unless you press "Defaults from preview".';
+        pvCtls.appendChild(lbl);
+        for(const inp of inputs){
+          const t=isfType(inp), nm=isfName(inp);
+          if(!nm) continue;
+          const wrap=document.createElement('div');
+          wrap.style.cssText='margin-bottom:7px;';
+          const cap=document.createElement('div');
+          cap.style.cssText='font-size:10.5px;color:#a8afc0;display:flex;justify-content:space-between;gap:6px;';
+          const capName=document.createElement('span'); capName.textContent=inp.LABEL||nm;
+          const capVal=document.createElement('b'); capVal.style.cssText='color:#7a8099;font-weight:400;';
+          cap.appendChild(capName); cap.appendChild(capVal);
+          wrap.appendChild(cap);
+          const sliderCss='width:100%;margin:1px 0;';
+
+          if(t==='image'||t==='audio'||t==='audioFFT'){
+            capVal.textContent='test pattern';
+            pvCtls.appendChild(wrap);
+            continue;
+          }
+          if(t==='bool'||t==='event'){
+            const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!!liveVals[nm];
+            cb.addEventListener('change',function(){ liveVals[nm]=cb.checked?1:0; });
+            capVal.textContent='';
+            wrap.appendChild(cb);
+            pvCtls.appendChild(wrap);
+            continue;
+          }
+          if(t==='long'){
+            const vals=inp.VALUES||inp.values||[], labs=inp.LABELS||inp.labels||[];
+            const sel=document.createElement('select');
+            sel.style.cssText='width:100%;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:2px 4px;font-size:11px;';
+            if(vals.length){
+              vals.forEach(function(v,i){ const o=document.createElement('option'); o.value=v; o.textContent=labs[i]!=null?labs[i]:v; sel.appendChild(o); });
+            } else {
+              const lo=inp.MIN|0, hi=inp.MAX!=null?inp.MAX|0:lo+10;
+              for(let v=lo;v<=hi;v++){ const o=document.createElement('option'); o.value=v; o.textContent=v; sel.appendChild(o); }
+            }
+            sel.value=liveVals[nm];
+            sel.addEventListener('change',function(){ liveVals[nm]=parseInt(sel.value,10); });
+            wrap.appendChild(sel);
+            pvCtls.appendChild(wrap);
+            continue;
+          }
+          if(t==='color'){
+            const chs=['R','G','B','A'];
+            const upd=function(){ capVal.textContent=liveVals[nm].map(function(v){ return (+v).toFixed(2); }).join(' '); };
+            for(let ci=0;ci<4;ci++){
+              const r=document.createElement('input');
+              r.type='range'; r.min=0; r.max=1; r.step=0.004; r.value=liveVals[nm][ci];
+              r.title=chs[ci];
+              r.style.cssText=sliderCss;
+              r.addEventListener('input',function(){ liveVals[nm][ci]=parseFloat(r.value); upd(); });
+              wrap.appendChild(r);
+            }
+            upd();
+            pvCtls.appendChild(wrap);
+            continue;
+          }
+          if(t==='point2D'){
+            const upd=function(){ capVal.textContent=liveVals[nm].map(function(v){ return (+v).toFixed(2); }).join(', '); };
+            for(let ai=0;ai<2;ai++){
+              const mnRaw=inp.MIN, mxRaw=inp.MAX;
+              const mn=Array.isArray(mnRaw)?(mnRaw[ai]!=null?mnRaw[ai]:0):(mnRaw!=null?mnRaw:0);
+              const mx=Array.isArray(mxRaw)?(mxRaw[ai]!=null?mxRaw[ai]:1):(mxRaw!=null?mxRaw:1);
+              const r=document.createElement('input');
+              r.type='range'; r.min=mn; r.max=mx; r.step=(mx-mn)/500||0.002; r.value=liveVals[nm][ai];
+              r.title=ai?'Y':'X';
+              r.style.cssText=sliderCss;
+              r.addEventListener('input',function(){ liveVals[nm][ai]=parseFloat(r.value); upd(); });
+              wrap.appendChild(r);
+            }
+            upd();
+            pvCtls.appendChild(wrap);
+            continue;
+          }
+          // float
+          const lo=typeof inp.MIN==='number'?inp.MIN:0, hi=typeof inp.MAX==='number'?inp.MAX:1;
+          const r=document.createElement('input');
+          r.type='range'; r.min=lo; r.max=hi; r.step=(hi-lo)/500||0.001; r.value=liveVals[nm];
+          r.style.cssText=sliderCss;
+          capVal.textContent=(+liveVals[nm]).toFixed(3);
+          r.addEventListener('input',function(){ liveVals[nm]=parseFloat(r.value); capVal.textContent=(+r.value).toFixed(3); });
+          wrap.appendChild(r);
+          pvCtls.appendChild(wrap);
+        }
+      }
+
+      function paintImpact(){
+        let top=0;
+        rowRefs.forEach(function(ref){ if(ref.impact&&ref.impact.score>top) top=ref.impact.score; });
+        rowRefs.forEach(function(ref){
+          const im=ref.impact;
+          if(!im) return;
+          // Bars are scaled against the strongest parameter in THIS shader.
+          // An absolute scale would leave a subtle-but-real shader looking
+          // entirely inert.
+          const rel=top>0?im.score/top:0;
+          ref.impactFill.style.width=Math.max(im.dead?0:2,Math.round(rel*100))+'%';
+          ref.impactFill.style.background=im.dead?'#3a404e':(rel>0.5?'#4fa3ff':rel>0.15?'#63b3ff':'#7a8099');
+          if(im.untestable){ ref.impactLbl.textContent='no range'; ref.impactLbl.style.color='#5a6075'; }
+          else if(im.dead){ ref.impactLbl.textContent='no effect here'; ref.impactLbl.style.color='#ffb454'; }
+          else { ref.impactLbl.textContent=(im.score*100).toFixed(im.score<0.01?2:1)+'%'; ref.impactLbl.style.color='#7a8099'; }
+        });
+      }
+
+      function runScan(){
+        if(!renderer||!renderer.program) return;
+        scanBtn.disabled=true; topBtn.disabled=true;
+        const settle=(Array.isArray(header.PASSES)&&header.PASSES.some(function(p){ return p&&p.PERSISTENT; }))?5:1;
+        // Scanning from the CURRENT slider values, not the file defaults, is
+        // what lets you find the controls that only come alive once something
+        // else is switched on — the usual reason a control looks inert.
+        scanCtx=renderer.impactBegin(rows,{settle:settle,base:liveVals});
+        const step=function(){
+          if(!scanCtx||!renderer){ return; }
+          let r;
+          try{ r=renderer.impactStep(scanCtx,12); }
+          catch(e){ pvNote('Effect scan stopped: '+e.message,'#ffb454'); scanCtx=null; scanBtn.disabled=false; return; }
+          for(let i=0;i<r.results.length;i++) rowRefs[i].impact=r.results[i];
+          paintImpact();
+          scanBtn.textContent='Scanning '+Math.round(r.progress*100)+'%';
+          if(!r.done){ scanRaf=requestAnimationFrame(step); return; }
+          scanCtx=null; scanRaf=0;
+          scanBtn.textContent='Rescan effect';
+          scanBtn.disabled=false; topBtn.disabled=false;
+          const live=rowRefs.filter(function(x){ return x.impact&&!x.impact.dead; }).length;
+          const dead=rowRefs.length-live;
+          pvNote(live+' of '+rowRefs.length+' parameters visibly change the picture at these settings'
+            +(dead?('; '+dead+' do nothing here. A control that is gated behind another one reads as "no effect" until you switch that one on — move the sliders and rescan.'):'.'));
+        };
+        step();
+      }
+
+      // Tick the parameters worth automating: everything within a reasonable
+      // fraction of the strongest mover, capped so a 50-input shader does not
+      // hand back 30 lanes. Explicitly UNticks the inert ones, since the whole
+      // point is to stop you wiring up controls that do nothing.
+      function tickTopMovers(){
+        const scored=rowRefs.filter(function(r){ return r.impact&&!r.impact.dead; })
+          .sort(function(a,b){ return b.impact.score-a.impact.score; });
+        if(!scored.length){ flash('Nothing visibly changed the picture, so there is nothing to tick. Try moving the preview sliders and rescanning.'); return; }
+        const top=scored[0].impact.score;
+        const keep=scored.filter(function(r){ return r.impact.score>=top*0.15; }).slice(0,12);
+        const keepSet=new Set(keep);
+        rowRefs.forEach(function(r){
+          const want=keepSet.has(r);
+          if(r.importCb.checked!==want){ r.importCb.checked=want; r.setDimmed(!want); }
+        });
+        rowRefs.forEach(function(r){ r.checkConflict(); });
+        updateCount();
+        flash('Ticked the '+keep.length+' parameter'+(keep.length!==1?'s':'')+' that most change the picture.');
+      }
+
+      // Write the live slider values back as each lane's starting MIDI value.
+      // Reuses defaultCCVal/defaultPbVal rather than repeating the scaling, so
+      // preview-derived defaults quantize exactly like file-derived ones.
+      function defaultsFromPreview(){
+        if(!liveVals) return;
+        rowRefs.forEach(function(ref){
+          const row=ref.row, nm=row.srcName;
+          let v;
+          if(row.isColor) v=liveVals[nm][row.colorCh];
+          else if(row.isPoint2D) v=liveVals[nm][row.pointAxis];
+          else v=liveVals[nm];
+          if(typeof v!=='number'||!isFinite(v)) return;
+          ref.applyNativeDefault(v);
+        });
+        flash('Starting MIDI values taken from the preview sliders.');
+      }
+
+      scanBtn.addEventListener('click',runScan);
+      topBtn.addEventListener('click',tickTopMovers);
+      useValsBtn.addEventListener('click',defaultsFromPreview);
+      dlg.addEventListener('close',stopPreview);
+      startPreview();
 
       // Initial state — all unticked, dimmable cells dimmed
       rowRefs.forEach(function(ref){ ref.setDimmed(true); ref.checkConflict(); });
