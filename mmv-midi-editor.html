@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.39
+  MMV MIDI & CC Curve Editor v0.9.40
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -936,6 +936,55 @@
   can hand-edit inside a span, but a later move re-bakes over that edit. The
   alternative is the app fighting your own edits, which is worse.
 
+
+  v0.9.40 Pitch-bound macros. The macro feature shipped and then failed in use,
+  and the reason was the re-use workflow rather than the macros themselves. To
+  put a macro somewhere you had to select the note, open Setup, find the macro
+  and click "→ Note" — once per note. For the actual job people wanted it for,
+  the same gesture on every kick in a song, that is slower than copy/paste, so
+  the fastest route through the app was the one that didn't use the feature.
+  A capability nobody can afford to use is not a capability.
+
+  So a macro can now be bound to a PITCH instead of to a note: "this macro
+  lives on C1". After that, placing a note on C1 IS placing the macro. Write
+  kicks the way you always would and the automation arrives with them, moves
+  when you move them, and goes when you delete them. That is the user's own
+  model of the thing, and it is better than the one that shipped — the macro
+  becomes a property of the key, which is where a drum sound already lives.
+  Bindings can be narrowed to one channel or left on any, they are listed with
+  the key's mapped drum name rather than a MIDI number, and adding or removing
+  one bakes or un-bakes every note it claims in a single undo step.
+
+  A binding is a standing rule, not a one-off, so nothing remembers a decision
+  that the rule could make instead: which macro a note carries is re-derived
+  from its pitch and channel every time anything moves. That is also what makes
+  dragging a note off a bound key take the automation away with it. An explicit
+  per-note assign still overrides its binding and stays the escape hatch, which
+  is the only thing a note needs to remember for itself, and is exactly what
+  the note.macroBound marker distinguishes.
+
+  Copies now carry the macro. Alt+drag and copy/paste dropped it, which was a
+  deliberate choice in v0.9.39 and the wrong one: the whole workflow is "put
+  this gesture in many places", so a copy that silently loses it makes the
+  fast route the broken one. Each copy bakes a FRESH instance id rather than
+  sharing the original's — instance ids are what a delete uses to find its own
+  points, so a shared one would mean deleting either copy stripped the other's
+  automation out from under it.
+
+  Baking stays strictly edit-time; nothing here runs per frame or per tick, and
+  the scheduler still sees only ordinary points. What is new is that one click
+  can now bake a great deal — 200 notes × several lanes × N points — so a bind
+  or a paste that would lay down more than 20 000 points says how many and asks
+  first rather than locking up while it works. The re-derivation itself indexes
+  bindings by pitch, so a resync costs what the notes carrying macros cost and
+  not notes × bindings.
+
+  Finally, Capture said what it needed only after you clicked it. It is now
+  disabled until a loop range exists, and says why — a macro IS a loop range —
+  and the capture dialog states plainly that ticking lanes is how you choose
+  what the macro contains, and that lanes with no points in the range are why
+  the list may be shorter than you expected.
+
 -->
 
 
@@ -1857,6 +1906,16 @@
           </div>
           <div id="macroList" style="display:flex;flex-direction:column;gap:2px;margin-top:4px;"></div>
           <div class="hint" style="margin-top:4px;">A macro is an editing aid: attaching one to a note expands it into ordinary CC points at that note's position. Macro notes are drawn amber in the piano roll.</div>
+          <div class="setup-subtitle">Pitch bindings</div>
+          <div class="setup-row setup-sub-row">
+            <select id="macroBindMacro" style="flex:1 1 110px;min-width:90px;" title="Which macro to bind"></select>
+            <span class="lbl">on</span>
+            <input type="text" id="macroBindPitch" placeholder="C1" style="width:62px;" title="Pitch to bind, written as a note name — C1, F#2, Eb3 — or a plain MIDI number 0–127.">
+            <select id="macroBindCh" style="width:88px;" title="Bind on one channel only, or on any channel"></select>
+            <button id="macroBindAddBtn" title="Bind the macro to this pitch — every note there, now and later, carries it">Bind Pitch</button>
+          </div>
+          <div id="macroBindList" style="display:flex;flex-direction:column;gap:2px;margin-top:4px;"></div>
+          <div class="hint setup-note" style="margin-top:4px;padding-left:10px;">Bind a macro to a pitch and every note at that pitch carries it automatically — put the macro on C1 and then just write a note wherever the kick lands. Assigning a macro to a single note with "→ Note" above overrides its binding, as the one-off escape hatch.</div>
         </div>
         <div class="setup-section">
           <div class="setup-title">Danger zone</div>
@@ -2279,6 +2338,11 @@
     // note (see the "CC Macros" section further down). Project data, so it
     // rides in snapshot()/applyState() and therefore in save/load too.
     macros:[],
+    // Pitch bindings: {pitch, ch, macroId}. "Every note on this key carries
+    // this macro", which is how a macro is actually placed 200 times — one
+    // note per kick — rather than selected-and-applied 200 times. ch===null
+    // means any channel. Project data, same as macros themselves.
+    macroBindings:[],
     // "Play macro" mode. OFF by default — a macro note behaves like any other
     // note and sends its MIDI note out. ON makes it an editing marker only:
     // its CC gesture is already baked into the lanes, so the note itself
@@ -2596,6 +2660,11 @@
     // own — notes and lane points are already serialised whole, so they ride
     // along, which is also what makes undo of an assign/move/delete work.
     macros:state.macros||[],
+    // Pitch bindings ride here too, and MUST: they are what makes a project's
+    // macro notes reproducible. Without them a reload would leave the baked
+    // points but forget the rule that put them there, so the next note placed
+    // on that key would come up bare.
+    macroBindings:state.macroBindings||[],
     locS:state.locStart,locE:state.locEnd,next:state.nextId,pitchNames:state.pitchNames,projectName:state.projectName,
     genLen:state.genLen,channelNames:state.channelNames,
     genLo:state.genLo,genHi:state.genHi,genTension:state.genTension,genPhase:state.genPhase,
@@ -2622,6 +2691,10 @@
     // and it must be assigned unconditionally so undoing back past a capture
     // actually drops the macro rather than leaving the old array in place.
     state.macros=o.macros||[];
+    // Same unconditional assignment, for the same reason: undoing back past
+    // the bind that created a binding has to remove it, not leave the live
+    // array standing.
+    state.macroBindings=o.macroBindings||[];
     if(o.genLen){ state.genLen=o.genLen; if($('genLen')) $('genLen').value=state.genLen; }
     if(o.channelNames) state.channelNames=o.channelNames;
     if(o.genLo!=null){ state.genLo=o.genLo; if($('advLo')){ $('advLo').value=o.genLo; $('advLoR').value=o.genLo; } }
@@ -3460,8 +3533,21 @@
         if(state.viewCh!==null&&n.ch!==state.viewCh) return;
         if(n.start<=t2&&n.start+n.length>=t1&&n.pitch>=p1&&n.pitch<=p2) state.selection.add(n.id); });
     } else if(prDrag.altCopy&&(prDrag.mode==='move'||prDrag.mode==='resize'||prDrag.mode==='resizeLeft')){
-      // Alt+drag: restore originals, paste copies at new positions
-      const newNotes=prDrag.group.map(g=>({id:state.nextId++,pitch:g.n.pitch,start:g.n.start,length:g.n.length,vel:g.n.vel,ch:g.n.ch}));
+      // Alt+drag: restore originals, paste copies at new positions.
+      // The copy carries the macro (v0.9.40 — dropping it was wrong: the
+      // whole workflow is "put this gesture in many places", and a copy that
+      // silently loses it makes the fast route the one that doesn't work).
+      // It carries the DEFINITION only — macroId plus the lane resolution the
+      // user already answered for — never macroInst/macroAt, so resyncMacros()
+      // below bakes it a fresh instance id at the new position. Sharing an
+      // instance id would mean deleting either copy stripped the other's
+      // points. macroBound is deliberately not copied: a bound copy is
+      // re-derived from its own new pitch/channel, which is what a binding
+      // means.
+      const newNotes=prDrag.group.map(g=>{
+        const c={id:state.nextId++,pitch:g.n.pitch,start:g.n.start,length:g.n.length,vel:g.n.vel,ch:g.n.ch};
+        if(g.n.macroId!=null&&!g.n.macroBound){ c.macroId=g.n.macroId; if(g.n.macroMap) c.macroMap=g.n.macroMap.slice(); }
+        return c; });
       prDrag.group.forEach(g=>{ g.n.start=g.start; g.n.pitch=g.pitch; if(g.length!==undefined) g.n.length=g.length; });
       newNotes.forEach(n=>state.notes.push(n));
       state.selection.clear(); newNotes.forEach(n=>state.selection.add(n.id));
@@ -3476,7 +3562,12 @@
     else if(effTool(e)==='select'){
       pushUndo();
       const note={id:state.nextId++,pitch:yToPitch(y),start:Math.max(0,snapTFloor(xToTick(x))),length:noteLenTicks(),vel:state.defVel,ch:state.defCh};
-      state.notes.push(note); state.selection.clear(); state.selection.add(note.id); previewNoteOn(note); requestDraw(); }
+      state.notes.push(note); state.selection.clear(); state.selection.add(note.id);
+      // A new note on a bound pitch must arrive already carrying its macro —
+      // that IS the feature. Inside the same pushUndo() above, so the note and
+      // its baked CC points are one edit.
+      resyncMacros();
+      previewNoteOn(note); requestDraw(); }
   });
   keysCanvas.addEventListener('dblclick',e=>{
     const colRect=$('keysCol').getBoundingClientRect();
@@ -3628,6 +3719,10 @@
       openChPopover(curCh,nc,(ch)=>{
         if(!state.selection.size) return;
         pushUndo(); state.notes.forEach(n=>{ if(state.selection.has(n.id)) n.ch=ch; });
+        // A channel-specific binding is matched on channel, so changing it can
+        // hand a note a macro or take one away — same re-derivation as a pitch
+        // change, in the same undo entry.
+        resyncMacros();
         updateNoteInfo(); requestDraw();
       });
     });
@@ -4664,6 +4759,21 @@
   //                     a re-bake reuses the user's earlier create/map/skip
   //                     answers instead of re-asking or silently dropping a
   //                     lane they deliberately mapped elsewhere.
+  //   note.macroBound = set when the macro came from a PITCH BINDING rather
+  //                     than from an explicit "→ Note" assign. The bake
+  //                     fields above look identical either way, so without
+  //                     this marker there is no way to tell "the user chose
+  //                     this macro for this note" from "the binding gave it
+  //                     one", and removing a binding could not know which
+  //                     notes to un-bake. Its absence is what makes an
+  //                     explicit assign stick.
+  //
+  //   state.macroBindings[k] = {pitch, ch, macroId}   ch===null = any channel
+  //
+  // v0.9.40: bindings exist because assigning a macro one selected note at a
+  // time is slower than copy/paste, which defeated the point of having macros
+  // at all. Binding a macro to a pitch turns "place the macro" back into
+  // "write a note", which is the gesture the user already has.
   function macroById(id){ return (state.macros||[]).find(m=>m.id===id)||null; }
 
   // Label for a captured lane wherever it has to be named to the user. A
@@ -4689,6 +4799,113 @@
   function findMacroLane(ml){
     return state.ccLanes.find(l=>(l.type||'cc')===ml.type && l.ch===ml.ch
       && (ml.type==='cc' ? l.cc===ml.cc : true))||null;
+  }
+
+  // ── Pitch bindings ─────────────────────────────────────────────
+  // A resync walks every note, and every note has to be asked "does a binding
+  // claim you?". Asked naively that is notes × bindings on a song with
+  // hundreds of both, on every drag release. Indexing by pitch first makes
+  // the per-note question a single Map lookup plus a walk of the (normally
+  // one) bindings that share that key, so the resync stays proportional to
+  // the notes that actually carry macros rather than to the cross product.
+  function macroBindingIndex(){
+    const idx=new Map();
+    for(const b of (state.macroBindings||[])){
+      let l=idx.get(b.pitch); if(!l){ l=[]; idx.set(b.pitch,l); }
+      l.push(b);
+    }
+    return idx;
+  }
+  // Which macro the bindings give this note, or null. A channel-specific
+  // binding beats an any-channel one on the same pitch: the specific rule is
+  // the more deliberate statement, and without that precedence a later
+  // "any channel → Riser" would silently swallow the "Ch10 → Kick FX" the
+  // user set up first. Among equally specific bindings the first wins, which
+  // is also the order they are listed in.
+  function boundMacroIdFor(note, idx){
+    const list=idx?idx.get(note.pitch)
+      :(state.macroBindings||[]).filter(b=>b.pitch===note.pitch);
+    if(!list||!list.length) return null;
+    let any=null;
+    for(const b of list){
+      if(b.ch===note.ch) return b.macroId;
+      if(b.ch==null&&any==null) any=b.macroId;
+    }
+    return any;
+  }
+  // The macro a note should be carrying right now. An explicit assign —
+  // macroId set with no macroBound marker — always wins, so the per-note
+  // escape hatch still works on a bound pitch.
+  function effectiveMacroIdFor(note, idx){
+    if(note.macroId!=null && !note.macroBound) return note.macroId;
+    return boundMacroIdFor(note, idx);
+  }
+  function clearNoteMacro(n){
+    delete n.macroId; delete n.macroInst; delete n.macroAt; delete n.macroMap; delete n.macroBound;
+  }
+  // Notes a binding would newly claim: everything at that pitch/channel that
+  // is not already spoken for by an explicit assign.
+  function notesMatchingBinding(b){
+    let n=0;
+    for(const note of state.notes){
+      if(note.pitch!==b.pitch) continue;
+      if(b.ch!=null&&note.ch!==b.ch) continue;
+      if(note.macroId!=null&&!note.macroBound) continue; // explicit assign wins
+      n++;
+    }
+    return n;
+  }
+  // Worst-case points one instance of a macro lays down: its own points plus
+  // the two possible guards per lane.
+  function macroPointCost(macro){
+    return macro?macro.lanes.reduce((s,l)=>s+l.points.length+2,0):0;
+  }
+  // Baking is edit-time only, but it is not free, and a binding is the one
+  // gesture that can bake unboundedly much from a single click: 200 kicks ×
+  // several lanes × N points each. 20 000 points is the line — a real drum
+  // session (200 hits × 3 lanes × ~10 points ≈ 6 000) stays well under it, so
+  // the warning never nags legitimate use, while anything past it is heading
+  // for lane arrays big enough to make ordinary drawing and editing crawl.
+  // Ask rather than freeze: the count is the whole point of the message, and
+  // the user is the only one who knows whether they meant it.
+  const MACRO_BAKE_WARN_POINTS=20000;
+  function confirmMacroBake(noteCount, macro, what){
+    const total=noteCount*macroPointCost(macro);
+    if(total<=MACRO_BAKE_WARN_POINTS) return true;
+    return confirm(what+' would bake about '+total.toLocaleString()+' CC points across '
+      +noteCount+' notes.\n\nThat is a lot of automation to draw and edit, and it cannot be '
+      +'undone in less than one Ctrl+Z.\n\nContinue?');
+  }
+
+  function addMacroBinding(pitch, ch, macroId){
+    const macro=macroById(macroId);
+    if(!macro){ flash('Capture a macro first — there is nothing to bind'); return false; }
+    if(!(pitch>=0&&pitch<=127)){ flash('Pitch must be a note name like C1, or a MIDI number 0–127'); return false; }
+    const bs=state.macroBindings||(state.macroBindings=[]);
+    if(bs.some(b=>b.pitch===pitch&&b.ch===ch)){ flash('That pitch is already bound on that channel'); return false; }
+    const b={pitch, ch:(ch==null?null:ch|0), macroId};
+    if(!confirmMacroBake(notesMatchingBinding(b), macro,
+      'Binding "'+macro.name+'" to '+macroBindPitchLabel(b))) return false;
+    // One undo entry for the binding AND every note it bakes — the user made
+    // one gesture, so one Ctrl+Z has to put everything back.
+    pushUndo();
+    bs.push(b);
+    resyncMacros();
+    renderMacroBindings(); updateNoteInfo(); requestDraw();
+    flash('Bound "'+macro.name+'" to '+macroBindPitchLabel(b));
+    return true;
+  }
+  function removeMacroBinding(i){
+    const bs=state.macroBindings||[];
+    if(i<0||i>=bs.length) return false;
+    pushUndo();
+    bs.splice(i,1);
+    // resyncMacros() finds the notes whose macro no longer has a source and
+    // un-bakes them, so removal is the exact inverse of the bind — again in
+    // a single undo entry.
+    resyncMacros();
+    renderMacroBindings(); updateNoteInfo(); requestDraw();
+    return true;
   }
 
   // ── Capture ────────────────────────────────────────────────────
@@ -4790,6 +5007,11 @@
       bakeMacroIntoLane(lane, ml, s, e, inst);
     });
     note.macroId=macro.id; note.macroInst=inst; note.macroAt=note.start; note.macroMap=map.slice();
+    // A bake is explicit unless the caller says otherwise — resyncMacros()
+    // re-sets the marker for the notes it baked from a binding. Doing it this
+    // way round means assignMacroToNote() needs no extra step to turn a bound
+    // note into an explicitly assigned one, which is the escape hatch.
+    delete note.macroBound;
   }
 
   // ── Assign ─────────────────────────────────────────────────────
@@ -4831,8 +5053,13 @@
   // contains consistent baked points, and re-baking there would invent a new
   // instance id on every undo.
   function resyncMacros(){
-    if(!state.macros||!state.macros.length) return false;
+    const hasMacros=state.macros&&state.macros.length;
+    const hasBindings=state.macroBindings&&state.macroBindings.length;
+    // Nothing to derive and nothing that could have been derived earlier —
+    // still the normal case, and still a single comparison on every edit.
+    if(!hasMacros&&!hasBindings) return false;
     let changed=false;
+    const idx=macroBindingIndex();
     const live=new Set();
     for(const n of state.notes) if(n.macroId!=null&&n.macroInst!=null) live.add(n.macroInst);
     // Points whose owning note no longer exists (deleted note, or a macro
@@ -4841,16 +5068,35 @@
     for(const lane of state.ccLanes) for(const p of lane.points) if(p.mi!=null&&!live.has(p.mi)) orphans.add(p.mi);
     orphans.forEach(mi=>{ stripMacroInstance(mi); changed=true; });
     for(const n of state.notes){
-      if(n.macroId==null) continue;
-      if(n.macroInst!=null && n.macroAt===n.start) continue;
-      const macro=macroById(n.macroId);
+      // What this note SHOULD carry, from its explicit assign or from the
+      // bindings. Recomputed rather than remembered, so a note dragged onto
+      // (or off) a bound key, or moved to another channel, picks the change
+      // up by the same route as everything else here.
+      const want=effectiveMacroIdFor(n, idx);
+      if(want==null){
+        if(n.macroId==null) continue; // the overwhelmingly common case
+        // Its binding was removed, or its pitch/channel moved off the bound
+        // key — un-bake and forget it.
+        if(n.macroInst!=null) stripMacroInstance(n.macroInst);
+        clearNoteMacro(n); changed=true; continue;
+      }
+      const macro=macroById(want);
       if(!macro){ // the macro definition itself was deleted — drop the marker
-        delete n.macroId; delete n.macroInst; delete n.macroAt; delete n.macroMap; changed=true; continue; }
+        if(n.macroInst!=null) stripMacroInstance(n.macroInst);
+        clearNoteMacro(n); changed=true; continue; }
+      // "bound" = this macro is coming from a binding rather than from an
+      // explicit assign, which is exactly the condition effectiveMacroIdFor()
+      // fell through on.
+      const bound=!(n.macroId!=null&&!n.macroBound);
+      if(n.macroId===want && n.macroInst!=null && n.macroAt===n.start && !!n.macroBound===bound) continue;
       if(n.macroInst!=null) stripMacroInstance(n.macroInst);
-      const map=(n.macroMap&&n.macroMap.length===macro.lanes.length)
+      // The stored create/map/skip answers only apply to the macro they were
+      // given for; a note that just changed macro resolves afresh.
+      const map=(n.macroMap&&n.macroId===want&&n.macroMap.length===macro.lanes.length)
         ? n.macroMap.slice()
         : macro.lanes.map(ml=>{ const l=findMacroLane(ml); return l?l.id:null; });
       bakeMacroOnNote(n, macro, map);
+      if(bound) n.macroBound=1; else delete n.macroBound;
       changed=true;
     }
     return changed;
@@ -4887,11 +5133,91 @@
       del.addEventListener('click',()=>{
         pushUndo();
         const i=state.macros.indexOf(m); if(i>=0) state.macros.splice(i,1);
+        // A binding pointing at a macro that no longer exists is a rule that
+        // can never fire again; leaving it listed would only ever read as a
+        // bug. resyncMacros() already un-bakes the notes.
+        state.macroBindings=(state.macroBindings||[]).filter(b=>b.macroId!==m.id);
         resyncMacros(); renderMacroList(); updateNoteInfo(); requestDraw();
       });
       row.appendChild(nm); row.appendChild(meta); row.appendChild(assign); row.appendChild(del);
       box.appendChild(row);
     });
+    // The bindings list names macros and the picker offers them, so both
+    // follow every capture and delete without a second call site.
+    renderMacroBindings();
+  }
+
+  // How a bound pitch is named everywhere it is shown. Never a raw MIDI
+  // number: on a drum kit the whole point is that the key is "Kick", and
+  // "36" would put the user back to counting semitones. The mapped name from
+  // state.pitchNames leads when there is one, with the note name kept beside
+  // it so the two readings stay connected.
+  function macroBindPitchLabel(b){
+    const ch=(b.ch==null)?(state.viewCh??state.defCh):b.ch;
+    const cn=pitchName(b.pitch, ch);
+    return noteName(b.pitch)+(cn?' – '+cn:'');
+  }
+  function renderMacroBindings(){
+    // The macro picker is part of this render: it has to track captures and
+    // deletions, and before the first capture there is nothing to bind at all.
+    const pick=$('macroBindMacro'), addBtn=$('macroBindAddBtn');
+    if(pick){
+      const prev=pick.value;
+      pick.innerHTML='';
+      const macros=state.macros||[];
+      macros.forEach(m=>{ const o=document.createElement('option'); o.value=String(m.id); o.textContent=m.name; pick.appendChild(o); });
+      if(!macros.length){ const o=document.createElement('option'); o.value=''; o.textContent='(no macros yet)'; pick.appendChild(o); }
+      if(prev&&[...pick.options].some(o=>o.value===prev)) pick.value=prev;
+      pick.disabled=!macros.length;
+      if(addBtn){ addBtn.disabled=!macros.length;
+        addBtn.title=macros.length
+          ? 'Bind the macro to this pitch — every note there, now and later, carries it'
+          : 'Capture a macro first: there is nothing to bind yet.'; }
+    }
+    const box=$('macroBindList'); if(!box) return;
+    box.innerHTML='';
+    const bs=state.macroBindings||[];
+    if(!bs.length){
+      const h=document.createElement('span'); h.className='hint';
+      h.textContent='No pitch bindings — bind a macro to a pitch to place it by writing notes.';
+      box.appendChild(h); return;
+    }
+    bs.forEach((b,i)=>{
+      const row=document.createElement('div');
+      row.className='setup-row setup-sub-row'; row.dataset.bindingIndex=String(i);
+      row.style.cssText='padding:2px 0 2px 10px;';
+      const p=document.createElement('span'); p.dataset.col='pitch'; p.textContent=macroBindPitchLabel(b);
+      p.style.cssText='flex:0 0 auto;font-size:11px;color:var(--accent2);';
+      const ch=document.createElement('span'); ch.dataset.col='ch'; ch.className='pill';
+      ch.textContent=(b.ch==null)?'Any Ch':('Ch'+((b.ch|0)+1));
+      const m=macroById(b.macroId);
+      const nm=document.createElement('span'); nm.dataset.col='macro';
+      nm.textContent='→ '+(m?m.name:'(deleted macro)');
+      nm.style.cssText='flex:1;min-width:60px;font-size:11px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      const cnt=document.createElement('span'); cnt.dataset.col='count'; cnt.className='hint';
+      const nn=state.notes.filter(n=>n.macroBound&&n.macroId===b.macroId&&n.pitch===b.pitch&&(b.ch==null||n.ch===b.ch)).length;
+      cnt.textContent=nn+' note'+(nn!==1?'s':'');
+      const del=document.createElement('button'); del.dataset.act='unbind'; del.textContent='✕';
+      del.title='Remove this binding — its notes lose the macro and the CC points it baked';
+      del.addEventListener('click',()=>removeMacroBinding(i));
+      row.appendChild(p); row.appendChild(ch); row.appendChild(nm); row.appendChild(cnt); row.appendChild(del);
+      box.appendChild(row);
+    });
+  }
+
+  // Capture has one hard prerequisite — a loop range, because that IS the
+  // macro's span — and v0.9.39 expressed it only as a flash message AFTER
+  // the click, which is too late to be instruction. A disabled button that
+  // says what to do instead is the whole fix.
+  function updateMacroCaptureBtn(){
+    const btn=$('macroCaptureBtn'); if(!btn) return;
+    const has=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
+    btn.disabled=!has;
+    btn.title=has
+      ? 'Capture '+tickToBBT(state.locStart)+' → '+tickToBBT(state.locEnd)
+        +' across the CC lanes you tick, as a reusable macro'
+      : 'No loop range is set, and a macro IS a loop range — drag on the ruler to mark the '
+        +'span you want to capture, then this becomes available.';
   }
 
   // Shared chrome for the two macro dialogs — same look as the drum-map /
@@ -4928,8 +5254,15 @@
     if(a==null||b==null||b<=a){ flash('Set a loop range on the ruler first — Capture uses it as the macro span'); return; }
     const cands=macroCaptureCandidates();
     if(!cands.length){ flash('No CC lane has points in the loop range'); return; }
+    // The sub-line has to say what the tick boxes ARE, not just what the
+    // range is: v0.9.39 left "how do I choose what the macro contains?"
+    // answerable only by guessing, and the answer is these boxes. It also
+    // has to say why a lane you expected is absent, since the list is
+    // filtered to lanes with points in the range.
     const {dlg, body, footer}=macroDialogShell('macroCaptureDialog','Capture CC Macro',
-      'Captures '+tickToBBT(a)+' → '+tickToBBT(b)+' ('+Math.round(b-a)+' ticks) from the ticked lanes. '
+      'Captures '+tickToBBT(a)+' → '+tickToBBT(b)+' ('+Math.round(b-a)+' ticks). '
+      +'Tick the lanes to include — that is how you choose what the macro contains. '
+      +'Only lanes with points inside this range are listed. '
       +'Points are stored relative to the range start, so the macro can be dropped on any note.');
     const nameRow=document.createElement('div');
     nameRow.style.cssText='display:flex;align-items:center;gap:8px;padding:4px 0 10px;';
@@ -5371,12 +5704,30 @@
       state.clipboard={type:'cc',span:b-a,points:out}; flash('Copied CC region: '+out.length+' pts'); }
     else { if(!state.selection.size){ flash('Nothing selected'); return; }
       const sel=[...state.selection].map(byId).filter(Boolean); const minS=Math.min(...sel.map(n=>n.start));
-      state.clipboard={type:'notes',items:sel.map(n=>({d:n.start-minS,pitch:n.pitch,length:n.length,vel:n.vel,ch:n.ch}))};
+      // macroId/macroMap ride in the clipboard for the same reason the
+      // Alt+drag copy carries them (see there). Only an EXPLICIT assign is
+      // copied; a bound note's macro is re-derived from where the paste lands,
+      // which is the binding doing its job.
+      state.clipboard={type:'notes',items:sel.map(n=>({d:n.start-minS,pitch:n.pitch,length:n.length,vel:n.vel,ch:n.ch,
+        macroId:(n.macroId!=null&&!n.macroBound)?n.macroId:null,
+        macroMap:(n.macroId!=null&&!n.macroBound&&n.macroMap)?n.macroMap.slice():null}))};
       flash('Copied '+sel.length+' note'+(sel.length>1?'s':'')); }
   }
   function paste(){ if(!state.clipboard){ flash('Clipboard empty'); return; } const ph=state.playhead;
-    if(state.clipboard.type==='notes'){ pushUndo(); state.selection.clear(); state.focus='piano';
-      for(const it of state.clipboard.items){ const n={id:state.nextId++,pitch:it.pitch,start:Math.max(0,ph+it.d),length:it.length,vel:it.vel,ch:it.ch}; state.notes.push(n); state.selection.add(n.id); }
+    if(state.clipboard.type==='notes'){
+      // Cost check before anything is mutated: a clipboard of macro notes
+      // pasted repeatedly is the other way to bake a great deal at once.
+      // Cancelling here leaves the project untouched, undo stack included.
+      const mid=state.clipboard.items.find(it=>it.macroId!=null);
+      if(mid&&!confirmMacroBake(state.clipboard.items.filter(it=>it.macroId!=null).length,
+        macroById(mid.macroId), 'Pasting these notes')) return;
+      pushUndo(); state.selection.clear(); state.focus='piano';
+      for(const it of state.clipboard.items){ const n={id:state.nextId++,pitch:it.pitch,start:Math.max(0,ph+it.d),length:it.length,vel:it.vel,ch:it.ch};
+        // No macroInst: resyncMacros() below bakes each paste a fresh
+        // instance, so deleting one pasted copy never strips another's points.
+        if(it.macroId!=null){ n.macroId=it.macroId; if(it.macroMap) n.macroMap=it.macroMap.slice(); }
+        state.notes.push(n); state.selection.add(n.id); }
+      resyncMacros();
       flash('Pasted notes at '+tickToBBT(ph)); }
     else { const lane=activeLane(); if(!lane){ flash('Select a CC lane to paste into'); return; } pushUndo();
       const span=state.clipboard.span, a=ph, b=ph+span; lane.points=lane.points.filter(p=>p.t<a-1||p.t>b+1);
@@ -6797,6 +7148,10 @@
     const hasRange=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
     $('stLoop').textContent=hasRange?(tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd)):'whole track';
     updateGenLenEnabled(hasRange);
+    // Capture's only prerequisite is the loop range, so this is the one place
+    // that already knows when to enable it — ruler drag, ruler dblclick and
+    // applyState() all come through here.
+    updateMacroCaptureBtn();
   }
   // Generate's Len field only sets the span when there's no loop range (see
   // generate()'s a/b logic) — a selected range determines the span instead,
@@ -7308,11 +7663,42 @@
     const sel=[...state.selection].map(byId).filter(Boolean);
     const withMacro=sel.filter(n=>n.macroId!=null);
     if(!withMacro.length){ flash('No selected note carries a macro'); return; }
+    // A bound note cannot be cleared in place: the binding is a standing rule
+    // and the very next resync would re-bake it, so silently "clearing" it
+    // would look broken. Say where the macro is actually coming from instead.
+    const explicit=withMacro.filter(n=>!n.macroBound);
+    if(!explicit.length){ flash('That macro comes from a pitch binding — remove the binding in Setup ▸ CC Macros, or move the note off that key'); return; }
     pushUndo();
-    withMacro.forEach(n=>{ if(n.macroInst!=null) stripMacroInstance(n.macroInst);
-      delete n.macroId; delete n.macroInst; delete n.macroAt; delete n.macroMap; });
+    explicit.forEach(n=>{ if(n.macroInst!=null) stripMacroInstance(n.macroInst); clearNoteMacro(n); });
+    // The note may sit on a bound pitch, in which case clearing the explicit
+    // assign hands it back to the binding — which is the right answer, and
+    // only resyncMacros() can work it out.
+    resyncMacros();
     updateNoteInfo(); requestDraw();
   });
+  // ── Setup ▸ CC Macros ▸ Pitch bindings ───────────────────────────
+  (function(){
+    const chSel=$('macroBindCh'); if(!chSel) return;
+    // "Any Ch" first and selected by default: a drum key is usually the same
+    // key whatever channel it arrives on, and the narrower rule is the one
+    // you opt into.
+    const any=document.createElement('option'); any.value=''; any.textContent='Any Ch'; chSel.appendChild(any);
+    for(let c=0;c<16;c++){ const o=document.createElement('option'); o.value=String(c); o.textContent='Ch'+(c+1); chSel.appendChild(o); }
+    $('macroBindAddBtn').addEventListener('click',()=>{
+      const raw=($('macroBindPitch').value||'').trim();
+      // Note names first (that is what the field asks for and what the list
+      // shows back), falling back to a bare MIDI number for anyone who thinks
+      // in them or is pasting from a drum chart.
+      let pitch=noteNameToPitch(raw);
+      if(pitch==null && /^\d{1,3}$/.test(raw)) pitch=+raw;
+      if(pitch==null){ flash('Enter a pitch as a note name like C1, or a MIDI number 0–127'); return; }
+      const chVal=$('macroBindCh').value;
+      const mid=$('macroBindMacro').value;
+      if(mid==='') { flash('Capture a macro first — there is nothing to bind'); return; }
+      addMacroBinding(pitch, chVal===''?null:+chVal, +mid);
+    });
+    $('macroBindPitch').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); $('macroBindAddBtn').click(); } });
+  })();
   $('fileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return; const fr=new FileReader(); fr.onload=()=>importMidi(fr.result, f.name); fr.readAsArrayBuffer(f); e.target.value=''; });
   $('drumMapImportBtn').onclick=()=>$('drumMapFileInput').click();
   $('drumMapFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f) return; handleDrumMapFile(f); e.target.value=''; });
