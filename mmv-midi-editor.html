@@ -5110,7 +5110,10 @@
     if(!macros.length){
       const h=document.createElement('span'); h.className='hint';
       h.textContent='No macros yet — select a loop range on the ruler, then Capture.';
-      box.appendChild(h); return;
+      box.appendChild(h);
+      // Still render the bindings below: "no macros" is exactly when the
+      // binding picker has to disable itself and say why.
+      renderMacroBindings(); return;
     }
     macros.forEach(m=>{
       const row=document.createElement('div');
@@ -6505,6 +6508,10 @@
       cpList=cpList.map(l=>({...l,ch:mapping[l.ch]}));
     }
     notes.forEach(n=>state.notes.push({id:state.nextId++,...n}));
+    // An imported drum part is exactly the case bindings exist for: its kicks
+    // arrive on the bound pitch and should carry the macro without the user
+    // having to touch every one. Called after the lanes below are built, so
+    // the bake has somewhere to land — see the second call at the end.
     let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+n.length));
     ccList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
     pbList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
@@ -6519,6 +6526,10 @@
       const ln=r.mmvMeta.laneNames||{};
       newLanes.forEach(l=>{ const name=ln[l.cc+'_'+l.ch]; if(name){ l.name=name; l._row.querySelector('.lname').value=name; } });
     }
+    // Last, once every lane the import brought with it exists — a bake needs
+    // its target lanes, and resolving them before this point would silently
+    // "skip" lanes that were about to be created a few lines above.
+    resyncMacros();
     syncInputs(); updateDuration(); resizeCanvases();
   }
 
@@ -6801,7 +6812,13 @@
     if(recCountInTimer){ clearTimeout(recCountInTimer); recCountInTimer=null; }
     if(recCountInNodes){ const now=clickCtx?clickCtx.currentTime:0; recCountInNodes.forEach(o=>{ try{ o.stop(now); }catch(e){} }); recCountInNodes=null; }
     state.recArmed=false;
-    if(state.recording){ state.recording=false; finalizeOpenRecNotes(); }
+    if(state.recording){ state.recording=false; finalizeOpenRecNotes();
+      // Recorded notes land on bound pitches like any other. Deliberately
+      // ONCE, here at the end of the session, rather than per note event in
+      // recNoteEvent(): that runs while the transport is live, and a bake per
+      // incoming Note Off is exactly the per-event playback-path cost this
+      // whole feature is built to avoid.
+      resyncMacros(); requestDraw(); }
   }
   function toggleRecord(){
     if(state.recording||state.recArmed){
@@ -8156,6 +8173,8 @@
         if(!merge) state.notes=state.notes.filter(n=>n.start<targetTick||n.start>=targetTick+dur);
         for(const n of preset.notes) state.notes.push({...n,id:state.nextId++,start:targetTick+Math.round(n.start*scale)});
         state.notes.sort((a,b)=>a.start-b.start);
+        // Inserted notes land on bound pitches like written ones do.
+        resyncMacros();
       }
       refreshTagBar();
       resizeCanvases(); forceDraw();
