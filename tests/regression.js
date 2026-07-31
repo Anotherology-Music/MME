@@ -7953,25 +7953,27 @@ async function run() {
       res.notes[1].ch !== 0 && res.notes[1].start === res.bar3, res);
   });
 
-  // ---------------- ISF: Enable Preview + Update ISF ----------------
+  // ---------------- ISF: Enable Preview + Export ISF ----------------
 
   await withPage(browser, async (page) => {
     const label = await page.evaluate(() => {
       const b = document.getElementById('isfMigrateBtn');
       return { text: b.textContent.trim(), title: b.title };
     });
-    check('the Migrate to MMV button is relabelled "Update ISF" (id isfMigrateBtn unchanged)',
-      label.text.includes('Update ISF') && !label.text.includes('Migrate'), label);
+    // Renamed again in v0.9.41: "Migrate to MMV" -> "Update ISF" -> "Export
+    // ISF". The id is the contract, the label is not.
+    check('the ISF export button is labelled "Export ISF" (id isfMigrateBtn unchanged)',
+      label.text.includes('Export ISF') && !label.text.includes('Migrate') && !label.text.includes('Update ISF'), label);
     check('its tooltip no longer says "Migrate to MMV" either', !/Migrate to MMV/.test(label.title), label.title);
 
     // The description has to match what the code actually does: Import ISF
-    // makes the "(MME)" copy, and Update ISF rewrites THAT file in place
+    // makes the "(MME)" copy, and Export ISF rewrites THAT file in place
     // plus downloads a wiring sheet.
     const desc = await page.evaluate(() => {
       const notes = [...document.querySelectorAll('#setupPanel .setup-note')].map(n => n.textContent.replace(/\s+/g, ' ').trim());
       return notes.find(t => t.includes('(MME)')) || '';
     });
-    check('Update ISF is described as rewriting the existing "(MME)" working copy, not creating a new suffixed shader',
+    check('Export ISF is described as rewriting the existing "(MME)" working copy, not creating a new suffixed shader',
       /\(MME\)/.test(desc) && /working copy/i.test(desc) && !/creates? a new shader/i.test(desc), desc);
     check('the description also covers the wiring sheet the export produces',
       /wiring sheet/i.test(desc), desc);
@@ -9070,19 +9072,19 @@ async function run() {
       const id = window._TEST_addLane(21, 0);
       // Straight ramp 0 -> 120 across two bars, so the value at any tick is
       // arithmetic we can assert against rather than eyeball.
-      window._TEST_setLanePoints(id, [{ t: 0, v: 0 }, { t: 3840, v: 120 }]);
+      window._TEST_setLanePoints(id, [{ t: 0, v: 0 }, { t: 1920, v: 120 }]);
       window._TEST_state.snap = 'off';
       window._TEST_requestDraw();
       return id;
     });
     await page.waitForTimeout(80);
 
-    const onLine = await page.evaluate((id) => window._TEST_laneValueAt(id, 1920), laneId);
+    const onLine = await page.evaluate((id) => window._TEST_laneValueAt(id, 960), laneId);
     check('setup: the ramp reads 60 at its midpoint', Math.abs(onLine - 60) < 1, onLine);
 
     // Aim the cursor at value 10 — a long way below the line's 60 — at the
     // midpoint tick.
-    const pos = await page.evaluate((id) => window._TEST_laneClientPos(id, 1920, 10), laneId);
+    const pos = await page.evaluate((id) => window._TEST_laneClientPos(id, 960, 10), laneId);
     await page.keyboard.down('Control');
     await page.keyboard.down('Shift');
     await page.mouse.dblclick(pos.x, pos.y);
@@ -9091,19 +9093,20 @@ async function run() {
     await page.waitForTimeout(80);
 
     const pts = await page.evaluate((id) => window._TEST_lanePoints(id), laneId);
-    const added = pts.find(p => p.t > 0 && p.t < 3840);
+    const added = pts.find(p => p.t > 0 && p.t < 1920);
     check('Ctrl+Shift+double-click adds a point between the existing two', !!added, pts);
     check('...whose value comes from the line, not the cursor height (60, not 10)',
       !!added && Math.abs(added.v - 60) <= 1, added);
     check('...so the curve either side of it is unchanged',
-      Math.abs(await page.evaluate((id) => window._TEST_laneValueAt(id, 960), laneId) - 30) <= 1
-      && Math.abs(await page.evaluate((id) => window._TEST_laneValueAt(id, 2880), laneId) - 90) <= 1,
-      { at960: await page.evaluate((id) => window._TEST_laneValueAt(id, 960), laneId) });
+      Math.abs(await page.evaluate((id) => window._TEST_laneValueAt(id, 480), laneId) - 30) <= 1
+      && Math.abs(await page.evaluate((id) => window._TEST_laneValueAt(id, 1440), laneId) - 90) <= 1,
+      { at480: await page.evaluate((id) => window._TEST_laneValueAt(id, 480), laneId),
+        at1440: await page.evaluate((id) => window._TEST_laneValueAt(id, 1440), laneId) });
 
     // The delete-nearby-point branch must not fire for this chord: double-
     // clicking near an existing point with Ctrl+Shift adds an anchor, it
     // does not remove the point you were aiming next to.
-    const nearPos = await page.evaluate((id) => window._TEST_laneClientPos(id, 1930, 60), laneId);
+    const nearPos = await page.evaluate((id) => window._TEST_laneClientPos(id, 970, 60), laneId);
     const before = await page.evaluate((id) => window._TEST_lanePoints(id).length, laneId);
     await page.keyboard.down('Control');
     await page.keyboard.down('Shift');
@@ -9117,11 +9120,11 @@ async function run() {
     // A plain double-click keeps its old behaviour — the value follows the
     // cursor. This is the check that would catch the chord swallowing the
     // ordinary gesture.
-    const plainPos = await page.evaluate((id) => window._TEST_laneClientPos(id, 3000, 15), laneId);
+    const plainPos = await page.evaluate((id) => window._TEST_laneClientPos(id, 1440, 15), laneId);
     await page.mouse.dblclick(plainPos.x, plainPos.y);
     await page.waitForTimeout(80);
     const plainPts = await page.evaluate((id) => window._TEST_lanePoints(id), laneId);
-    const plain = plainPts.find(p => Math.abs(p.t - 3000) < 60);
+    const plain = plainPts.find(p => Math.abs(p.t - 1440) < 60);
     check('a plain double-click still takes its value from the cursor, not the line',
       !!plain && Math.abs(plain.v - 15) <= 3, { plain, expectedNear: 15 });
 
@@ -9353,8 +9356,12 @@ async function run() {
     });
     check('the MMV Smooth button looks visibly different on vs off', shown.on !== shown.off, shown);
 
+    // Real WCAG relative luminance — sRGB channels must be gamma-linearised
+    // first. A naive (0.2126r+0.7152g+0.0722b)/255 rates this pair 3.8:1 when
+    // it is actually 6.1:1, which would fail a perfectly legible button.
     const parse = (c) => (c.match(/\d+/g) || []).map(Number);
-    const lum = (c) => { const [r, g, b] = parse(c); return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255; };
+    const lin = (v) => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+    const lum = (c) => { const [r, g, b] = parse(c); return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b); };
     const contrast = (a, b) => {
       const l1 = Math.max(lum(a), lum(b)), l2 = Math.min(lum(a), lum(b));
       return (l1 + 0.05) / (l2 + 0.05);

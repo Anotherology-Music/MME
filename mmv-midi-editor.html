@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.40
+  MMV MIDI & CC Curve Editor v0.9.41
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -990,6 +990,49 @@
   and the capture dialog states plainly that ticking lanes is how you choose
   what the macro contains, and that lanes with no points in the range are why
   the list may be shorter than you expected.
+
+
+  v0.9.41 ISF import numbering, bulk lane delete, and an anchor-point gesture.
+
+  Importing an ISF used to carry its CC numbering on from wherever the last
+  import stopped. That was a hard-coded channel: the scan that skipped
+  already-used CC numbers always looked at channel 1, whatever channel the rows
+  were actually headed for. So a second copy of a shader destined for channel 2
+  was numbered around the first copy's lanes on channel 1 for no reason. The
+  import dialog now opens with Channel and "Number CC from" controls that govern
+  the whole import, and the skip is channel-aware — set Ch2 and the numbering
+  restarts at 14, because channel 2 has nothing on it. Two copies of one shader
+  with identical CC numbers on different channels is a normal thing to want, and
+  is now three clicks. "Skip numbers already in use" can be unticked when you
+  want exact numbering and would rather see the conflict flags than have them
+  avoided.
+
+  "Update ISF" is now "Export ISF". The notes it writes into the shader's own
+  DESCRIPTION — which MMV shows verbatim under right-click > Help — now state
+  that MIDI arrives as 0.00-1.00 and print each parameter's real range beside
+  its Scale/Offset, so "Scale=6.28" reads as "range 0 .. 6.28" months later with
+  no MME project open. A parameter already in 0-1 is called out as needing no
+  Scale at all.
+
+  Deleting an ISF import's lanes meant twenty × clicks and twenty confirmation
+  dialogs. A "Delete lanes…" button next to the Add Lane buttons opens a list
+  grouped by tag — and an ISF import tags every lane it creates with the
+  shader's name — so the whole set comes off with one tick and goes back with
+  one Ctrl+Z.
+
+  Ctrl+Shift+double-click on a CC lane adds an anchor point: you choose the
+  time, the curve chooses the value. Guard points either side of a gesture were
+  otherwise a game of pixel-accuracy, because an ordinary double-click takes its
+  value from the cursor's height and lands a value or two off the line — tilting
+  the very segment the point was meant to hold still. The value now comes from
+  laneValueAt(), which is exactly what the lane already plays at that tick, so
+  dropping an anchor cannot change the shape at all. Alt as well bypasses snap.
+
+  The MMV Smooth button was unreadable and gave no sign whether it was on. The
+  panel's own `#setupPanel button` rule is an ID selector and was quietly
+  beating the global `button.on`, stripping the lit background while leaving
+  that rule's dark navy text — near-black on near-black. Restored at matching
+  specificity, which fixes every toggle in the panel, not just this one.
 
 -->
 
