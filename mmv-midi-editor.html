@@ -5231,7 +5231,8 @@
     const hdr=document.createElement('div');
     hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;';
     const t=document.createElement('div'); t.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;'; t.textContent=title;
-    const s=document.createElement('div'); s.style.cssText='font-size:12px;color:#7a8099;margin-top:6px;'; s.textContent=sub;
+    const s=document.createElement('div'); s.dataset.col='sub';
+    s.style.cssText='font-size:12px;color:#7a8099;margin-top:6px;'; s.textContent=sub;
     hdr.appendChild(t); hdr.appendChild(s); dlg.appendChild(hdr);
     const body=document.createElement('div');
     body.style.cssText='padding:8px 18px;font-size:12px;overflow-y:auto;flex:1 1 auto;';

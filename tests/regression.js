@@ -147,6 +147,30 @@ function buildTestHtml() {
       '  window._TEST_addNote = (o) => { const n = Object.assign({ id: state.nextId++, pitch: 60, start: 0, length: 240, vel: 100, ch: 0 }, o); state.notes.push(n); return n.id; };',
       '  window._TEST_selectNotes = (ids) => { state.selection.clear(); ids.forEach(i => state.selection.add(i)); state.focus = "piano"; updateNoteInfo(); requestDraw(); };',
       '  window._TEST_getCss = (v) => getCss(v);',
+      // ── v0.9.40 pitch bindings + macro-carrying copies. Same scope again:
+      // addMacroBinding/removeMacroBinding/copySel/paste/removeNote are all
+      // plain top-level declarations alongside state.
+      '  window._TEST_macroBindings = () => JSON.parse(JSON.stringify(state.macroBindings || []));',
+      '  window._TEST_addMacroBinding = (pitch, ch, macroId) => addMacroBinding(pitch, ch, macroId);',
+      '  window._TEST_removeMacroBinding = (i) => removeMacroBinding(i);',
+      '  window._TEST_renderMacroBindings = () => renderMacroBindings();',
+      '  window._TEST_copySel = () => copySel();',
+      '  window._TEST_paste = () => paste();',
+      '  window._TEST_removeNoteById = (id) => { const n = state.notes.find(x => x.id === id); if (n) removeNote(n); };',
+      // Exactly what the ruler drag/dblclick do: set the range, then tell the
+      // UI. Nothing here reaches past what a real gesture touches.
+      '  window._TEST_setLoopRange = (a, b) => { state.locStart = a; state.locEnd = b; updateLoopStatus(); };',
+      // Alt+drag copy is a mouseup-time branch over prDrag, not a callable
+      // function, so drive it the way the real gesture does: hand the same
+      // group shape the mousedown handler builds and let the real handler run.
+      '  window._TEST_altDragCopy = (ids, dTick, dPitch) => {',
+      '    pushUndo();',
+      '    const group = ids.map(i => { const n = state.notes.find(x => x.id === i); return { n, start: n.start, pitch: n.pitch, length: n.length }; });',
+      '    group.forEach(g => { g.n.start = Math.max(0, g.start + dTick); g.n.pitch = g.pitch + (dPitch || 0); });',
+      '    prDrag = { mode: "move", note: group[0].n, altCopy: true, group };',
+      '    window.dispatchEvent(new MouseEvent("mouseup"));',
+      '    return [...state.selection];',
+      '  };',
       '  init();',
     ].join('\n')
   );
@@ -8642,6 +8666,387 @@ async function run() {
     await page.waitForTimeout(60);
     const withoutMacro = await page.evaluate(() => document.getElementById('noteInfoMacro').style.display === 'none');
     check('...and stays hidden for a note with no macro', withoutMacro === true, withoutMacro);
+  });
+
+  // ---------------- CC Macros ▸ pitch bindings (v0.9.40) ----------------
+  // The point of the whole feature: "put the macro on C1, then just write a
+  // note wherever the kick happens". C1 is MIDI 36 under this app's octave
+  // convention (see noteName()).
+  const C1 = 36, D1 = 38;
+
+  await withPage(browser, async (page) => {
+    // A note placed on a bound pitch carries the macro with no further action
+    // — no selection, no Setup panel, no per-note assign.
+    const res = await page.evaluate(({ BAR, C1, D1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      window._TEST_addMacroBinding(C1, null, mid);
+      // Notes placed AFTER the bind, exactly as writing a drum part does.
+      const kick = window._TEST_addNote({ start: 4 * BAR, pitch: C1 });
+      const other = window._TEST_addNote({ start: 6 * BAR, pitch: D1 });
+      window._TEST_resyncMacros();
+      return {
+        mid, laneId,
+        kick: window._TEST_noteById(kick), other: window._TEST_noteById(other),
+        dip: window._TEST_laneValueAt(laneId, 4 * BAR + 960),
+        after: window._TEST_laneValueAt(laneId, 5 * BAR + 1),
+        atOther: window._TEST_laneValueAt(laneId, 6 * BAR + 960),
+      };
+    }, { BAR, C1, D1 });
+    check('a note placed on a bound pitch carries the macro with no assign step',
+      res.kick.macroId === res.mid && res.kick.macroInst != null && res.kick.macroAt === 4 * BAR, res.kick);
+    check('...and it is marked as binding-derived, not as an explicit assign',
+      !!res.kick.macroBound === true, res.kick);
+    check('...so its CC gesture is actually baked into the lane at the note',
+      res.dip === 0 && res.after === 12, res);
+    check('a note at an unbound pitch carries nothing',
+      res.other.macroId === undefined && res.atOther === 12, res.other);
+  });
+
+  await withPage(browser, async (page) => {
+    // A channel-specific binding must not claim the same pitch on another
+    // channel — that is the whole reason ch is part of the binding.
+    const res = await page.evaluate(({ BAR, C1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      window._TEST_addMacroBinding(C1, 9, mid); // Ch10 only
+      const onCh10 = window._TEST_addNote({ start: 4 * BAR, pitch: C1, ch: 9 });
+      const onCh1 = window._TEST_addNote({ start: 6 * BAR, pitch: C1, ch: 0 });
+      window._TEST_resyncMacros();
+      return { mid, onCh10: window._TEST_noteById(onCh10), onCh1: window._TEST_noteById(onCh1) };
+    }, { BAR, C1 });
+    check('a channel-specific binding claims the bound channel',
+      res.onCh10.macroId === res.mid, res.onCh10);
+    check('...and leaves the same pitch on another channel alone',
+      res.onCh1.macroId === undefined, res.onCh1);
+  });
+
+  await withPage(browser, async (page) => {
+    // The per-note escape hatch still wins. Two macros, a binding to the
+    // first, and an explicit assign of the second onto a note sitting on the
+    // bound pitch: the explicit assign must survive every later resync.
+    const res = await page.evaluate(({ BAR, C1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 100 }, { t: BAR, v: 100 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const bound = window._TEST_captureMacro('Bound', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 40 }, { t: BAR, v: 40 }]);
+      const chosen = window._TEST_captureMacro('Chosen', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      window._TEST_addMacroBinding(C1, null, bound);
+      const n = window._TEST_addNote({ start: 4 * BAR, pitch: C1 });
+      window._TEST_resyncMacros();
+      const afterBind = window._TEST_noteById(n);
+      window._TEST_assignMacroToNote(n, chosen);
+      const afterAssign = window._TEST_noteById(n);
+      // Anything at all that triggers a resync must not undo the choice.
+      window._TEST_resyncMacros();
+      window._TEST_resyncMacros();
+      return { bound, chosen, n, afterBind, afterAssign,
+        settled: window._TEST_noteById(n), val: window._TEST_laneValueAt(laneId, 4 * BAR + 10) };
+    }, { BAR, C1 });
+    check('the binding claims the note until it is explicitly assigned',
+      res.afterBind.macroId === res.bound && !!res.afterBind.macroBound === true, res.afterBind);
+    check('an explicit per-note assign overrides the binding for that note',
+      res.afterAssign.macroId === res.chosen && res.afterAssign.macroBound === undefined, res.afterAssign);
+    check('...and a later resync does not hand it back to the binding',
+      res.settled.macroId === res.chosen && res.val === 40, res);
+  });
+
+  await withPage(browser, async (page) => {
+    // Adding a binding is retroactive — it has to bake the notes already
+    // sitting on that pitch, or "bind, then look at the song" would show
+    // nothing. Removing it is the exact inverse. Each is one undo step.
+    const res = await page.evaluate(({ BAR, C1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      // Three kicks written BEFORE the macro was ever bound.
+      const ids = [4 * BAR, 6 * BAR, 8 * BAR].map(t => window._TEST_addNote({ start: t, pitch: C1 }));
+      const before = ids.map(i => window._TEST_noteById(i).macroId);
+      window._TEST_addMacroBinding(C1, null, mid);
+      const carried = ids.map(i => window._TEST_noteById(i));
+      return { mid, laneId, ids, before, carried,
+        insts: carried.map(n => n.macroInst),
+        tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+        dip: window._TEST_laneValueAt(laneId, 6 * BAR + 960) };
+    }, { BAR, C1 });
+    check('no note carries the macro before the bind', res.before.every(v => v === undefined), res.before);
+    check('adding a binding bakes every note already sitting on that pitch',
+      res.carried.every(n => n.macroId === res.mid && n.macroInst != null) && res.dip === 0, res.carried);
+    check('...each with its own instance id, never a shared one',
+      new Set(res.insts).size === 3, res.insts);
+
+    // One Ctrl+Z has to take the binding AND all three bakes back together.
+    await page.evaluate(() => window._TEST_undo());
+    const undone = await page.evaluate(({ ids, laneId, BAR }) => ({
+      bindings: window._TEST_macroBindings().length,
+      carried: ids.map(i => window._TEST_noteById(i).macroId),
+      tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+      flat: window._TEST_laneValueAt(laneId, 6 * BAR + 960),
+    }), { ...res, BAR });
+    check('a single Ctrl+Z undoes the bind and every note it baked',
+      undone.bindings === 0 && undone.carried.every(v => v === undefined)
+      && undone.tagged === 0 && undone.flat === 12, undone);
+
+    await page.evaluate(() => window._TEST_redo());
+    const redone = await page.evaluate(({ laneId, BAR }) => ({
+      bindings: window._TEST_macroBindings().length,
+      dip: window._TEST_laneValueAt(laneId, 6 * BAR + 960),
+    }), { ...res, BAR });
+    check('...and redo puts both back', redone.bindings === 1 && redone.dip === 0, redone);
+
+    // Removing the binding un-bakes, again in one step.
+    const removed = await page.evaluate(({ ids, laneId, BAR }) => {
+      window._TEST_removeMacroBinding(0);
+      return {
+        bindings: window._TEST_macroBindings().length,
+        carried: ids.map(i => window._TEST_noteById(i).macroId),
+        notes: ids.map(i => !!window._TEST_noteById(i)),
+        tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+        flat: window._TEST_laneValueAt(laneId, 6 * BAR + 960),
+      };
+    }, { ...res, BAR });
+    check('removing a binding un-bakes every note it claimed, leaving the notes themselves',
+      removed.bindings === 0 && removed.carried.every(v => v === undefined)
+      && removed.notes.every(Boolean) && removed.tagged === 0 && removed.flat === 12, removed);
+    await page.evaluate(() => window._TEST_undo());
+    const reBound = await page.evaluate(({ laneId, BAR }) => ({
+      bindings: window._TEST_macroBindings().length,
+      dip: window._TEST_laneValueAt(laneId, 6 * BAR + 960),
+    }), { ...res, BAR });
+    check('...and one Ctrl+Z restores the binding and its bakes',
+      reBound.bindings === 1 && reBound.dip === 0, reBound);
+  });
+
+  await withPage(browser, async (page) => {
+    // Dragging a bound note off the bound key has to take the automation with
+    // it — the macro is a property of the key, not of the note.
+    const res = await page.evaluate(({ BAR, C1, D1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      window._TEST_addMacroBinding(C1, null, mid);
+      const n = window._TEST_addNote({ start: 4 * BAR, pitch: C1 });
+      window._TEST_resyncMacros();
+      const on = window._TEST_laneValueAt(laneId, 4 * BAR + 960);
+      s.notes.find(x => x.id === n).pitch = D1;
+      window._TEST_resyncMacros();
+      return { on, note: window._TEST_noteById(n),
+        off: window._TEST_laneValueAt(laneId, 4 * BAR + 960),
+        tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length };
+    }, { BAR, C1, D1 });
+    check('dragging a bound note off the bound pitch removes its macro and its points',
+      res.on === 0 && res.note.macroId === undefined && res.off === 12 && res.tagged === 0, res);
+  });
+
+  await withPage(browser, async (page) => {
+    // Alt+drag copy. v0.9.39 deliberately dropped macroId; v0.9.40 carries it,
+    // because "put this gesture in many places" is the entire workflow.
+    const res = await page.evaluate(({ BAR }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const orig = window._TEST_addNote({ start: 2 * BAR, pitch: 60 });
+      window._TEST_assignMacroToNote(orig, mid);
+      window._TEST_selectNotes([orig]);
+      const copyIds = window._TEST_altDragCopy([orig], 6 * BAR, 0);
+      const copy = copyIds.map(i => window._TEST_noteById(i)).find(n => n.id !== orig);
+      return { mid, orig: window._TEST_noteById(orig), copy, laneId,
+        atOrig: window._TEST_laneValueAt(laneId, 2 * BAR + 960),
+        atCopy: window._TEST_laneValueAt(laneId, 8 * BAR + 960) };
+    }, { BAR });
+    check('an Alt+drag copy of a macro note carries the macro',
+      res.copy && res.copy.macroId === res.mid, res.copy);
+    check('...with its own instance id, never the original\'s',
+      res.copy.macroInst != null && res.copy.macroInst !== res.orig.macroInst, { c: res.copy.macroInst, o: res.orig.macroInst });
+    check('...and both positions actually hold the baked gesture',
+      res.atOrig === 0 && res.atCopy === 0, res);
+
+    // The reason distinct instance ids matter: a delete must strip only its
+    // own points. With a shared id it would strip the survivor's too.
+    const afterDelete = await page.evaluate(({ copy, laneId, BAR }) => {
+      window._TEST_removeNoteById(copy.id);
+      return { atOrig: window._TEST_laneValueAt(laneId, 2 * BAR + 960),
+        atCopy: window._TEST_laneValueAt(laneId, 8 * BAR + 960) };
+    }, { copy: res.copy, laneId: res.laneId, BAR });
+    check('deleting one copy leaves the other copy\'s baked points intact',
+      afterDelete.atOrig === 0 && afterDelete.atCopy === 12, afterDelete);
+  });
+
+  await withPage(browser, async (page) => {
+    // Copy/paste, same requirement.
+    const res = await page.evaluate(({ BAR }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dip', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      const orig = window._TEST_addNote({ start: 2 * BAR, pitch: 60 });
+      window._TEST_assignMacroToNote(orig, mid);
+      window._TEST_selectNotes([orig]);
+      window._TEST_copySel();
+      s.playhead = 8 * BAR;
+      window._TEST_paste();
+      const pasted = s.notes.filter(n => n.id !== orig);
+      return { mid, laneId, orig: window._TEST_noteById(orig),
+        pastedCount: pasted.length,
+        pasted: pasted.length ? window._TEST_noteById(pasted[0].id) : null,
+        atOrig: window._TEST_laneValueAt(laneId, 2 * BAR + 960),
+        atPaste: window._TEST_laneValueAt(laneId, 8 * BAR + 960) };
+    }, { BAR });
+    check('copy/paste of a macro note carries the macro',
+      res.pastedCount === 1 && res.pasted.macroId === res.mid, res.pasted);
+    check('...with a fresh instance id and its gesture baked at the paste point',
+      res.pasted.macroInst != null && res.pasted.macroInst !== res.orig.macroInst
+      && res.atOrig === 0 && res.atPaste === 0, res);
+  });
+
+  await withPage(browser, async (page) => {
+    // Bindings are project data: they must survive a real save/load round
+    // trip, or reloading would keep the baked points but forget the rule.
+    const ids = await page.evaluate(({ BAR, C1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      window._TEST_addMacroBinding(C1, 9, mid);
+      const n = window._TEST_addNote({ start: 4 * BAR, pitch: C1, ch: 9 });
+      window._TEST_resyncMacros();
+      return { mid, n, C1 };
+    }, { BAR, C1 });
+    const json = await page.evaluate(() => JSON.stringify({ version: 1, projectName: 'bind-song', audioFile: '', snapshot: JSON.parse(window._TEST_snapshot()) }));
+    await page.evaluate((j) => window._TEST_loadProject(new File([j], 'bind-song.mmvp', { type: 'application/json' })), json);
+    await page.waitForTimeout(150);
+    const after = await page.evaluate(({ n }) => ({
+      bindings: window._TEST_macroBindings(),
+      note: window._TEST_noteById(n),
+      rows: Array.from(document.querySelectorAll('#macroBindList [data-binding-index]')).map(r => ({
+        pitch: r.querySelector('[data-col="pitch"]').textContent,
+        ch: r.querySelector('[data-col="ch"]').textContent,
+        macro: r.querySelector('[data-col="macro"]').textContent,
+      })),
+    }), ids);
+    check('pitch bindings survive a project save/load round trip',
+      after.bindings.length === 1 && after.bindings[0].pitch === C1
+      && after.bindings[0].ch === 9 && after.bindings[0].macroId === ids.mid, after.bindings);
+    check('...and the reloaded note is still carrying the bound macro',
+      after.note.macroId === ids.mid && !!after.note.macroBound === true, after.note);
+    check('the bindings list names the pitch, never a raw MIDI number',
+      after.rows.length === 1 && after.rows[0].pitch === 'C1'
+      && after.rows[0].ch === 'Ch10' && after.rows[0].macro === '→ Kick FX', after.rows);
+  });
+
+  await withPage(browser, async (page) => {
+    // The list has to read as the drum name once the key is mapped — "36" is
+    // exactly what the user should never have to see.
+    const rows = await page.evaluate(({ BAR, C1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 10 }, { t: BAR, v: 30 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      s.pitchNames['9_' + C1] = 'Kick';
+      window._TEST_addMacroBinding(C1, 9, mid);
+      return Array.from(document.querySelectorAll('#macroBindList [data-binding-index]'))
+        .map(r => r.querySelector('[data-col="pitch"]').textContent);
+    }, { BAR, C1 });
+    check('a mapped drum name is what the binding list shows for the pitch',
+      rows.length === 1 && rows[0] === 'C1 – Kick', rows);
+  });
+
+  await withPage(browser, async (page) => {
+    // Capture's prerequisite must be visible BEFORE the click, not flashed
+    // after it.
+    const noRange = await page.evaluate(() => {
+      const b = document.getElementById('macroCaptureBtn');
+      return { disabled: b.disabled, title: b.title };
+    });
+    check('Capture is disabled when no loop range is set',
+      noRange.disabled === true, noRange);
+    check('...and its title says a macro IS a loop range and to drag on the ruler',
+      /loop range/i.test(noRange.title) && /ruler/i.test(noRange.title), noRange.title);
+    // Setting a range goes through updateLoopStatus(), which is the one call
+    // the ruler drag makes — so this is the real path, not a private poke.
+    const withRange = await page.evaluate((BAR) => {
+      window._TEST_setLoopRange(0, BAR);
+      const b = document.getElementById('macroCaptureBtn');
+      return { disabled: b.disabled, title: b.title };
+    }, BAR);
+    check('...and a set loop range enables it', withRange.disabled === false, withRange);
+    // Clearing it again (ruler double-click) must put the explanation back.
+    const cleared = await page.evaluate(() => {
+      window._TEST_setLoopRange(null, null);
+      const b = document.getElementById('macroCaptureBtn');
+      return { disabled: b.disabled, title: b.title };
+    });
+    check('...and clearing the range disables it again with the same explanation',
+      cleared.disabled === true && /ruler/i.test(cleared.title), cleared);
+  });
+
+  await withPage(browser, async (page) => {
+    // The capture dialog must state that the tick boxes are how the macro's
+    // contents are chosen, and why a lane might be missing from the list.
+    await page.evaluate((BAR) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(23, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 10 }, { t: BAR, v: 30 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      window._TEST_showMacroCaptureDialog();
+    }, BAR);
+    await page.waitForTimeout(60);
+    const sub = await page.evaluate(() => document.querySelector('#macroCaptureDialog [data-col="sub"]').textContent);
+    check('the capture dialog says ticking lanes is how you choose the macro\'s contents',
+      /tick the lanes/i.test(sub) && /choose what the macro contains/i.test(sub), sub);
+    check('...and that only lanes with points in the range are listed',
+      /only lanes with points inside this range are listed/i.test(sub), sub);
+  });
+
+  await withPage(browser, async (page) => {
+    // The performance guard. A bind is the one gesture that can bake
+    // unboundedly much from one click, so past the threshold it must report
+    // the count and let the user say no — and saying no must change nothing.
+    let dialogMsg = null;
+    page.on('dialog', async d => { dialogMsg = d.message(); await d.dismiss(); });
+    const res = await page.evaluate(({ BAR, C1 }) => {
+      const s = window._TEST_state;
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 127 }, { t: 960, v: 0 }, { t: BAR, v: 127 }]);
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Kick FX', [laneId]);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 12 }]);
+      // 5 points per instance (3 captured + 2 possible guards), so 4200 notes
+      // projects 21 000 — past the 20 000 line.
+      for (let i = 0; i < 4200; i++) window._TEST_addNote({ start: i * 16, pitch: C1 });
+      const ok = window._TEST_addMacroBinding(C1, null, mid);
+      return { ok, bindings: window._TEST_macroBindings().length,
+        tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length };
+    }, { BAR, C1 });
+    check('a bind that would bake past the threshold asks first, with the count',
+      dialogMsg != null && /21,?000/.test(dialogMsg) && /4200/.test(dialogMsg), dialogMsg);
+    check('...and declining leaves the project completely untouched',
+      res.ok === false && res.bindings === 0 && res.tagged === 0, res);
   });
 
   await browser.close();
