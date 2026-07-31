@@ -1088,6 +1088,13 @@
      actionable things in the panel look actionable. */
   #setupPanel button{background:var(--panel3,#262b34);border-color:var(--line2,#3a404e);}
   #setupPanel button:hover{border-color:var(--accent);}
+  /* The rule above is an ID selector, so it outranks the global `button.on`
+     and stripped the lit background off every toggle inside the panel —
+     while `button.on`'s dark navy TEXT colour survived. MMV Smooth ended up
+     near-black on near-black, unreadable and with no visible on/off state.
+     Restore the lit look at matching specificity. */
+  #setupPanel button.on{background:var(--accent);color:#06223f;border-color:var(--accent);font-weight:600;}
+  #setupPanel button.on:hover{border-color:#8cc4ff;}
   .setup-note svg{vertical-align:-2px;}
   .setup-opt{font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;}
   .setup-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
@@ -1865,9 +1872,9 @@
           </div>
           <div class="setup-note">Enabling preview will display the shader so you can visually validate which parameters you wish to create a CC# lane to control.</div>
           <div class="setup-row setup-sub-row">
-            <button id="isfMigrateBtn" title="Review which imported ISF parameters are automated vs. static, bake updated defaults into the shader's &quot;(MME)&quot; working copy, and export a wiring sheet for MMV's Source/Feature/CC + Modifiers">&#x21C4; Update ISF</button>
+            <button id="isfMigrateBtn" title="Review which imported ISF parameters are automated vs. static, bake updated defaults into the shader's &quot;(MME)&quot; working copy, write the MMV setup notes into its DESCRIPTION, and export a wiring sheet for MMV's Source/Feature/CC + Modifiers">&#x21C4; Export ISF</button>
           </div>
-          <div class="setup-note">Rewrites the &ldquo;(MME)&rdquo; working copy that Import ISF put in your project folder &mdash; baking the values at the playhead in as the shader&rsquo;s new ISF defaults, so it opens elsewhere looking the way you set it up here. It also downloads a wiring sheet listing each automated parameter&rsquo;s channel, CC# and Scale/Offset/Step for MMV&rsquo;s Source/Feature/CC + Modifiers.</div>
+          <div class="setup-note">Rewrites the &ldquo;(MME)&rdquo; working copy that Import ISF put in your project folder &mdash; baking the values at the playhead in as the shader&rsquo;s new ISF defaults, so it opens elsewhere looking the way you set it up here. The same wiring notes are written into the shader&rsquo;s own DESCRIPTION field, so in MMV you can right-click the shader&rsquo;s menu bar &rsaquo; Help and read the Scale/Offset settings each parameter needs. A wiring sheet is downloaded alongside it.</div>
 
           <div class="setup-subtitle">KEY NAMES</div>
           <div class="setup-row setup-sub-row">
@@ -2097,6 +2104,7 @@
         <button id="addLane">+ Add CC lane</button>
         <button id="addPbLane">+ Add PB lane</button>
         <button id="addCpLane">+ Add CP lane</button>
+        <button id="delLanesBtn" class="warn" title="Select several lanes and delete them in one go — grouped by tag, so an ISF import's whole set of lanes can be cleared with one tick">&#x1F5D1; Delete lanes…</button>
       </div>
       <div class="main" style="position:relative;">
         <div class="gen-grp">
@@ -3904,6 +3912,25 @@
     });
     cv.addEventListener('mouseleave',()=>{ if(segHover&&segHover.lane===lane){ segHover=null; requestDraw(); } if(!ccDrag) cv.style.cursor=''; });
     cv.addEventListener('dblclick',e=>{ const {x,y}=laneCoords(lane,e); const near=nearestCCPoint(lane,x,y);
+      // Ctrl+Shift = anchor point: you choose WHEN, the curve chooses WHAT.
+      // Placing a guard point either side of a gesture you're about to draw
+      // is otherwise a game of pixel-accuracy — an ordinary double-click
+      // takes its value from the cursor's height, so it lands a value or two
+      // off the line and tilts the very segment it was meant to hold still.
+      // Here the value comes from laneValueAt(), i.e. exactly what the lane
+      // already plays at that tick, so dropping the anchor cannot change the
+      // shape at all. Alt additionally bypasses snap for a tick-exact anchor
+      // (plain Shift can't mean "no snap" here — it's part of the chord).
+      if(e.ctrlKey&&e.shiftKey){
+        e.preventDefault();
+        const t=(state.snap==='off'||e.altKey)?xToTick(x):snapT(xToTick(x));
+        if(t<0) return;
+        pushUndo();
+        const r=laneRange(lane);
+        upsertPoint(lane,t,Math.max(r.min,Math.min(r.max,Math.round(laneValueAt(lane,t)))));
+        requestDraw();
+        return;
+      }
       if(near.p&&near.d<14){ pushUndo(); removePoint(lane,near.p); requestDraw(); }
       else { const t=(state.snap==='off'||e.shiftKey)?xToTick(x):snapT(xToTick(x)); pushUndo(); upsertPoint(lane,t,y2valForLane(y,cv.height,lane)); requestDraw(); } });
   }
@@ -4518,6 +4545,9 @@
 
     const sc=document.createElement('div'); sc.className='scroll hx lane-canvas-scroll';
     const cv=document.createElement('canvas'); sc.appendChild(cv);
+    cv.title='Double-click = add / delete a point\n'
+      +'Ctrl+Shift+double-click = anchor point (lands on the existing line, so it can\'t change the curve)\n'
+      +'Shift+double-click = add without snapping';
     body.appendChild(left); body.appendChild(sc);
     row.appendChild(row1); row.appendChild(body); row.appendChild(grip);
     $('lanes').appendChild(row);
@@ -4726,6 +4756,145 @@
     if(scrollToId){ const tgt=state.ccLanes.find(l=>l.id===scrollToId); if(tgt&&tgt._row) tgt._row.scrollIntoView({block:'nearest',behavior:'smooth'}); } }
   function removeLane(id){ const i=state.ccLanes.findIndex(l=>l.id===id); if(i<0)return; state.ccLanes[i]._row.remove(); state.ccLanes.splice(i,1);
     if(state.activeLaneId===id) state.activeLaneId=state.ccLanes.length?state.ccLanes[0].id:null; refreshActive(); refreshTagBar(); requestDraw(); }
+  // ---------- Bulk lane delete ----------
+  // Deleting an ISF import's lanes one at a time meant twenty × clicks and
+  // twenty confirm() dialogs. This lists every lane grouped by its first
+  // tag — which, for an ISF import, is the shader's own auto-tag — so the
+  // whole set comes off in one tick and one undo step.
+  function laneGroupKey(l){ return (l.tags&&l.tags.length?String(l.tags[0]):'')||'(untagged)'; }
+
+  function deleteLanes(ids){
+    if(!ids.length) return 0;
+    pushUndo();
+    // Snapshot the id list first: removeLane() splices state.ccLanes as it
+    // goes, so iterating the live array would skip every other lane.
+    ids.slice().forEach(function(id){ removeLane(id); });
+    resizeCanvases(); requestDraw();
+    return ids.length;
+  }
+
+  function showDeleteLanesDialog(){
+    if(!state.ccLanes.length){ flash('No lanes to delete.'); return; }
+    const existing=document.getElementById('delLanesDialog');
+    if(existing) existing.remove();
+
+    const dlg=document.createElement('dialog');
+    dlg.id='delLanesDialog';
+    dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+      +'width:min(560px,94vw);max-height:86vh;overflow:hidden;display:flex;flex-direction:column;';
+
+    const hdr=document.createElement('div');
+    hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;';
+    hdr.innerHTML='<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x1F5D1; Delete lanes</div>'
+      +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Tick the lanes to remove. Groups are the lane\'s first tag &mdash; an ISF import tags every lane it creates with the shader\'s name, so ticking that group clears the whole import. One undo step puts them all back.</div>';
+    dlg.appendChild(hdr);
+
+    const listWrap=document.createElement('div');
+    listWrap.style.cssText='overflow-y:auto;flex:1;padding:6px 0;';
+
+    // Group order follows lane order, so the dialog reads down the page in
+    // the same order the lanes themselves are stacked.
+    const groups=[]; const byKey={};
+    state.ccLanes.forEach(function(l){
+      const k=laneGroupKey(l);
+      if(!byKey[k]){ byKey[k]={key:k,lanes:[]}; byKey[k].cbs=[]; groups.push(byKey[k]); }
+      byKey[k].lanes.push(l);
+    });
+
+    const cbs=[];              // {lane, cb}
+    let footCount=null, delBtn=null;
+
+    function updateCount(){
+      const n=cbs.filter(function(r){ return r.cb.checked; }).length;
+      footCount.textContent=n+' of '+cbs.length+' lane'+(cbs.length===1?'':'s')+' selected';
+      delBtn.disabled=n===0;
+      delBtn.textContent=n?('Delete '+n+' lane'+(n===1?'':'s')):'Delete';
+      groups.forEach(function(g){
+        const on=g.cbs.filter(function(c){ return c.checked; }).length;
+        g.master.checked=on===g.cbs.length;
+        g.master.indeterminate=on>0&&on<g.cbs.length;
+      });
+    }
+
+    groups.forEach(function(g){
+      const gHdr=document.createElement('label');
+      gHdr.style.cssText='display:flex;align-items:center;gap:7px;padding:6px 18px 5px;background:#23272f;'
+        +'border-top:1px solid #2c313b;border-bottom:1px solid #2c313b;cursor:pointer;';
+      const gCb=document.createElement('input'); gCb.type='checkbox';
+      const gName=document.createElement('span');
+      gName.style.cssText='font-size:11px;font-weight:700;letter-spacing:.04em;color:#9aa3b5;';
+      gName.textContent=g.key.toUpperCase();
+      const gCount=document.createElement('span');
+      gCount.style.cssText='font-size:11px;color:#5a6075;';
+      gCount.textContent=g.lanes.length+' lane'+(g.lanes.length===1?'':'s');
+      gHdr.appendChild(gCb); gHdr.appendChild(gName); gHdr.appendChild(gCount);
+      listWrap.appendChild(gHdr);
+      g.master=gCb;
+
+      g.lanes.forEach(function(l){
+        const row=document.createElement('label');
+        row.style.cssText='display:flex;align-items:center;gap:8px;padding:4px 18px 4px 34px;cursor:pointer;font-size:12px;';
+        row.addEventListener('mouseenter',function(){ row.style.background='#23272f'; });
+        row.addEventListener('mouseleave',function(){ row.style.background=''; });
+        const cb=document.createElement('input'); cb.type='checkbox';
+        const dot=document.createElement('span');
+        dot.style.cssText='width:9px;height:9px;border-radius:50%;flex-shrink:0;background:'+l.color+';';
+        const name=document.createElement('span');
+        name.style.cssText='flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        name.textContent=laneLabelFor(l);
+        const pts=document.createElement('span');
+        pts.style.cssText='font-size:11px;color:#5a6075;flex-shrink:0;';
+        pts.textContent=(l.points?l.points.length:0)+' pt'+((l.points&&l.points.length===1)?'':'s');
+        row.appendChild(cb); row.appendChild(dot); row.appendChild(name); row.appendChild(pts);
+        listWrap.appendChild(row);
+        cbs.push({lane:l,cb:cb}); g.cbs.push(cb);
+        cb.addEventListener('change',updateCount);
+      });
+
+      gCb.addEventListener('change',function(){
+        g.cbs.forEach(function(c){ c.checked=gCb.checked; });
+        updateCount();
+      });
+    });
+
+    dlg.appendChild(listWrap);
+
+    const foot=document.createElement('div');
+    foot.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;align-items:center;gap:8px;';
+    const allLbl=document.createElement('label');
+    allLbl.style.cssText='display:flex;align-items:center;gap:5px;font-size:11px;color:#7a8099;cursor:pointer;';
+    const allCb=document.createElement('input'); allCb.type='checkbox';
+    allLbl.appendChild(allCb); allLbl.appendChild(document.createTextNode('Select all'));
+    footCount=document.createElement('span');
+    footCount.style.cssText='font-size:11px;color:#7a8099;margin-left:6px;';
+    const spacer=document.createElement('span'); spacer.style.flex='1';
+    const cancelBtn=document.createElement('button'); cancelBtn.textContent='Cancel';
+    cancelBtn.style.cssText='background:#262b34;color:#c8cdd8;border:1px solid #3a404e;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;';
+    delBtn=document.createElement('button'); delBtn.textContent='Delete';
+    delBtn.style.cssText='background:#5a2020;color:#ffd0d0;border:1px solid #8a3030;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;font-weight:600;';
+    foot.appendChild(allLbl); foot.appendChild(footCount); foot.appendChild(spacer);
+    foot.appendChild(cancelBtn); foot.appendChild(delBtn);
+    dlg.appendChild(foot);
+
+    allCb.addEventListener('change',function(){
+      cbs.forEach(function(r){ r.cb.checked=allCb.checked; });
+      updateCount();
+    });
+    cancelBtn.addEventListener('click',function(){ dlg.close(); dlg.remove(); });
+    dlg.addEventListener('cancel',function(){ dlg.remove(); });
+    delBtn.addEventListener('click',function(){
+      const ids=cbs.filter(function(r){ return r.cb.checked; }).map(function(r){ return r.lane.id; });
+      if(!ids.length) return;
+      const n=deleteLanes(ids);
+      dlg.close(); dlg.remove();
+      flash('Deleted '+n+' lane'+(n===1?'':'s')+' — Ctrl+Z to undo.');
+    });
+
+    document.body.appendChild(dlg);
+    updateCount();
+    dlg.showModal();
+  }
+
   function setActiveLane(id){ state.activeLaneId=id; refreshActive(); }
   function refreshActive(){
     const hasActive=state.ccLanes.some(l=>l.id===state.activeLaneId);
@@ -7590,6 +7759,7 @@
   $('addLane').onclick=()=>{ pushUndo(); addLane(); };
   $('addPbLane').addEventListener('click',()=>{ pushUndo(); addPbLane(); });
   $('addCpLane').addEventListener('click',()=>{ pushUndo(); addCpLane(); });
+  $('delLanesBtn').addEventListener('click',()=>showDeleteLanesDialog());
   // ── Move All — shift the WHOLE project in time (notes + every CC/PB/CP
   // curve + the audio track), locked together. Right by a bar = insert a bar
   // at the start (the common "I need room at the beginning" case). Left removes
@@ -9351,7 +9521,7 @@
         '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x2B21; Import ISF</div>'
         +'<div style="font-size:12px;color:#4fa3ff;margin-top:3px;">'+escHtml(shaderTitle)+'</div>'
         +'<div style="font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;">'+escHtml(filename)+'</div>'
-        +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Tick the parameters you want to import, assign CC numbers and MIDI channels, then click Import Lanes. Tick PB for a parameter that needs real 14-bit resolution instead of CC\'s 7-bit — one per MIDI channel.</div>';
+        +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Set the channel and starting CC below, tick the parameters you want, then click Import Lanes. Tick PB for a parameter that needs real 14-bit resolution instead of CC\'s 7-bit — one per MIDI channel.</div>';
       dlg.appendChild(hdr);
 
       // ── Tag row ─────────────────────────────────────────────────
@@ -9369,6 +9539,71 @@
       sceneInput.style.cssText='width:120px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:3px 6px;font-size:12px;';
       tagRow.appendChild(tagInfo); tagRow.appendChild(sceneLbl); tagRow.appendChild(sceneInput);
       dlg.appendChild(tagRow);
+
+      // ── Numbering strip ─────────────────────────────────────────
+      // Channel and start-CC for the whole import, decided ONCE up front.
+      // Before this existed the initial numbering skipped CCs already in use
+      // *on channel 1*, hard-coded, whatever channel the rows were actually
+      // headed for — so importing a second copy of a shader carried on from
+      // where the first left off (CC34, CC35, …) even when it was going to
+      // its own empty channel. Two copies of one shader on two channels, with
+      // matching CC numbers, is a normal thing to want; now you set Ch2 here
+      // and the numbering restarts from 14 because Ch2 has nothing on it.
+      const numRow=document.createElement('div');
+      numRow.style.cssText='padding:8px 18px;border-bottom:1px solid #2c313b;flex-shrink:0;display:flex;align-items:center;gap:7px;flex-wrap:wrap;';
+      function numLbl(txt){
+        const s=document.createElement('span');
+        s.style.cssText='font-size:11px;color:#7a8099;'; s.textContent=txt; return s;
+      }
+      const numChInput=document.createElement('input');
+      numChInput.id='isfNumCh';
+      numChInput.type='number'; numChInput.min='1'; numChInput.max='16'; numChInput.value='1';
+      numChInput.style.cssText='width:52px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:3px 6px;font-size:12px;text-align:center;';
+      numChInput.title='MIDI channel for every row in this import. Changing it renumbers straight away.';
+      const numStartInput=document.createElement('input');
+      numStartInput.id='isfNumStart';
+      numStartInput.type='number'; numStartInput.min='0'; numStartInput.max='127'; numStartInput.value='14';
+      numStartInput.style.cssText='width:56px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:3px 6px;font-size:12px;text-align:center;';
+      numStartInput.title='First CC number. Rows are numbered upwards from here. CC14 is the start of the general-purpose range.';
+      const skipLbl=document.createElement('label');
+      skipLbl.style.cssText='display:flex;align-items:center;gap:4px;font-size:11px;color:#7a8099;cursor:pointer;';
+      const skipCb=document.createElement('input'); skipCb.id='isfNumSkip'; skipCb.type='checkbox'; skipCb.checked=true;
+      skipCb.title='On: step over CC numbers already used on that channel. Off: number strictly in sequence and flag any clash.';
+      skipLbl.appendChild(skipCb); skipLbl.appendChild(document.createTextNode('skip numbers already in use'));
+      const renumBtn=document.createElement('button');
+      renumBtn.id='isfRenumBtn';
+      renumBtn.textContent='Renumber';
+      renumBtn.title='Re-apply the channel and numbering above to every row';
+      renumBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;';
+      numRow.appendChild(numLbl('Channel'));   numRow.appendChild(numChInput);
+      numRow.appendChild(numLbl('Number CC from')); numRow.appendChild(numStartInput);
+      numRow.appendChild(skipLbl);
+      numRow.appendChild(renumBtn);
+      dlg.appendChild(numRow);
+
+      function numCh0(){ return Math.max(0,Math.min(15,(parseInt(numChInput.value)||1)-1)); }
+      function numStart(){ return Math.max(0,Math.min(127,parseInt(numStartInput.value)||0)); }
+
+      // Sequential CC numbers from `startCC` on `ch`, optionally stepping over
+      // numbers that channel already uses. Also tracks what it hands out, so
+      // two rows in the same import can never be given the same number.
+      function computeSeqCCs(startCC,ch,skipUsed,count){
+        const used=skipUsed?usedCCSet():new Set();
+        const out=[]; let cc=startCC;
+        for(let i=0;i<count;i++){
+          while(cc<=127&&used.has(ch+'_'+cc)) cc++;
+          let pick=cc;
+          if(cc>127){
+            // Ran off the top of the CC range — fall back to the lowest
+            // number still free rather than stacking every remaining row
+            // on CC127 where they'd all silently collide.
+            pick=127;
+            for(let c=0;c<=127;c++){ if(!used.has(ch+'_'+c)){ pick=c; break; } }
+          } else { cc++; }
+          out.push(pick); used.add(ch+'_'+pick);
+        }
+        return out;
+      }
 
       if(skipped.length){
         const warnRow=document.createElement('div');
@@ -9447,11 +9682,12 @@
       // rowRefs: {importCb, pbCb, ccInput, chInput, defCCVal, defPbVal, row, setDimmed, checkConflict, tr}
       const rowRefs=[];
 
-      // Pre-assign default CCs: start from 14, increment per row
-      const initUsed=usedCCSet();
-      let runningCC=14;
+      // Pre-assign CCs from the numbering strip's defaults (Ch1, from CC14,
+      // skipping numbers that channel already uses).
+      const initCCs=computeSeqCCs(numStart(),numCh0(),skipCb.checked,rows.length);
+      const initCh=String(numCh0()+1);
 
-      rows.forEach(function(row){
+      rows.forEach(function(row,rowIdx){
         const tr=document.createElement('tr');
         tr.style.borderBottom='1px solid #23272f';
 
@@ -9462,10 +9698,7 @@
         let defCV=defaultCCVal(row);
         let defPV=defaultPbVal(row);
 
-        // Assign initial CC: next free from 14
-        while(initUsed.has('0_'+runningCC)&&runningCC<=127) runningCC++;
-        const initCC=runningCC<=127?runningCC:14;
-        runningCC++;
+        const initCC=initCCs[rowIdx];
 
         // Import checkbox
         const importCb=document.createElement('input'); importCb.type='checkbox'; importCb.checked=false;
@@ -9480,7 +9713,7 @@
 
         // Ch input
         const chInput=document.createElement('input');
-        chInput.type='number'; chInput.min='1'; chInput.max='16'; chInput.value='1';
+        chInput.type='number'; chInput.min='1'; chInput.max='16'; chInput.value=initCh;
         chInput.style.cssText='width:44px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:2px 4px;text-align:center;';
 
         // Conflict indicator
@@ -9706,7 +9939,7 @@
 
       const autoBtn=document.createElement('button');
       autoBtn.textContent='Auto-fill CC';
-      autoBtn.title='Assign sequential CC numbers (starting at 14) to all ticked rows';
+      autoBtn.title='Give each TICKED row the next free CC on its own channel. Use Renumber above to renumber every row from a chosen start instead.';
       autoBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;';
 
       const countLbl=document.createElement('span');
@@ -9766,6 +9999,25 @@
           rowRefs.forEach(function(r){ r.chInput.value=firstCh; r.checkConflict(); });
         }
       });
+
+      // ── Numbering strip: apply channel + sequential CCs ──────────
+      // Renumbers EVERY row, ticked or not. The ticks say what to import;
+      // the numbering says where it lands, and a row you tick a moment later
+      // should already carry the right number rather than a stale one from
+      // whatever the channel used to be.
+      function applyNumbering(){
+        const ch0=numCh0();
+        const seq=computeSeqCCs(numStart(),ch0,skipCb.checked,rowRefs.length);
+        rowRefs.forEach(function(ref,i){
+          ref.chInput.value=String(ch0+1);
+          if(!ref.pbCb.checked) ref.ccInput.value=String(seq[i]);
+          ref.checkConflict();
+        });
+      }
+      renumBtn.addEventListener('click',applyNumbering);
+      numChInput.addEventListener('change',applyNumbering);
+      numStartInput.addEventListener('change',applyNumbering);
+      skipCb.addEventListener('change',applyNumbering);
 
       // ── Auto-fill CC ─────────────────────────────────────────────
       autoBtn.addEventListener('click',function(){
@@ -10221,8 +10473,20 @@
         lines.push('MMV wiring — connect each parameter\'s Source/Feature as shown, then add');
         lines.push('a Scale modifier ABOVE an Offset modifier (Scale first, then Offset — the');
         lines.push('stacking order changes the result):');
+        lines.push('');
+        lines.push('MIDI hands MMV a 0.00-1.00 value. Any parameter whose range is not');
+        lines.push('already 0.00-1.00 therefore NEEDS the Scale/Offset pair below, or it');
+        lines.push('will only ever reach the bottom fraction of its travel. Each line');
+        lines.push('gives the parameter\'s real range, then the modifiers that map');
+        lines.push('0.00-1.00 onto it.');
         wireRefs.forEach(function(r){
-          let line='  '+r.row.name+': '+wireFeatureLabel(r)+', Scale='+fmtNum(r.mods.scale)+', Offset='+fmtNum(r.mods.offset);
+          // Spelling out the native range is what makes this readable inside
+          // MMV's right-click > Help, months later, with no MME project open:
+          // "Scale=6.28" means nothing on its own, "range 0 .. 6.28" explains it.
+          const rng='range '+fmtNum(r.row.min)+' .. '+fmtNum(r.row.max);
+          const native=(r.mods.scale===1&&r.mods.offset===0)?' (already 0-1, no Scale needed)':'';
+          let line='  '+r.row.name+' ['+rng+']'+native+': '+wireFeatureLabel(r)
+            +', Scale='+fmtNum(r.mods.scale)+', Offset='+fmtNum(r.mods.offset);
           if(r.mods.step!=null) line+=', Step='+fmtNum(r.mods.step);
           if(r.mods.warning) line+='  ['+r.mods.warning+']';
           lines.push(line);
@@ -10346,7 +10610,7 @@
       const hdr=document.createElement('div');
       hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;';
       hdr.innerHTML=
-        '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x21C4; Update ISF</div>'
+        '<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x21C4; Export ISF</div>'
         +'<div style="font-size:12px;color:#4fa3ff;margin-top:3px;">'+escHtml(entry.label||entry.filename)+'</div>'
         +'<div style="font-size:11px;color:#5a6075;margin-top:2px;font-family:monospace;">'+escHtml(entry.filename)+'</div>'
         +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">Static rows get their ISF default updated to the current playhead value. Automated rows get a wiring-sheet entry (channel, CC, Scale/Offset/Step) for MMV\'s modifiers.</div>';
@@ -10553,7 +10817,7 @@
         +'width:min(520px,95vw);max-height:80vh;overflow:hidden;display:flex;flex-direction:column;';
       const hdr=document.createElement('div');
       hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;font-size:14px;font-weight:700;color:#e0e4ef;';
-      hdr.textContent='Update which ISF import?';
+      hdr.textContent='Export which ISF import?';
       dlg.appendChild(hdr);
       const list=document.createElement('div');
       list.style.cssText='overflow-y:auto;padding:8px;';

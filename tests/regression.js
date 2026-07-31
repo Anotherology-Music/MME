@@ -171,6 +171,12 @@ function buildTestHtml() {
       '    window.dispatchEvent(new MouseEvent("mouseup"));',
       '    return [...state.selection];',
       '  };',
+      // ── v0.9.41 bulk lane delete. deleteLanes/showDeleteLanesDialog/
+      // laneGroupKey sit directly alongside removeLane in this same
+      // top-level scope, so the init(); anchor is the right place.
+      '  window._TEST_deleteLanes = (ids) => deleteLanes(ids);',
+      '  window._TEST_showDeleteLanesDialog = () => showDeleteLanesDialog();',
+      '  window._TEST_laneGroupKey = (laneId) => laneGroupKey(state.ccLanes.find(l => l.id === laneId));',
       '  init();',
     ].join('\n')
   );
@@ -186,6 +192,11 @@ function buildTestHtml() {
       '    window._TEST_buildMappingRows=(inputs)=>buildMappingRows(inputs);',
       '    window._TEST_isfPreprocess=(src,inputs,targets,es100)=>isfPreprocess(src,inputs,targets,es100);',
       '    window._TEST_isfBuildVert=(src,es100)=>isfBuildVert(src,es100);',
+      // v0.9.41: the MMV setup notes written into the shader's DESCRIPTION.
+      // Same private IIFE as everything else here — buildMigrationNotesText
+      // and computeModifiers are not visible from the init() scope.
+      '    window._TEST_buildMigrationNotesText=(entry,defs,wire)=>buildMigrationNotesText(entry,defs,wire);',
+      '    window._TEST_computeModifiers=(row)=>computeModifiers(row);',
       '    function showISFDialog(header, filename, sourceText){',
     ].join('\n')
   );
@@ -9047,6 +9058,310 @@ async function run() {
       dialogMsg != null && /21,?000/.test(dialogMsg) && /4200/.test(dialogMsg), dialogMsg);
     check('...and declining leaves the project completely untouched',
       res.ok === false && res.bindings === 0 && res.tagged === 0, res);
+  });
+
+  // ---------------- v0.9.41: anchor point (Ctrl+Shift+double-click) ----------------
+
+  await withPage(browser, async (page) => {
+    // The whole point of the gesture: the TIME comes from the cursor, the
+    // VALUE comes from the curve. Click deliberately far from the line and
+    // the new point must still land exactly on it.
+    const laneId = await page.evaluate(() => {
+      const id = window._TEST_addLane(21, 0);
+      // Straight ramp 0 -> 120 across two bars, so the value at any tick is
+      // arithmetic we can assert against rather than eyeball.
+      window._TEST_setLanePoints(id, [{ t: 0, v: 0 }, { t: 3840, v: 120 }]);
+      window._TEST_state.snap = 'off';
+      window._TEST_requestDraw();
+      return id;
+    });
+    await page.waitForTimeout(80);
+
+    const onLine = await page.evaluate((id) => window._TEST_laneValueAt(id, 1920), laneId);
+    check('setup: the ramp reads 60 at its midpoint', Math.abs(onLine - 60) < 1, onLine);
+
+    // Aim the cursor at value 10 — a long way below the line's 60 — at the
+    // midpoint tick.
+    const pos = await page.evaluate((id) => window._TEST_laneClientPos(id, 1920, 10), laneId);
+    await page.keyboard.down('Control');
+    await page.keyboard.down('Shift');
+    await page.mouse.dblclick(pos.x, pos.y);
+    await page.keyboard.up('Shift');
+    await page.keyboard.up('Control');
+    await page.waitForTimeout(80);
+
+    const pts = await page.evaluate((id) => window._TEST_lanePoints(id), laneId);
+    const added = pts.find(p => p.t > 0 && p.t < 3840);
+    check('Ctrl+Shift+double-click adds a point between the existing two', !!added, pts);
+    check('...whose value comes from the line, not the cursor height (60, not 10)',
+      !!added && Math.abs(added.v - 60) <= 1, added);
+    check('...so the curve either side of it is unchanged',
+      Math.abs(await page.evaluate((id) => window._TEST_laneValueAt(id, 960), laneId) - 30) <= 1
+      && Math.abs(await page.evaluate((id) => window._TEST_laneValueAt(id, 2880), laneId) - 90) <= 1,
+      { at960: await page.evaluate((id) => window._TEST_laneValueAt(id, 960), laneId) });
+
+    // The delete-nearby-point branch must not fire for this chord: double-
+    // clicking near an existing point with Ctrl+Shift adds an anchor, it
+    // does not remove the point you were aiming next to.
+    const nearPos = await page.evaluate((id) => window._TEST_laneClientPos(id, 1930, 60), laneId);
+    const before = await page.evaluate((id) => window._TEST_lanePoints(id).length, laneId);
+    await page.keyboard.down('Control');
+    await page.keyboard.down('Shift');
+    await page.mouse.dblclick(nearPos.x, nearPos.y);
+    await page.keyboard.up('Shift');
+    await page.keyboard.up('Control');
+    await page.waitForTimeout(80);
+    const after = await page.evaluate((id) => window._TEST_lanePoints(id).length, laneId);
+    check('Ctrl+Shift near an existing point still adds, never deletes', after >= before, { before, after });
+
+    // A plain double-click keeps its old behaviour — the value follows the
+    // cursor. This is the check that would catch the chord swallowing the
+    // ordinary gesture.
+    const plainPos = await page.evaluate((id) => window._TEST_laneClientPos(id, 3000, 15), laneId);
+    await page.mouse.dblclick(plainPos.x, plainPos.y);
+    await page.waitForTimeout(80);
+    const plainPts = await page.evaluate((id) => window._TEST_lanePoints(id), laneId);
+    const plain = plainPts.find(p => Math.abs(p.t - 3000) < 60);
+    check('a plain double-click still takes its value from the cursor, not the line',
+      !!plain && Math.abs(plain.v - 15) <= 3, { plain, expectedNear: 15 });
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(60);
+    const undone = await page.evaluate((id) => window._TEST_lanePoints(id).length, laneId);
+    check('adding a point by double-click is undoable', undone === after, { undone, after });
+  });
+
+  // ---------------- v0.9.41: bulk lane delete ----------------
+
+  await withPage(browser, async (page) => {
+    const setup = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ccLanes.slice().forEach(l => window._TEST_deleteLanes([l.id]));
+      const ids = [];
+      for (let i = 0; i < 3; i++) {
+        const id = window._TEST_addLane(30 + i, 0);
+        window._TEST_setLaneTags(id, ['kaleido']);
+        ids.push(id);
+      }
+      for (let i = 0; i < 2; i++) {
+        const id = window._TEST_addLane(40 + i, 0);
+        window._TEST_setLaneTags(id, ['plasma']);
+        ids.push(id);
+      }
+      return { ids, total: s.ccLanes.length };
+    });
+    check('setup: five lanes across two tags', setup.total === 5, setup);
+
+    const grouped = await page.evaluate((id) => window._TEST_laneGroupKey(id), setup.ids[0]);
+    check('a lane groups under its first tag', grouped === 'kaleido', grouped);
+
+    await page.evaluate(() => window._TEST_showDeleteLanesDialog());
+    await page.waitForTimeout(120);
+    const dlgInfo = await page.evaluate(() => {
+      const d = document.getElementById('delLanesDialog');
+      if (!d) return null;
+      return {
+        open: d.open,
+        groups: [...d.querySelectorAll('label')].map(l => l.textContent).filter(t => /KALEIDO|PLASMA/.test(t)),
+        rows: d.querySelectorAll('input[type=checkbox]').length,
+      };
+    });
+    check('the delete dialog opens and groups lanes by tag',
+      !!dlgInfo && dlgInfo.open && dlgInfo.groups.length === 2, dlgInfo);
+    // 5 lane checkboxes + 2 group masters + 1 select-all
+    check('...with a checkbox per lane, per group, and one select-all',
+      !!dlgInfo && dlgInfo.rows === 8, dlgInfo);
+
+    // Ticking a group master ticks exactly that group's lanes, and the
+    // Delete button names the count.
+    const afterGroup = await page.evaluate(() => {
+      const d = document.getElementById('delLanesDialog');
+      const masters = [...d.querySelectorAll('label')].filter(l => /KALEIDO/.test(l.textContent));
+      const cb = masters[0].querySelector('input[type=checkbox]');
+      cb.checked = true; cb.dispatchEvent(new Event('change'));
+      const btns = [...d.querySelectorAll('button')];
+      return { del: btns[btns.length - 1].textContent, disabled: btns[btns.length - 1].disabled };
+    });
+    check('ticking a tag group arms exactly that group\'s lanes',
+      afterGroup.del === 'Delete 3 lanes' && !afterGroup.disabled, afterGroup);
+
+    const afterDelete = await page.evaluate(() => {
+      const d = document.getElementById('delLanesDialog');
+      const btns = [...d.querySelectorAll('button')];
+      btns[btns.length - 1].click();
+      return {
+        remaining: window._TEST_state.ccLanes.length,
+        tags: window._TEST_state.ccLanes.map(l => l.tags[0]),
+        gone: !document.getElementById('delLanesDialog'),
+      };
+    });
+    check('deleting a whole tag group removes exactly those lanes in one go',
+      afterDelete.remaining === 2 && afterDelete.tags.every(t => t === 'plasma'), afterDelete);
+    check('...and the dialog closes itself', afterDelete.gone, afterDelete);
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(80);
+    const undone = await page.evaluate(() => window._TEST_state.ccLanes.length);
+    check('a bulk delete of three lanes is ONE undo step, not three', undone === 5, undone);
+
+    // The bug this guards: removeLane() splices the live array, so iterating
+    // it directly would skip every other lane.
+    const wiped = await page.evaluate(() => {
+      const ids = window._TEST_state.ccLanes.map(l => l.id);
+      window._TEST_deleteLanes(ids);
+      return window._TEST_state.ccLanes.length;
+    });
+    check('deleting every lane at once really removes all of them', wiped === 0, wiped);
+  });
+
+  // ---------------- v0.9.41: ISF import channel + start-CC ----------------
+
+  await withPage(browser, async (page) => {
+    const header = {
+      INPUTS: [
+        { NAME: 'zoom', TYPE: 'float', MIN: 0, MAX: 6.28 },
+        { NAME: 'speed', TYPE: 'float', MIN: 0, MAX: 4 },
+        { NAME: 'warp', TYPE: 'float', MIN: 0, MAX: 1 },
+      ],
+    };
+    await page.evaluate(() => { window._TEST_state.ccLanes.slice().forEach(l => window._TEST_deleteLanes([l.id])); });
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'shaderA.fs'), header);
+    await page.waitForTimeout(150);
+
+    const readRows = () => page.evaluate(() => {
+      const d = document.getElementById('isfDialog');
+      return [...d.querySelectorAll('tbody tr')].map(tr => ({
+        cc: tr.querySelector('[data-col=cc] input').value,
+        ch: tr.querySelector('[data-col=ch] input').value,
+      }));
+    });
+
+    const first = await readRows();
+    check('a fresh import numbers sequentially from CC14 on Ch1',
+      first.map(r => r.cc).join(',') === '14,15,16' && first.every(r => r.ch === '1'), first);
+
+    // Import them, so channel 1 now has CC14-16 occupied.
+    await page.evaluate(() => {
+      const d = document.getElementById('isfDialog');
+      d.querySelectorAll('tbody tr').forEach(tr => tr.querySelector('[data-col=import] input').click());
+    });
+    await page.click('#isfDialog button:has-text("Import Lanes")');
+    await page.waitForTimeout(120);
+    const lanesAfter = await page.evaluate(() => window._TEST_state.ccLanes.map(l => l.cc + '/' + l.ch));
+    check('...and importing puts them on Ch1 as CC14-16', lanesAfter.join(',') === '14/0,15/0,16/0', lanesAfter);
+
+    // The actual complaint: a SECOND copy of the same shader used to carry
+    // on from where the first stopped (17,18,19) even when headed for an
+    // empty channel, because the skip-in-use scan was hard-coded to ch 0.
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'shaderB.fs'), header);
+    await page.waitForTimeout(150);
+    const second = await readRows();
+    check('a second import of the same shader still defaults to Ch1, continuing 17-19',
+      second.map(r => r.cc).join(',') === '17,18,19', second);
+
+    await page.evaluate(() => {
+      const d = document.getElementById('isfDialog');
+      const inp = d.querySelector('#isfNumCh');
+      inp.value = '2'; inp.dispatchEvent(new Event('change'));
+    });
+    await page.waitForTimeout(80);
+    const onCh2 = await readRows();
+    check('choosing Ch2 renumbers the whole import back to CC14 — Ch2 is empty',
+      onCh2.map(r => r.cc).join(',') === '14,15,16' && onCh2.every(r => r.ch === '2'), onCh2);
+
+    // An explicit start number is honoured too.
+    await page.evaluate(() => {
+      const d = document.getElementById('isfDialog');
+      const inp = d.querySelector('#isfNumStart');
+      inp.value = '40'; inp.dispatchEvent(new Event('change'));
+    });
+    await page.waitForTimeout(80);
+    const from40 = await readRows();
+    check('"Number CC from 40" numbers 40,41,42', from40.map(r => r.cc).join(',') === '40,41,42', from40);
+
+    // Back to Ch1 with skip on: 40-42 are free there too, so the numbering
+    // is the same — what changes is the CONFLICT state, not the numbers.
+    await page.evaluate(() => {
+      const d = document.getElementById('isfDialog');
+      const ch = d.querySelector('#isfNumCh');
+      ch.value = '1'; ch.dispatchEvent(new Event('change'));
+      const start = d.querySelector('#isfNumStart');
+      start.value = '14'; start.dispatchEvent(new Event('change'));
+    });
+    await page.waitForTimeout(80);
+    const backCh1 = await readRows();
+    check('back on Ch1 from 14, the in-use 14-16 are stepped over (17,18,19)',
+      backCh1.map(r => r.cc).join(',') === '17,18,19', backCh1);
+
+    // Unticking "skip" gives strictly sequential numbering, clashes and all
+    // — the escape hatch for "I want these exact numbers".
+    await page.evaluate(() => {
+      const d = document.getElementById('isfDialog');
+      const skip = d.querySelector('#isfNumSkip');
+      skip.checked = false; skip.dispatchEvent(new Event('change'));
+    });
+    await page.waitForTimeout(80);
+    const noSkip = await readRows();
+    check('unticking "skip numbers already in use" numbers strictly 14,15,16 even though they clash',
+      noSkip.map(r => r.cc).join(',') === '14,15,16', noSkip);
+
+    await page.evaluate(() => { const d = document.getElementById('isfDialog'); d.close(); d.remove(); });
+  });
+
+  // ---------------- v0.9.41: MMV setup notes in the ISF DESCRIPTION ----------------
+
+  await withPage(browser, async (page) => {
+    const notes = await page.evaluate(() => window._TEST_buildMigrationNotesText(
+      { filename: 'kaleido (MME).fs', label: 'Kaleido' },
+      [],
+      [
+        { row: { name: 'zoom', min: 0, max: 6.28 }, mods: { scale: 6.28, offset: 0, step: null, warning: null }, lane: { ch: 0, cc: 20, type: 'cc' } },
+        { row: { name: 'warp', min: 0, max: 1 }, mods: { scale: 1, offset: 0, step: null, warning: null }, lane: { ch: 0, cc: 21, type: 'cc' } },
+        { row: { name: 'shift', min: -2, max: 2 }, mods: { scale: 4, offset: -2, step: null, warning: null }, lane: { ch: 1, cc: 22, type: 'cc' } },
+      ],
+    ));
+    check('the DESCRIPTION notes explain WHY a Scale is needed (MIDI sends 0.00-1.00)',
+      /0\.00-1\.00/.test(notes) && /Scale/.test(notes), notes.slice(0, 400));
+    check('...and name each parameter\'s real range next to its Scale/Offset',
+      /zoom \[range 0 \.\. 6\.28\]/.test(notes) && /Scale=6\.28/.test(notes), notes);
+    check('...including a negative-minimum parameter, where the Offset matters',
+      /shift \[range -2 \.\. 2\]/.test(notes) && /Scale=4/.test(notes) && /Offset=-2/.test(notes), notes);
+    check('a parameter already in 0-1 is called out as needing no Scale',
+      /warp \[range 0 \.\. 1\] \(already 0-1, no Scale needed\)/.test(notes), notes);
+    check('the notes still carry the Scale-above-Offset stacking warning',
+      /Scale first, then Offset/.test(notes), notes);
+    check('the notes are still delimited so a re-export replaces them in place',
+      /--- MME Migration Notes/.test(notes) && /--- End MME Migration Notes ---/.test(notes), notes);
+  });
+
+  // ---------------- v0.9.41: Setup panel toggle contrast ----------------
+
+  await withPage(browser, async (page) => {
+    // #setupPanel button (an ID selector) was quietly beating the global
+    // button.on, stripping the lit background while leaving its dark navy
+    // text — MMV Smooth read as near-black on near-black with no visible
+    // on/off state at all.
+    const shown = await page.evaluate(() => {
+      const p = document.getElementById('setupPanel');
+      if (p) p.style.display = 'block';
+      const b = document.getElementById('mmvSmooth');
+      const on = getComputedStyle(b).backgroundColor;
+      b.classList.remove('on');
+      const off = getComputedStyle(b).backgroundColor;
+      b.classList.add('on');
+      return { on, off, color: getComputedStyle(b).color };
+    });
+    check('the MMV Smooth button looks visibly different on vs off', shown.on !== shown.off, shown);
+
+    const parse = (c) => (c.match(/\d+/g) || []).map(Number);
+    const lum = (c) => { const [r, g, b] = parse(c); return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255; };
+    const contrast = (a, b) => {
+      const l1 = Math.max(lum(a), lum(b)), l2 = Math.min(lum(a), lum(b));
+      return (l1 + 0.05) / (l2 + 0.05);
+    };
+    const ratio = contrast(shown.color, shown.on);
+    check('...and its text is legible against its own lit background (contrast > 4.5:1)',
+      ratio > 4.5, { ratio: ratio.toFixed(2), text: shown.color, bg: shown.on });
   });
 
   await browser.close();
