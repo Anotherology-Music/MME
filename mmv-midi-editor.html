@@ -979,6 +979,12 @@
   bindings by pitch, so a resync costs what the notes carrying macros cost and
   not notes × bindings.
 
+  Known behaviour, inherited and now much easier to hit: two macro instances
+  whose spans overlap fight over the same ticks, and the later bake wins in the
+  overlap. A lane can only hold one value at a time, so there is no third
+  answer; it just matters more when a one-bar macro is bound to a key you are
+  hitting every beat. Capture the span you actually want repeated.
+
   Finally, Capture said what it needed only after you clicked it. It is now
   disabled until a loop range exists, and says why — a macro IS a loop range —
   and the capture dialog states plainly that ticking lanes is how you choose
