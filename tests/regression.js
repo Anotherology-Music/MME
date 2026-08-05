@@ -9386,13 +9386,18 @@ async function run() {
     check('Setup > ISF has an Open ISF Catalogue button and a URL box',
       /Open ISF Catalogue/.test(ui.btn) && ui.type === 'text', ui);
     check('...pre-filled with the catalogue\'s .html address', /ISF-Catalogue\.html$/.test(ui.value), ui.value);
+    // This file is published to a public website, so the shipped default must
+    // stay a placeholder rather than anyone's real home directory. Cheap to
+    // assert, and the sort of thing that quietly creeps back in.
+    check('...and the shipped default names no real user account',
+      /YourName/.test(ui.value) && !/\/Users\/(?!YourName)[a-z0-9._-]+\//i.test(ui.value), ui.value);
 
     // A Windows path is what the user actually has to hand, so the box has
     // to take one. The bare-drive-letter case is the trap: "C:" satisfies a
     // naive scheme test and would be passed through untouched.
     const norm = await page.evaluate(() => ({
-      backslash: window._TEST_normaliseCatalogueUrl('C:\\Users\\matt\\repos\\ISF\\_catalogue\\ISF-Catalogue.html'),
-      forward: window._TEST_normaliseCatalogueUrl('C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html'),
+      backslash: window._TEST_normaliseCatalogueUrl('C:\\Users\\YourName\\ISF\\_catalogue\\ISF-Catalogue.html'),
+      forward: window._TEST_normaliseCatalogueUrl('C:/Users/YourName/ISF/_catalogue/ISF-Catalogue.html'),
       quoted: window._TEST_normaliseCatalogueUrl('"C:\\ISF\\ISF-Catalogue.html"'),
       unc: window._TEST_normaliseCatalogueUrl('\\\\nas\\shaders\\ISF-Catalogue.html'),
       alreadyFile: window._TEST_normaliseCatalogueUrl('file:///C:/ISF/ISF-Catalogue.html'),
@@ -9400,9 +9405,9 @@ async function run() {
       empty: window._TEST_normaliseCatalogueUrl('   '),
     }));
     check('a backslashed Windows path becomes a file:// URL',
-      norm.backslash === 'file:///C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html', norm.backslash);
+      norm.backslash === 'file:///C:/Users/YourName/ISF/_catalogue/ISF-Catalogue.html', norm.backslash);
     check('a forward-slashed Windows path does too (the "C:" scheme trap)',
-      norm.forward === 'file:///C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html', norm.forward);
+      norm.forward === 'file:///C:/Users/YourName/ISF/_catalogue/ISF-Catalogue.html', norm.forward);
     check('surrounding quotes from a Windows "Copy as path" are stripped',
       norm.quoted === 'file:///C:/ISF/ISF-Catalogue.html', norm.quoted);
     check('a UNC path becomes a file:// URL', norm.unc === 'file:////nas/shaders/ISF-Catalogue.html', norm.unc);
@@ -9420,7 +9425,7 @@ async function run() {
     });
 
     const cmdMsg = await page.evaluate(() => {
-      document.getElementById('isfCatalogueUrl').value = 'C:\\Users\\matt\\repos\\ISF\\_catalogue\\ISF Catalogue.cmd';
+      document.getElementById('isfCatalogueUrl').value = 'C:\\Users\\YourName\\ISF\\_catalogue\\ISF Catalogue.cmd';
       window._TEST_openIsfCatalogue();
       const t = document.getElementById('stCtx');
       return { toast: t ? t.textContent : '', opened: window.__opened.length };

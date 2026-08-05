@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.42
+  MMV MIDI & CC Curve Editor v0.9.43
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1063,6 +1063,16 @@
   requires two or more characters before the colon, which no drive letter can
   supply.
 
+
+  v0.9.43 The ISF Catalogue box now ships a placeholder path rather than a
+  real one. This file is published to a public website, so a default of
+  C:/Users/<someone's actual account>/... put a real home directory on the web
+  for no benefit — the address is per-browser and gets edited on first use
+  anyway. Defaults to .../Users/YourName/... instead, and a test asserts the
+  shipped default names no real account, since this is exactly the sort of
+  thing that creeps back in unnoticed. The regression fixtures got the same
+  treatment; they publish too.
+
 -->
 
 
@@ -1951,7 +1961,7 @@
           <div class="setup-row setup-sub-row">
             <button id="isfCatalogueBtn" title="Open your ISF Catalogue in a new browser tab">&#x1F5C2; Open ISF Catalogue</button>
             <input type="text" id="isfCatalogueUrl" style="flex:1 1 240px;min-width:160px;"
-              value="file:///C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html"
+              value="file:///C:/Users/YourName/ISF/_catalogue/ISF-Catalogue.html"
               placeholder="file:///C:/.../ISF-Catalogue.html or http://127.0.0.1:8770/ISF-Catalogue.html"
               title="Where your ISF Catalogue lives. A Windows path is accepted and converted to a file:// URL. Saved in this browser.">
           </div>
