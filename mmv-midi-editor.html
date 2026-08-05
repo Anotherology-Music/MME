@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.41
+  MMV MIDI & CC Curve Editor v0.9.42
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1033,6 +1033,35 @@
   beating the global `button.on`, stripping the lit background while leaving
   that rule's dark navy text — near-black on near-black. Restored at matching
   specificity, which fixes every toggle in the panel, not just this one.
+
+
+  v0.9.42 A link out to the ISF Catalogue.
+
+  Setup > IMPORT / EXPORT > ISF gains an "Open ISF Catalogue" button and an
+  editable address beside it, remembered in this browser rather than in the
+  project — where the catalogue lives is a property of the machine, like the
+  MIDI port, not something that should travel inside a .mmvp.
+
+  It cannot launch the catalogue's .cmd, and no amount of work would change
+  that: no web page may start a program on the machine viewing it, in any
+  browser, under any setting. The button therefore points at the catalogue's
+  .html, and says exactly that if it is handed a .cmd/.exe rather than
+  appearing to do nothing.
+
+  The second limit is subtler and worth knowing before it bites. A file://
+  address opens only when MME itself was opened from a file; served from a web
+  address, the browser refuses file:// links out of it — and refuses them
+  SILENTLY, which is indistinguishable from a broken button. That case is
+  detected up front and explained, naming the protocol MME is actually running
+  under. Serving the catalogue over http:// and storing that address works from
+  either, and is the better choice for anyone running MME from the web copy.
+
+  The box takes a raw Windows path as well as a URL and converts it, including
+  a UNC path and the quotes that Explorer's "Copy as path" wraps around one.
+  The trap there: a bare drive letter satisfies a naive scheme test — "C:" reads
+  as a protocol — so the drive-path case is tested first and the scheme test
+  requires two or more characters before the colon, which no drive letter can
+  supply.
 
 -->
 
