@@ -131,6 +131,10 @@ function buildTestHtml() {
       '  window._TEST_midiInsertOpts = () => midiInsertOpts();',
       '  window._TEST_refreshSetupPanelDynamics = () => refreshSetupPanelDynamics();',
       '  window._TEST_noteNameToPitch = (s) => noteNameToPitch(s);',
+      // v0.9.41: ISF Catalogue launcher. Both live in this same top-level
+      // scope, right beside the Enable Preview preference wiring.
+      '  window._TEST_normaliseCatalogueUrl = (s) => normaliseCatalogueUrl(s);',
+      '  window._TEST_openIsfCatalogue = () => openIsfCatalogue();',
       '  window._TEST_parseNoteNameCsv = (t) => parseNoteNameCsv(t);',
       '  window._TEST_handleNoteNameCsvFile = (text, name) => handleNoteNameCsvFile(new File([text], name, { type: "text/csv" }));',
       // ── CC macros. Every one of these lives in the same top-level scope as
@@ -9369,6 +9373,113 @@ async function run() {
     const ratio = contrast(shown.color, shown.on);
     check('...and its text is legible against its own lit background (contrast > 4.5:1)',
       ratio > 4.5, { ratio: ratio.toFixed(2), text: shown.color, bg: shown.on });
+  });
+
+  // ---------------- v0.9.41: ISF Catalogue launcher ----------------
+
+  await withPage(browser, async (page) => {
+    const ui = await page.evaluate(() => {
+      const btn = document.getElementById('isfCatalogueBtn');
+      const inp = document.getElementById('isfCatalogueUrl');
+      return { btn: btn && btn.textContent.trim(), type: inp && inp.type, value: inp && inp.value };
+    });
+    check('Setup > ISF has an Open ISF Catalogue button and a URL box',
+      /Open ISF Catalogue/.test(ui.btn) && ui.type === 'text', ui);
+    check('...pre-filled with the catalogue\'s .html address', /ISF-Catalogue\.html$/.test(ui.value), ui.value);
+
+    // A Windows path is what the user actually has to hand, so the box has
+    // to take one. The bare-drive-letter case is the trap: "C:" satisfies a
+    // naive scheme test and would be passed through untouched.
+    const norm = await page.evaluate(() => ({
+      backslash: window._TEST_normaliseCatalogueUrl('C:\\Users\\matt\\repos\\ISF\\_catalogue\\ISF-Catalogue.html'),
+      forward: window._TEST_normaliseCatalogueUrl('C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html'),
+      quoted: window._TEST_normaliseCatalogueUrl('"C:\\ISF\\ISF-Catalogue.html"'),
+      unc: window._TEST_normaliseCatalogueUrl('\\\\nas\\shaders\\ISF-Catalogue.html'),
+      alreadyFile: window._TEST_normaliseCatalogueUrl('file:///C:/ISF/ISF-Catalogue.html'),
+      http: window._TEST_normaliseCatalogueUrl('http://127.0.0.1:8770/ISF-Catalogue.html'),
+      empty: window._TEST_normaliseCatalogueUrl('   '),
+    }));
+    check('a backslashed Windows path becomes a file:// URL',
+      norm.backslash === 'file:///C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html', norm.backslash);
+    check('a forward-slashed Windows path does too (the "C:" scheme trap)',
+      norm.forward === 'file:///C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html', norm.forward);
+    check('surrounding quotes from a Windows "Copy as path" are stripped',
+      norm.quoted === 'file:///C:/ISF/ISF-Catalogue.html', norm.quoted);
+    check('a UNC path becomes a file:// URL', norm.unc === 'file:////nas/shaders/ISF-Catalogue.html', norm.unc);
+    check('an address that is already a URL is left alone',
+      norm.alreadyFile === 'file:///C:/ISF/ISF-Catalogue.html' && norm.http === 'http://127.0.0.1:8770/ISF-Catalogue.html', norm);
+    check('an empty box normalises to empty, not to a bogus URL', norm.empty === '', norm.empty);
+
+    // The two refusals. Both are browser rules, and both have to SAY so —
+    // a silently-blocked window.open looks identical to a broken button.
+    const opened = [];
+    await page.evaluate(() => {
+      window.__origOpen = window.open;
+      window.__opened = [];
+      window.open = (u) => { window.__opened.push(u); return {}; };
+    });
+
+    const cmdMsg = await page.evaluate(() => {
+      document.getElementById('isfCatalogueUrl').value = 'C:\\Users\\matt\\repos\\ISF\\_catalogue\\ISF Catalogue.cmd';
+      window._TEST_openIsfCatalogue();
+      const t = document.getElementById('stCtx');
+      return { toast: t ? t.textContent : '', opened: window.__opened.length };
+    });
+    check('pointing it at a .cmd refuses, and says a browser cannot launch a program',
+      /cannot launch a program/i.test(cmdMsg.toast) && cmdMsg.opened === 0, cmdMsg);
+
+    // The page under test is served over http, so a file:// link is exactly
+    // the blocked case.
+    const fileMsg = await page.evaluate(() => {
+      document.getElementById('isfCatalogueUrl').value = 'C:\\ISF\\ISF-Catalogue.html';
+      window._TEST_openIsfCatalogue();
+      const t = document.getElementById('stCtx');
+      return { toast: t ? t.textContent : '', opened: window.__opened.length, proto: location.protocol };
+    });
+    check('a file:// address from an http-served MME is refused with the reason',
+      /blocked/i.test(fileMsg.toast) && /file:\/\//.test(fileMsg.toast) && fileMsg.opened === 0, fileMsg);
+
+    const httpOpen = await page.evaluate(() => {
+      document.getElementById('isfCatalogueUrl').value = 'http://127.0.0.1:8770/ISF-Catalogue.html';
+      window._TEST_openIsfCatalogue();
+      return window.__opened;
+    });
+    check('an http:// address opens in a new tab',
+      httpOpen.length === 1 && httpOpen[0] === 'http://127.0.0.1:8770/ISF-Catalogue.html', httpOpen);
+
+    const emptyMsg = await page.evaluate(() => {
+      document.getElementById('isfCatalogueUrl').value = '';
+      window._TEST_openIsfCatalogue();
+      const t = document.getElementById('stCtx');
+      return { toast: t ? t.textContent : '', opened: window.__opened.length };
+    });
+    // opened stays at 1 — the count from the successful http open above.
+    // Nothing new was opened for the empty box.
+    check('an empty box asks for an address instead of opening about:blank',
+      /set the isf catalogue address/i.test(emptyMsg.toast) && emptyMsg.opened === 1, emptyMsg);
+
+    await page.evaluate(() => { window.open = window.__origOpen; });
+
+    // The address is a property of the machine, not the project, so it
+    // belongs in localStorage — and must survive a reload.
+    const persisted = await page.evaluate(() => {
+      const inp = document.getElementById('isfCatalogueUrl');
+      inp.value = 'http://localhost:9999/cat.html';
+      inp.dispatchEvent(new Event('change'));
+      return localStorage.getItem('mmv-isf-catalogue-url');
+    });
+    check('the catalogue address is remembered in localStorage',
+      persisted === 'http://localhost:9999/cat.html', persisted);
+
+    await page.reload();
+    await page.waitForTimeout(300);
+    const afterReload = await page.evaluate(() => document.getElementById('isfCatalogueUrl').value);
+    check('...and is restored on reload, overriding the shipped default',
+      afterReload === 'http://localhost:9999/cat.html', afterReload);
+
+    const snap = await page.evaluate(() => JSON.stringify(window._TEST_snapshot()));
+    check('the catalogue address is NOT saved into the project (it is a machine setting)',
+      !/localhost:9999/.test(snap), snap.length);
   });
 
   await browser.close();

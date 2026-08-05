@@ -1919,6 +1919,15 @@
           </div>
           <div class="setup-note">Rewrites the &ldquo;(MME)&rdquo; working copy that Import ISF put in your project folder &mdash; baking the values at the playhead in as the shader&rsquo;s new ISF defaults, so it opens elsewhere looking the way you set it up here. The same wiring notes are written into the shader&rsquo;s own DESCRIPTION field, so in MMV you can right-click the shader&rsquo;s menu bar &rsaquo; Help and read the Scale/Offset settings each parameter needs. A wiring sheet is downloaded alongside it.</div>
 
+          <div class="setup-row setup-sub-row">
+            <button id="isfCatalogueBtn" title="Open your ISF Catalogue in a new browser tab">&#x1F5C2; Open ISF Catalogue</button>
+            <input type="text" id="isfCatalogueUrl" style="flex:1 1 240px;min-width:160px;"
+              value="file:///C:/Users/matt/repos/ISF/_catalogue/ISF-Catalogue.html"
+              placeholder="file:///C:/.../ISF-Catalogue.html or http://127.0.0.1:8770/ISF-Catalogue.html"
+              title="Where your ISF Catalogue lives. A Windows path is accepted and converted to a file:// URL. Saved in this browser.">
+          </div>
+          <div class="setup-note">Opens your ISF Catalogue in a new tab. A browser cannot launch a <code>.cmd</code> (or any program) &mdash; that is a hard security rule, not an MME limitation &mdash; so point this at the catalogue&rsquo;s <code>.html</code> file. A <code>file://</code> address only works when MME itself was opened from a file; if you are running MME from a web address, the browser will refuse the link, and you should serve the catalogue over <code>http://</code> and paste that address here instead.</div>
+
           <div class="setup-subtitle">KEY NAMES</div>
           <div class="setup-row setup-sub-row">
             <button id="drumMapImportBtn" title="Import a Cubase drum map (.drm) to name piano-roll keys on a chosen channel — e.g. General MIDI percussion note names">&#x1F941; Import Drum Map (Cubase .drm)</button>
@@ -7952,6 +7961,49 @@
   $('isfPreviewEnable').addEventListener('change',()=>{
     try{ localStorage.setItem(ISF_PREVIEW_KEY,$('isfPreviewEnable').checked?'1':'0'); }catch(e){}
   });
+
+  // ── Setup ▸ IMPORT / EXPORT ▸ ISF: Open ISF Catalogue ────────────
+  // A link out to the user's own catalogue app. Stored per browser, not in
+  // the project — it's a property of this machine, like the MIDI port.
+  const ISF_CATALOGUE_KEY='mmv-isf-catalogue-url';
+  try{ const v=localStorage.getItem(ISF_CATALOGUE_KEY); if(v!==null) $('isfCatalogueUrl').value=v; }catch(e){}
+  $('isfCatalogueUrl').addEventListener('change',()=>{
+    try{ localStorage.setItem(ISF_CATALOGUE_KEY,$('isfCatalogueUrl').value.trim()); }catch(e){}
+  });
+
+  // Accepts what a Windows user actually has to hand — C:\path\file.html,
+  // with either slash direction, quoted or not — and turns it into a real
+  // file:// URL. Order matters: a bare drive letter ("C:") would satisfy a
+  // naive scheme test, so the drive-path case has to be checked first, and
+  // the scheme test demands two or more characters before the colon so it
+  // can never match one again.
+  function normaliseCatalogueUrl(raw){
+    const s=String(raw||'').trim().replace(/^"+|"+$/g,'');
+    if(!s) return '';
+    if(/^[a-z]:[\\/]/i.test(s)) return 'file:///'+s.replace(/\\/g,'/');
+    if(/^\\\\/.test(s))         return 'file://'+s.replace(/\\/g,'/');
+    if(/^[a-z][a-z0-9+.-]+:/i.test(s)) return s;
+    return s;
+  }
+
+  function openIsfCatalogue(){
+    const url=normaliseCatalogueUrl($('isfCatalogueUrl').value);
+    if(!url){ flash('Set the ISF Catalogue address first.'); return; }
+    // Both of the refusals below are the browser's rules, not ours. Saying so
+    // beats window.open() returning quietly and nothing appearing to happen —
+    // which is exactly what a blocked file:// link looks like from here.
+    if(/\.(cmd|bat|exe|ps1|sh|com|msi)(\?|#|$)/i.test(url)){
+      flash('A browser cannot launch a program. Point this at the catalogue\u2019s .html file instead.');
+      return;
+    }
+    if(/^file:/i.test(url)&&location.protocol!=='file:'){
+      flash('Blocked: MME is running from '+location.protocol+'//, and browsers refuse file:// links from a web page. Serve the catalogue over http:// and use that address.');
+      return;
+    }
+    const w=window.open(url,'_blank','noopener');
+    if(!w) flash('The browser blocked the new tab — allow pop-ups for MME, then try again.');
+  }
+  $('isfCatalogueBtn').addEventListener('click',openIsfCatalogue);
 
   // ── Setup ▸ IMPORT / EXPORT ▸ MIDI: Import .mid options ──────────
   // Insert's extras stay disabled (not hidden) while Replace all is selected,
