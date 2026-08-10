@@ -1847,7 +1847,7 @@
         <span class="pill">BPM</span>
         <span id="tempoVarBadge" class="var-badge">◆</span>
       </div>
-      <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="100" min="1" max="999"></div>
+      <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="100" min="1" max="9999"></div>
       <div class="group">
         <span class="lbl">Sig</span>
         <input type="number" id="tsNum" value="4" min="1" max="32">
@@ -2539,6 +2539,26 @@
     const tpb=segTicksPerBar(seg); return bar+1+(tickInBar>=tpb/2?1:0); }
   function contentW(){ return Math.max(200, Math.round(totalTicks()*state.pxPerTick)); }
   function prContentH(){ return NPITCH*state.noteHeight; }
+
+  // Longest song the Bars field will accept. 9999 bars is ~5.5 hours of 4/4
+  // at 120bpm — past any single piece this is for — while staying a bound
+  // rather than no bound at all.
+  const MAX_BARS=9999;
+
+  // Browsers silently clamp a layout box at 33,554,428px (2^25-4). Measured
+  // in Chrome, not folklore: ask for more and scrollWidth stops there, so the
+  // scroll spacer stops growing and the tail of a long song simply cannot be
+  // reached — with no error anywhere, which is the worst way for this to
+  // fail. The spacer is totalTicks * pxPerTick, so the length a project can
+  // reach and the depth it can zoom to trade against each other. Rather than
+  // cap length (the thing the user actually asked for), cap zoom, which
+  // nobody misses: even the reduced ceiling on a 100-minute show is still
+  // thousands of pixels per beat.
+  const MAX_SPACER_PX=33554428;
+  function maxPxPerTick(){
+    const t=totalTicks();
+    return t>0 ? Math.min(8,(MAX_SPACER_PX-GUTTER)/t) : 8;
+  }
   function tickToX(t){ return t*state.pxPerTick; }
   function xToTick(x){ return x/state.pxPerTick; }
   // GUTTER: a fixed visual inset (px) between the leftcol border and where
@@ -2678,6 +2698,12 @@
 
   // ---------- Sizing (virtualised: canvases are viewport-sized) ----------
   function resizeCanvases(){
+    // Enforced HERE rather than in zoomHAt because this is the one place the
+    // spacer is actually written — so a project loaded at a zoom its new
+    // length can't support, a PPQ change, or a Bars change is covered by the
+    // same line, not just the mouse-wheel path.
+    const capPPT=maxPxPerTick();
+    if(state.pxPerTick>capPPT) state.pxPerTick=capPPT;
     // +GUTTER: the drawn content is nudged right by GUTTER px (see beginPane's
     // callers), so the scrollable range needs the same extra room or the last
     // GUTTER px of the song would be pushed off-canvas and unreachable.
@@ -7806,7 +7832,7 @@
   $('quantEndBtn').addEventListener('click',e=>{ quantizeSelection('end', state.quantIterative||e.altKey); });
   $('quantIterBtn').addEventListener('click',()=>{ state.quantIterative=!state.quantIterative; $('quantIterBtn').classList.toggle('on',state.quantIterative); });
   $('bpm').addEventListener('input',e=>{ state.bpm=clamp(+e.target.value||120,20,400); state.tempoMap[0].bpm=state.bpm; updateDuration(); renderTsMapUI(); requestDraw(); flash('Tempo changed — re-export Sync Track if using Follow MMV'); });
-  $('bars').addEventListener('change',e=>{ state.bars=clamp(+e.target.value||4,1,999); updateDuration(); resizeCanvases(); });
+  $('bars').addEventListener('change',e=>{ state.bars=clamp(+e.target.value||4,1,MAX_BARS); updateDuration(); resizeCanvases(); });
   $('tsNum').addEventListener('change',e=>{ state.tsNum=clamp(+e.target.value||4,1,32); state.tsMap[0].num=state.tsNum; updateDuration(); resizeCanvases(); renderTsMapUI(); });
   $('tsDen').addEventListener('change',e=>{ state.tsDen=+e.target.value||4; state.tsMap[0].den=state.tsDen; updateDuration(); resizeCanvases(); renderTsMapUI(); });
   $('ppq').addEventListener('change',e=>{ state.ppq=clamp(+e.target.value||480,24,1920); updateDuration(); resizeCanvases(); });
@@ -7836,7 +7862,7 @@
   $('genLen').addEventListener('change',e=>{ state.genLen=e.target.value; if($('advLen')) $('advLen').value=state.genLen; });
   $('durDisp').addEventListener('click',()=>{ state.durMode=state.durMode==='hms'?'secs':'hms'; updateDuration(); });
   $('rulerMode').addEventListener('change',()=>{ state.rulerMode=$('rulerMode').value; requestDraw(); });
-  function zoomHAt(f, clientX){ const old=state.pxPerTick; const np=clamp(old*f,0.004,8); if(np===old) return;
+  function zoomHAt(f, clientX){ const old=state.pxPerTick; const np=clamp(old*f,0.004,maxPxPerTick()); if(np===old) return;
     const r=prScroll.getBoundingClientRect(); const mvx=(clientX==null)?prScroll.clientWidth/2:clamp(clientX-r.left,0,prScroll.clientWidth);
     const tickAtMouse=(state.scrollLeft+mvx-GUTTER)/old; state.pxPerTick=np; resizeCanvases();
     prScroll.scrollLeft=Math.max(0, tickAtMouse*np - mvx + GUTTER); state.scrollLeft=prScroll.scrollLeft; syncH(prScroll); applyTransforms(); updatePlayheadEl(); requestDraw(); }
@@ -8187,9 +8213,22 @@
     if(!audioBuf) return;
     const off=state.audioOffset||0;
     armUndo();
+    // The button's promise is "the loop matches the audio". When the audio
+    // runs past the end of the timeline this used to clamp to totalTicks()
+    // and quietly set a loop that stopped short — the same silent truncation
+    // that made a 100-minute file look like MME could only see half of it.
+    // Grow the song to fit instead, which is what the promise has to mean.
+    const endTick=Math.round(off+secondsToTicks(audioBuf.duration));
+    let grew=0;
+    if(endTick>totalTicks()){
+      const need=Math.min(MAX_BARS,Math.ceil(endTick/ticksPerBar())+1);
+      if(need>state.bars){ grew=need-state.bars; state.bars=need; syncInputs(); updateDuration(); resizeCanvases(); }
+    }
     state.locStart=clamp(Math.round(off),0,totalTicks());
-    state.locEnd=clamp(Math.round(off+secondsToTicks(audioBuf.duration)),0,totalTicks());
+    state.locEnd=clamp(endTick,0,totalTicks());
     commitUndo(); updateLoopStatus(); requestDraw();
+    if(grew) flash('Timeline extended by '+grew+' bar'+(grew===1?'':'s')+' to fit the audio.');
+    else if(endTick>totalTicks()) flash('Audio runs past the '+MAX_BARS+'-bar maximum — loop set to the end of the timeline.');
   });
   $('audioLoadBtn').onclick=()=>$('audioFileInput').click();
   $('audioClearBtn').addEventListener('click',()=>{ if(!audioBuf) return; clearAudio(); flash('Audio removed'); });

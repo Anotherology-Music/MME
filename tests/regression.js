@@ -97,6 +97,13 @@ function buildTestHtml() {
       '  window._TEST_setMidiInById = (id) => setMidiInById(id);',
       '  window._TEST_loadAudio = (file) => loadAudio(file);',
       '  window._TEST_audioBufDuration = () => (typeof audioBuf !== "undefined" && audioBuf) ? audioBuf.duration : null;',
+      // v0.9.44: long-song support. zoomHAt is the only place zoom is set, so
+      // driving it directly is the same path a Ctrl+wheel takes.
+      '  window._TEST_zoomH = (f) => zoomHAt(f, 700);',
+      '  window._TEST_maxPxPerTick = () => maxPxPerTick();',
+      '  window._TEST_MAX_BARS = () => MAX_BARS;',
+      '  window._TEST_MAX_SPACER_PX = () => MAX_SPACER_PX;',
+      '  window._TEST_spacerWidth = (which) => { const el = document.getElementById(which); const sp = el && el.querySelector(":scope > .spacer"); return sp ? { css: parseFloat(sp.style.width), scrollWidth: el.scrollWidth } : null; };',
       '  window._TEST_laneAudible = (id) => laneAudible(state.ccLanes.find(l => l.id === id));',
       '  window._TEST_buildPassEvents = (a, b) => buildPassEvents(a, b);',
       '  window._TEST_generate = (kind) => generate(kind);',
@@ -9485,6 +9492,105 @@ async function run() {
     const snap = await page.evaluate(() => JSON.stringify(window._TEST_snapshot()));
     check('the catalogue address is NOT saved into the project (it is a machine setting)',
       !/localhost:9999/.test(snap), snap.length);
+  });
+
+  // ---------------- v0.9.44: long songs (feature-length audio) ----------------
+
+  await withPage(browser, async (page) => {
+    // The reported limit: Bars stopped at 999, which at any usual tempo is
+    // well under half of a 100-minute show.
+    const cap = await page.evaluate(() => ({
+      max: document.getElementById('bars').max,
+      MAX_BARS: window._TEST_MAX_BARS(),
+    }));
+    check('the Bars field accepts far more than the old 999',
+      cap.max === '9999' && cap.MAX_BARS === 9999, cap);
+
+    const set = await page.evaluate(() => {
+      const el = document.getElementById('bars');
+      el.value = '9999'; el.dispatchEvent(new Event('change'));
+      return window._TEST_state.bars;
+    });
+    check('...and a 9999-bar song is actually accepted, not clamped back', set === 9999, set);
+
+    // A 100-minute show at 120bpm 4/4 is 3000 bars — the case that prompted
+    // this. It must be reachable, and reachable means the browser HONOURED
+    // the scroll spacer, not merely that we asked for it.
+    const long = await page.evaluate(() => {
+      const el = document.getElementById('bars');
+      el.value = '3000'; el.dispatchEvent(new Event('change'));
+      const sp = window._TEST_spacerWidth('prScroll');
+      return { bars: window._TEST_state.bars, sp, songSec: window._TEST_state.bars * 4 * (60 / window._TEST_state.bpm) };
+    });
+    check('a 3000-bar song (100 min at 120bpm) is accepted', long.bars === 3000 && long.songSec >= 6000, long);
+    check('...and the browser honours the full scroll width, so the end is reachable',
+      long.sp && long.sp.scrollWidth >= long.sp.css - 2, long.sp);
+
+    // The trap in raising the cap: spacer = totalTicks * pxPerTick, and a
+    // layout box silently stops growing at 33,554,428px. Zoom all the way in
+    // on a long song and the spacer must still be honoured.
+    const zoomed = await page.evaluate(() => {
+      for (let i = 0; i < 60; i++) window._TEST_zoomH(1.5); // way past the old ceiling of 8
+      const sp = window._TEST_spacerWidth('prScroll');
+      return { ppt: window._TEST_state.pxPerTick, max: window._TEST_maxPxPerTick(), sp, limit: window._TEST_MAX_SPACER_PX() };
+    });
+    check('zooming hard on a long song cannot push the spacer past the browser limit',
+      zoomed.sp.css <= zoomed.limit, zoomed);
+    check('...the spacer is still honoured at max zoom (the song end stays reachable)',
+      zoomed.sp.scrollWidth >= zoomed.sp.css - 2, zoomed.sp);
+    check('...and zoom stopped at the length-derived ceiling, not the old flat 8',
+      zoomed.ppt <= zoomed.max + 1e-9 && zoomed.max < 8, zoomed);
+
+    // ...while a short song is completely unaffected: it still reaches the
+    // original ceiling of 8, so this costs nothing in normal use.
+    const short = await page.evaluate(() => {
+      const el = document.getElementById('bars');
+      el.value = '100'; el.dispatchEvent(new Event('change'));
+      for (let i = 0; i < 60; i++) window._TEST_zoomH(1.5);
+      return { ppt: window._TEST_state.pxPerTick, max: window._TEST_maxPxPerTick() };
+    });
+    check('a normal-length song still zooms to the original maximum of 8',
+      Math.abs(short.ppt - 8) < 1e-9 && Math.abs(short.max - 8) < 1e-9, short);
+  });
+
+  await withPage(browser, async (page) => {
+    // "Set Loop to Audio" clamped the loop to totalTicks(), so with audio
+    // longer than the song it quietly set a loop that stopped short — the
+    // same silent truncation, in a second place.
+    const bytes = makeWavBytes(5);
+    await page.evaluate(() => {
+      const el = document.getElementById('bars');
+      el.value = '1'; el.dispatchEvent(new Event('change'));  // 1 bar = 2s at 120bpm
+    });
+    await page.evaluate((bytes) => {
+      const file = new File([new Uint8Array(bytes)], 'long.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(file);
+    }, bytes);
+    await page.waitForTimeout(200);
+
+    const before = await page.evaluate(() => ({
+      bars: window._TEST_state.bars, dur: window._TEST_audioBufDuration(),
+    }));
+    check('setup: 5s of audio against a 1-bar (2s) song', before.bars === 1 && before.dur === 5, before);
+
+    await page.click('#audioSetLoopBtn');
+    await page.waitForTimeout(100);
+    const after = await page.evaluate(() => ({
+      bars: window._TEST_state.bars,
+      locEnd: window._TEST_state.locEnd,
+      total: window._TEST_totalTicks(),
+      barsField: document.getElementById('bars').value,
+    }));
+    check('Set Loop to Audio grows the timeline to fit audio that outruns it',
+      after.bars >= 3, after);
+    check('...so the loop end reaches the real end of the audio, not the old song end',
+      after.locEnd > 960 * 2 && after.locEnd <= after.total, after);
+    check('...and the Bars field is updated to match', after.barsField === String(after.bars), after);
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(80);
+    const undone = await page.evaluate(() => window._TEST_state.bars);
+    check('...and growing the timeline is undoable in one step', undone === 1, undone);
   });
 
   await browser.close();
