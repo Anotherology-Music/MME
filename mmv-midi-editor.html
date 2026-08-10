@@ -1389,6 +1389,23 @@
   .ruler-row{height:26px;border-bottom:1px solid var(--line);}
   .ruler-row .leftcol{display:flex;align-items:center;justify-content:center;color:var(--txt2);font-size:10px;}
   .ruler-row .scroll{overflow-x:hidden;overflow-y:hidden;}
+  /* Section markers. Its own row rather than more freight on the ruler: the
+     ruler already stacks a time-signature and a tempo label per bar line, at
+     26px total, and a 37-section show would bury it. */
+  .marker-row{flex:0 0 auto;height:22px;border-bottom:1px solid var(--line);}
+  .marker-row .leftcol{display:flex;align-items:center;justify-content:center;gap:3px;}
+  .marker-row .leftcol button{font-size:9px;padding:1px 5px;}
+  .marker-row .scroll{overflow-x:hidden;overflow-y:hidden;}
+  /* The index: every marker as a numbered chip, always on screen even when its
+     position is scrolled far off it. This is what makes "jump to section 23"
+     a single click on a 100-minute timeline. */
+  .marker-bar{display:flex;flex-wrap:wrap;gap:3px;align-items:center;padding:4px 8px;
+    background:var(--panel3);border-bottom:1px solid var(--line);max-height:84px;overflow-y:auto;}
+  .marker-bar .mk-lbl{font-size:10px;color:var(--txt2);margin-right:2px;}
+  .marker-chip{font-size:10px;padding:2px 7px;border-radius:9px;background:#23272f;color:#9aa3b5;
+    border:1px solid var(--line2,#3a404e);cursor:pointer;white-space:nowrap;}
+  .marker-chip:hover{background:#1f3a5c;color:#cfe4ff;border-color:var(--accent);}
+  .marker-chip.cur{background:#1f3a5c;color:#cfe4ff;border-color:var(--accent);font-weight:600;}
   /* The top-left corner cell (was a static "bar" label) now holds three
      section-visibility toggles — hide the Piano Roll / Note Data / CC lanes to
      reclaim vertical space when focused on one or the other. Lit = shown. */
@@ -1807,8 +1824,10 @@
     <div class="transport-grp">
       <span class="lbl">Transport</span>
       <div class="btnrow">
+        <button id="prevMarkerBtn" title="Jump to the previous section marker (,)">|&#x25C0;&#x25C0;</button>
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
+        <button id="nextMarkerBtn" title="Jump to the next section marker (.)">&#x25B6;&#x25B6;|</button>
         <div id="recWrapper">
           <button id="recordBtn" title="Record incoming MIDI notes (R) — right-click to change channel, count-in, offset">
             <span class="recDot">⏺</span><span id="recChBadge">1</span>
@@ -2171,6 +2190,16 @@
       <div class="scroll" id="rulerScroll"><canvas id="rulerCanvas"></canvas></div>
     </div>
 
+    <div class="marker-bar" id="markerBar" style="display:none;"></div>
+
+    <div class="row marker-row" id="markerRow">
+      <div class="leftcol">
+        <button id="markerAddBtn" title="Drop a marker at the playhead (M)">&#x2691;+</button>
+        <button id="markerListBtn" title="Add many markers at once by pasting a list of times and names">List…</button>
+      </div>
+      <div class="scroll" id="markerScroll"><canvas id="markerCanvas"></canvas></div>
+    </div>
+
     <div class="row audio-row" id="audioRow">
       <div class="leftcol audio-leftcol">
         <div class="audio-name" id="audioFileName">No audio</div>
@@ -2449,6 +2478,11 @@
   const state = {
     bpm:120, ppq:480, bars:100, tsNum:4, tsDen:4, tsMap:[{tick:0,num:4,den:4}],
     tempoMap:[{tick:0,bpm:120}],
+    // Section markers: [{tick,name}], kept sorted by tick. Numbering is
+    // positional (marker 1 is the earliest), never stored — so inserting a
+    // section renumbers everything after it automatically, which is what you
+    // want when a show grows an extra scene.
+    markers:[],
     pxPerTick:0.18, noteHeight:11,
     defVel:100, defCh:0, ccRes:24, noteLen:'16',
     recCh:0, recCountIn:1, recording:false, recArmed:false, metronomeOn:false, recOffsetMs:0, quantIterative:false,
@@ -2720,6 +2754,7 @@
   const velScroll=$('velScroll'), velCanvas=$('velCanvas'), vctx=velCanvas.getContext('2d');
   const audioRow=$('audioRow'), audioScroll=$('audioScroll'), audioCanvas=$('audioCanvas'), actx=audioCanvas.getContext('2d');
   let audioCtx=null, audioSrc=null, audioGain=null, audioBuf=null, audioMuted=false, audioVolume=1;
+  const markerScroll=$('markerScroll'), markerCanvas=$('markerCanvas'), mctx=markerCanvas.getContext('2d');
   const phEl=$('playheadEl');
 
   function ensureSpacer(scrollEl){ let sp=scrollEl.querySelector(':scope > .spacer'); if(!sp){ sp=document.createElement('div'); sp.className='spacer'; scrollEl.insertBefore(sp, scrollEl.firstChild); } return sp; }
@@ -2739,6 +2774,7 @@
     const cw=contentW()+GUTTER;
     setSpacer(masterScroll, cw, 1);
     setSpacer(rulerScroll, cw, 1); rulerCanvas.width=rulerScroll.clientWidth||300; rulerCanvas.height=26;
+    setSpacer(markerScroll, cw, 1); markerCanvas.width=markerScroll.clientWidth||300; markerCanvas.height=markerScroll.clientHeight||22;
     setSpacer(audioScroll, cw, 1); audioCanvas.width=audioScroll.clientWidth||300; audioCanvas.height=audioRow.clientHeight||64;
     setSpacer(prScroll, cw, prContentH()); prCanvas.width=prScroll.clientWidth||300; prCanvas.height=prContentH();
     keysCanvas.width=state.keysW; keysCanvas.height=prContentH();
@@ -2748,12 +2784,27 @@
   }
   function applyTransforms(){ const tx='translateX('+(-state.scrollLeft)+'px)';
     // canvases sit in scrolled content; counter the scroll so they stay pinned, content is drawn with offset
-    rulerCanvas.style.transform=tx2(rulerScroll); audioCanvas.style.transform=tx2(audioScroll); prCanvas.style.transform=tx2(prScroll); velCanvas.style.transform=tx2(velScroll);
+    rulerCanvas.style.transform=tx2(rulerScroll); markerCanvas.style.transform=tx2(markerScroll); audioCanvas.style.transform=tx2(audioScroll); prCanvas.style.transform=tx2(prScroll); velCanvas.style.transform=tx2(velScroll);
     state.ccLanes.forEach(l=>{ if(l._canvas) l._canvas.style.transform=tx2(l._scroll); });
   }
   // canvas is absolute at content origin; translate it by +scroll to keep in viewport (horizontal), and (piano) +scrollTop handled natively
   function tx2(sc){ return 'translate('+sc.scrollLeft+'px,0px)'; }
-  function updatePlayheadEl(){ if(phEl) phEl.style.transform='translateX('+(tickToX(state.playhead)-state.scrollLeft+GUTTER)+'px)'; }
+  function updatePlayheadEl(){ if(phEl) phEl.style.transform='translateX('+(tickToX(state.playhead)-state.scrollLeft+GUTTER)+'px)';
+    refreshMarkerCurrent(); }
+  // Which numbered chip is lit follows the playhead through playback, but the
+  // DOM is only touched when the answer actually changes — this runs every
+  // frame, and rebuilding 37 chips per frame to move one highlight would be
+  // real work for no visible difference.
+  let markerChipEls=[], markerCurIdx=-1;
+  function refreshMarkerCurrent(){
+    if(!markerChipEls.length) return;
+    let idx=-1;
+    for(let i=0;i<state.markers.length;i++){ if(state.markers[i].tick<=state.playhead+1) idx=i; else break; }
+    if(idx===markerCurIdx) return;
+    if(markerChipEls[markerCurIdx]) markerChipEls[markerCurIdx].classList.remove('cur');
+    if(markerChipEls[idx]) markerChipEls[idx].classList.add('cur');
+    markerCurIdx=idx;
+  }
   // Scroll Lock: once the playhead reaches the middle of the viewport it
   // stays pinned there and the timeline scrolls underneath it instead.
   // Only nudges the scroll when the playhead is past center or has gone
@@ -2772,13 +2823,13 @@
 
   // ---------- Scroll sync ----------
   let syncing=false;
-  function hScrollers(){ return [rulerScroll, audioScroll, prScroll, velScroll, masterScroll, ...state.ccLanes.map(l=>l._scroll)].filter(Boolean); }
+  function hScrollers(){ return [rulerScroll, markerScroll, audioScroll, prScroll, velScroll, masterScroll, ...state.ccLanes.map(l=>l._scroll)].filter(Boolean); }
   function syncH(src){ if(syncing) return; syncing=true; state.scrollLeft=src.scrollLeft;
     hScrollers().forEach(s=>{ if(s!==src) s.scrollLeft=src.scrollLeft; }); syncing=false; }
   function onHScroll(src){ if(!syncing) syncH(src); state.scrollLeft=src.scrollLeft; applyTransforms(); updatePlayheadEl(); requestDraw(); }
   prScroll.addEventListener('scroll',()=>{ state.scrollTop=prScroll.scrollTop;
     keysCanvas.style.transform='translateY('+(-prScroll.scrollTop)+'px)'; onHScroll(prScroll); });
-  [rulerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
+  [rulerScroll,markerScroll,velScroll,masterScroll].forEach(s=>s.addEventListener('scroll',()=>onHScroll(s)));
 
   // ---------- Pane resize (grips) ----------
   // A CC lane is row 1 (Toggle/CC/Name/Channel/Colour/Move — always visible,
@@ -2814,6 +2865,7 @@
     lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points,isf:l.isf||null})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     tempoMap:state.tempoMap,
+    markers:state.markers||[],
     isfHistory:state.isfHistory||[],
     // Macro definitions. The per-note fields (macroId/macroInst/macroAt/
     // macroMap) and the per-point {mi:…} instance tags need no entry of their
@@ -2843,6 +2895,9 @@
     // Old projects (pre-v0.9.29) have no tempoMap at all — synthesize a
     // single tick-0 entry from their flat bpm so they still load correctly.
     state.tempoMap=o.tempoMap||[{tick:0,bpm:o.bpm}];
+    // Projects saved before markers existed have no key at all; an empty list
+    // is the right reading, and keeps undo of a marker edit symmetrical.
+    state.markers=Array.isArray(o.markers)?o.markers:[];
     state.locStart=o.locS; state.locEnd=o.locE; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
     state.projectName=o.projectName||''; if($('projectName')) $('projectName').value=state.projectName;
     if(o.isfHistory) state.isfHistory=o.isfHistory;
@@ -2894,7 +2949,7 @@
     // so filtering is a no-op there and a real fix for undo/redo.
     const validNoteIds=new Set(state.notes.map(n=>n.id));
     state.selection=new Set([...state.selection].filter(id=>validNoteIds.has(id)));
-    syncInputs(); updateLoopStatus(); updateDuration(); renderMacroList(); resizeCanvases(); }
+    syncInputs(); updateLoopStatus(); updateDuration(); renderMacroList(); renderMarkerBar(); resizeCanvases(); }
   // ---------- Undo/redo view preservation ----------
   // applyState() necessarily tears down and rebuilds every lane's DOM (see
   // its own comment above on why — points/lanes are wholesale-replaced
@@ -3014,7 +3069,7 @@
       if(advPanel&&advPanel.style.display!=='none'&&typeof window._drawAbPreview==='function') window._drawAbPreview();
     });
   }
-  function drawAll(){ drawRuler(); drawAudioWave(); drawKeys(); drawPiano(); drawVel(); state.ccLanes.forEach(drawLane); }
+  function drawAll(){ drawRuler(); drawMarkerRow(); drawAudioWave(); drawKeys(); drawPiano(); drawVel(); state.ccLanes.forEach(drawLane); }
   function beginPane(ctx,cv){ ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,cv.width,cv.height); ctx.setTransform(1,0,0,1,-state.scrollLeft,0); }
   let cssCache={};
   function getCss(v){ if(cssCache[v]) return cssCache[v]; return cssCache[v]=getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
@@ -8194,6 +8249,314 @@
     e.target.value=''; });
   restoreProjDir();
 
+  // ---------- Section markers ----------
+  // Kept sorted by tick at all times, so "marker N" is simply markers[N-1],
+  // and prev/next is a scan rather than a search through unordered data.
+  function sortMarkers(){ state.markers.sort((a,b)=>a.tick-b.tick); }
+
+  function addMarker(tick,name){
+    tick=clamp(Math.round(tick),0,totalTicks());
+    // Two markers on one tick would be indistinguishable both to a click and
+    // to prev/next, so a repeat drop at the same spot renames instead of
+    // stacking an unreachable duplicate underneath.
+    const dupe=state.markers.find(m=>m.tick===tick);
+    if(dupe){ if(name) dupe.name=name; sortMarkers(); return dupe; }
+    const m={tick,name:name||''};
+    state.markers.push(m); sortMarkers();
+    return m;
+  }
+
+  // An unnamed marker falls back to its position in the list, resolved at
+  // render time rather than stored — see state.markers' own note on why
+  // numbering is never persisted.
+  function markerLabel(m){ return (m.name||'').trim()||('Marker '+(state.markers.indexOf(m)+1)); }
+
+  function jumpToMarker(m){
+    if(!m) return;
+    seekPlayhead(m.tick);
+    scrollTickIntoView(m.tick);
+    renderMarkerBar();
+    flash(markerLabel(m)+' — '+fmtClockHundredths(tickToSeconds(m.tick)));
+  }
+
+  // Nearest marker strictly before / after the playhead. "Strictly" is the
+  // whole point: parked exactly on marker 5, Previous has to reach 4 rather
+  // than refuse to move because 5 counts as "at or before" the playhead.
+  function gotoAdjacentMarker(dir){
+    if(!state.markers.length){ flash('No markers yet — press M to drop one at the playhead.'); return; }
+    const t=state.playhead, EPS=1;
+    const m=dir<0
+      ? [...state.markers].reverse().find(x=>x.tick<t-EPS)
+      : state.markers.find(x=>x.tick>t+EPS);
+    if(!m){ flash(dir<0?'Already at the first marker.':'Already at the last marker.'); return; }
+    jumpToMarker(m);
+  }
+
+  // Lands the tick about a third in from the left rather than hard against
+  // the edge, so arriving at a section shows what follows it.
+  function scrollTickIntoView(tick){
+    const viewW=prScroll.clientWidth||600;
+    const target=clamp(tickToX(tick)-viewW/3,0,Math.max(0,contentW()+GUTTER-viewW));
+    hScrollers().forEach(s=>{ s.scrollLeft=target; });
+    state.scrollLeft=target; applyTransforms(); updatePlayheadEl(); requestDraw();
+  }
+
+  function removeMarker(m){ const i=state.markers.indexOf(m); if(i>=0) state.markers.splice(i,1); }
+
+  // -- The numbered index bar --------------------------------------
+  function renderMarkerBar(){
+    const bar=$('markerBar'); if(!bar) return;
+    bar.innerHTML='';
+    markerChipEls=[]; markerCurIdx=-1;
+    if(!state.markers.length){ bar.style.display='none'; return; }
+    bar.style.display='';
+    const lbl=document.createElement('span'); lbl.className='mk-lbl'; lbl.textContent='Markers:';
+    bar.appendChild(lbl);
+    // "Current" is the last marker at or before the playhead — the section
+    // you are actually inside, which is the one worth lighting up.
+    let curIdx=-1;
+    state.markers.forEach((m,i)=>{ if(m.tick<=state.playhead+1) curIdx=i; });
+    markerCurIdx=curIdx;
+    state.markers.forEach((m,i)=>{
+      const chip=document.createElement('button');
+      chip.type='button';
+      chip.className='marker-chip'+(i===curIdx?' cur':'');
+      chip.textContent=String(i+1);
+      chip.title=markerLabel(m)+' — '+fmtClockHundredths(tickToSeconds(m.tick))
+        +'\nClick to jump · right-click to rename or delete';
+      chip.addEventListener('click',()=>jumpToMarker(m));
+      chip.addEventListener('contextmenu',ev=>{ ev.preventDefault(); editMarker(m); });
+      bar.appendChild(chip); markerChipEls.push(chip);
+    });
+  }
+
+  function editMarker(m){
+    const v=prompt('Marker name (blank = numbered; type "delete" to remove it):',(m.name||'').trim());
+    if(v===null) return;
+    pushUndo();
+    if(v.trim().toLowerCase()==='delete'){ removeMarker(m); flash('Marker deleted'); }
+    else m.name=v.trim();
+    renderMarkerBar(); requestDraw();
+  }
+
+  // -- The timeline row --------------------------------------------
+  const MARKER_HIT_PAD=5, MARKER_PLATE_MAX=220;
+  function markerPlateW(m){ return Math.min(mctx.measureText(markerLabel(m)).width+8,MARKER_PLATE_MAX); }
+  function markerAtX(x){
+    // Right-to-left, so where two flags overlap at low zoom the click takes
+    // whichever was drawn on top.
+    for(let i=state.markers.length-1;i>=0;i--){
+      const m=state.markers[i], mx=tickToX(m.tick);
+      if(x>=mx-MARKER_HIT_PAD&&x<=mx+markerPlateW(m)) return m;
+    }
+    return null;
+  }
+  function markerLocalX(e){
+    const r=markerScroll.getBoundingClientRect();
+    return e.clientX-r.left+state.scrollLeft-GUTTER;
+  }
+
+  function drawMarkerRow(){
+    const cv=markerCanvas, ctx=mctx, w=cv.width, h=cv.height; beginPane(ctx,cv);
+    const sx=state.scrollLeft;
+    ctx.fillStyle=getCss('--panel3'); ctx.fillRect(sx,0,w,h);
+    ctx.translate(GUTTER,0);
+    ctx.font='10px system-ui'; ctx.textBaseline='middle'; ctx.textAlign='left';
+    if(!state.markers.length){
+      ctx.fillStyle=getCss('--txt2');
+      ctx.fillText('Section markers — press M, or double-click here, to add one',sx+8,h/2);
+      return;
+    }
+    const t0=xToTick(sx), t1=xToTick(sx+w);
+    // Culled by tick span rather than by index: a 37-section show at working
+    // zoom has two or three on screen and there is no reason to lay out 34
+    // labels nobody can see. The pad is one plate's worth of ticks, so a
+    // marker just off the left edge still draws its label into view.
+    const padT=MARKER_PLATE_MAX/Math.max(state.pxPerTick,1e-6);
+    state.markers.forEach((m,i)=>{
+      if(m.tick<t0-padT||m.tick>t1) return;
+      const x=Math.round(tickToX(m.tick));
+      const label=(i+1)+'. '+markerLabel(m);
+      const plateW=Math.min(ctx.measureText(label).width+8,MARKER_PLATE_MAX);
+      ctx.fillStyle=getCss('--accent2');
+      ctx.fillRect(x,1,plateW,h-3);
+      ctx.fillRect(x,0,2,h);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x,0,plateW,h); ctx.clip();
+      ctx.fillStyle='#2a1c00';
+      ctx.fillText(label,x+5,h/2+0.5);
+      ctx.restore();
+    });
+  }
+
+  let markerDrag=null;
+  markerCanvas.addEventListener('mousedown',e=>{
+    if(e.button===2) return;
+    const m=markerAtX(markerLocalX(e));
+    if(!m) return;
+    markerDrag={m,startX:e.clientX,moved:false};
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove',e=>{
+    if(!markerDrag) return;
+    if(!markerDrag.moved){
+      if(Math.abs(e.clientX-markerDrag.startX)<3) return;
+      markerDrag.moved=true; pushUndo();
+    }
+    const raw=xToTick(markerLocalX(e));
+    markerDrag.m.tick=clamp(Math.round(e.shiftKey?raw:snapT(raw)),0,totalTicks());
+    sortMarkers(); renderMarkerBar(); requestDraw();
+  });
+  window.addEventListener('mouseup',()=>{
+    if(!markerDrag) return;
+    // A press that never moved is a jump. Going to a flag you can already see
+    // is far and away the most common thing to want from it.
+    if(!markerDrag.moved) jumpToMarker(markerDrag.m);
+    markerDrag=null;
+  });
+  markerCanvas.addEventListener('dblclick',e=>{
+    const x=markerLocalX(e);
+    if(markerAtX(x)) return; // on a flag, that was two jumps, not a new marker
+    pushUndo();
+    addMarker(e.shiftKey?xToTick(x):snapT(xToTick(x)),'');
+    renderMarkerBar(); requestDraw();
+  });
+  markerCanvas.addEventListener('contextmenu',e=>{
+    const m=markerAtX(markerLocalX(e));
+    if(!m) return;
+    e.preventDefault(); editMarker(m);
+  });
+  markerCanvas.addEventListener('mousemove',e=>{
+    if(markerDrag) return;
+    markerCanvas.style.cursor=markerAtX(markerLocalX(e))?'grab':'default';
+  });
+
+  function addMarkerAtPlayhead(){
+    pushUndo();
+    const m=addMarker(state.playhead,'');
+    renderMarkerBar(); requestDraw();
+    flash(markerLabel(m)+' added at '+fmtClockHundredths(tickToSeconds(m.tick)));
+  }
+  $('markerAddBtn').addEventListener('click',addMarkerAtPlayhead);
+  $('prevMarkerBtn').addEventListener('click',()=>gotoAdjacentMarker(-1));
+  $('nextMarkerBtn').addEventListener('click',()=>gotoAdjacentMarker(1));
+
+  // -- Bulk entry --------------------------------------------------
+  // Placing 37 markers by hand, each needing a name, is the kind of chore
+  // that stops a feature being used. One paste of a track listing does it.
+  // Accepts a time and a name per line, either order, separated by a comma,
+  // tab, or run of spaces:  "3:24 Faultline" / "Faultline, 3:24" /
+  // "1:02:15  Curtain Call". Bare seconds and h:mm:ss both work.
+  function parseMarkerList(text){
+    const out=[], bad=[];
+    const TIME='(\\d{1,2}:\\d{1,2}(?::\\d{1,2})?(?:\\.\\d+)?|\\d+(?:\\.\\d+)?)';
+    String(text||'').split(/\r?\n/).forEach(function(rawLine,idx){
+      const line=rawLine.trim();
+      if(!line||/^[#;]/.test(line)) return;               // blank / commented out
+      // Anchored to the start or the end of the line. A loose search would
+      // take the "19" out of "Chapter 19" and site that marker at 19 seconds.
+      let timeStr=null,name='';
+      let m=line.match(new RegExp('^'+TIME+'[\\s,\\t]+(.*)$'));
+      if(m){ timeStr=m[1]; name=m[2]; }
+      else{
+        m=line.match(new RegExp('^(.*?)[\\s,\\t]+'+TIME+'$'));
+        if(m){ name=m[1]; timeStr=m[2]; }
+        else if(new RegExp('^'+TIME+'$').test(line)) timeStr=line;
+      }
+      if(timeStr==null){ bad.push({line:idx+1,text:line}); return; }
+      const parts=timeStr.split(':').map(Number);
+      let sec=0;
+      if(parts.length===3) sec=parts[0]*3600+parts[1]*60+parts[2];
+      else if(parts.length===2) sec=parts[0]*60+parts[1];
+      else sec=parts[0];
+      if(!isFinite(sec)||sec<0){ bad.push({line:idx+1,text:line}); return; }
+      out.push({sec:sec,name:name.replace(/^[\s,\t"']+|[\s,\t"']+$/g,'')});
+    });
+    return {entries:out,bad:bad};
+  }
+
+  function showMarkerListDialog(){
+    const existing=document.getElementById('markerListDialog');
+    if(existing) existing.remove();
+    const dlg=document.createElement('dialog');
+    dlg.id='markerListDialog';
+    dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+      +'width:min(560px,94vw);max-height:88vh;overflow:hidden;display:flex;flex-direction:column;';
+    const hdr=document.createElement('div');
+    hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;';
+    hdr.innerHTML='<div style="font-size:14px;font-weight:700;color:#e0e4ef;">&#x2691; Add markers from a list</div>'
+      +'<div style="font-size:11px;color:#7a8099;margin-top:4px;">One section per line: a time and a name, in either order, separated by a comma, a tab or spaces. '
+      +'<code>m:ss</code>, <code>h:mm:ss</code> and plain seconds all work. Lines starting <code>#</code> are ignored.</div>';
+    dlg.appendChild(hdr);
+    const ta=document.createElement('textarea');
+    ta.id='markerListText';
+    ta.style.cssText='margin:12px 18px;flex:1;min-height:200px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;'
+      +'border-radius:4px;padding:8px;font-family:monospace;font-size:12px;resize:vertical;';
+    ta.placeholder='0:00  Overture\n3:24  Chapter 1 - Built For Good\n7:05  Bridge 2';
+    dlg.appendChild(ta);
+    const status=document.createElement('div');
+    status.id='markerListStatus';
+    status.style.cssText='padding:0 18px 8px;font-size:11px;color:#7a8099;min-height:15px;';
+    dlg.appendChild(status);
+    const foot=document.createElement('div');
+    foot.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;align-items:center;gap:8px;';
+    const replaceLbl=document.createElement('label');
+    replaceLbl.style.cssText='display:flex;align-items:center;gap:5px;font-size:11px;color:#7a8099;cursor:pointer;';
+    const replaceCb=document.createElement('input'); replaceCb.type='checkbox'; replaceCb.id='markerListReplace';
+    replaceLbl.appendChild(replaceCb);
+    replaceLbl.appendChild(document.createTextNode('replace existing markers'));
+    const spacer=document.createElement('span'); spacer.style.flex='1';
+    const cancelBtn=document.createElement('button'); cancelBtn.textContent='Cancel';
+    cancelBtn.style.cssText='background:#262b34;color:#c8cdd8;border:1px solid #3a404e;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;';
+    const addBtn=document.createElement('button'); addBtn.textContent='Add markers'; addBtn.id='markerListAdd';
+    addBtn.style.cssText='background:#1f3a5c;color:#cfe4ff;border:1px solid #4fa3ff;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;font-weight:600;';
+    foot.appendChild(replaceLbl); foot.appendChild(spacer); foot.appendChild(cancelBtn); foot.appendChild(addBtn);
+    dlg.appendChild(foot);
+
+    function preview(){
+      const r=parseMarkerList(ta.value);
+      const last=r.entries.length?r.entries[r.entries.length-1]:null;
+      status.textContent=r.entries.length
+        ? r.entries.length+' marker'+(r.entries.length===1?'':'s')+' recognised'
+          +(last?', last at '+fmtClockHundredths(last.sec):'')
+          +(r.bad.length?' — '+r.bad.length+' line(s) not understood: '+r.bad.slice(0,2).map(b=>'"'+b.text+'"').join(', '):'')
+        : (ta.value.trim()?'Nothing recognised yet — every line needs a time.':'');
+      status.style.color=r.bad.length?'#ffb454':'#7a8099';
+      addBtn.disabled=!r.entries.length;
+      addBtn.style.opacity=r.entries.length?'1':'0.45';
+    }
+    ta.addEventListener('input',preview);
+
+    cancelBtn.addEventListener('click',()=>{ dlg.close(); dlg.remove(); });
+    dlg.addEventListener('cancel',()=>dlg.remove());
+    addBtn.addEventListener('click',()=>{
+      const r=parseMarkerList(ta.value);
+      if(!r.entries.length) return;
+      pushUndo();
+      if(replaceCb.checked) state.markers=[];
+      // Grow the song if the listing runs past its end, for the same reason
+      // Set Loop to Audio does: silently dropping the back half of a show is
+      // never the answer anyone wanted.
+      const lastTick=Math.round(secondsToTicks(r.entries[r.entries.length-1].sec));
+      let grew=0;
+      if(lastTick>totalTicks()){
+        const need=Math.min(MAX_BARS,Math.ceil(lastTick/ticksPerBar())+1);
+        if(need>state.bars){ grew=need-state.bars; state.bars=need; syncInputs(); updateDuration(); resizeCanvases(); }
+      }
+      r.entries.forEach(en=>addMarker(secondsToTicks(en.sec),en.name));
+      renderMarkerBar(); requestDraw();
+      dlg.close(); dlg.remove();
+      flash('Added '+r.entries.length+' marker'+(r.entries.length===1?'':'s')
+        +(grew?' — timeline extended by '+grew+' bars':'')+'.');
+    });
+
+    document.body.appendChild(dlg);
+    preview();
+    dlg.showModal();
+    ta.focus();
+  }
+  $('markerListBtn').addEventListener('click',showMarkerListDialog);
+
   // ---------- Audio track ----------
   async function loadAudio(file){
     if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
@@ -8347,6 +8710,11 @@
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
     if(e.code==='Numpad0'){ e.preventDefault(); seekPlayhead(state.lastPlayStart||0); return; }
     if(e.key==='.'){ e.preventDefault(); seekPlayhead(0); return; }
+    // < and > read like the transport's own |<< and >>| buttons. Plain , and
+    // . were not available: . already seeks to zero.
+    if(e.key==='<'){ e.preventDefault(); gotoAdjacentMarker(-1); return; }
+    if(e.key==='>'){ e.preventDefault(); gotoAdjacentMarker(1); return; }
+    if(!ctrl && e.key.toLowerCase()==='m'){ e.preventDefault(); addMarkerAtPlayhead(); return; }
     if(!ctrl && e.key.toLowerCase()==='r'){ e.preventDefault(); toggleRecord(); return; }
     if(!ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); toggleMetronome(); return; }
     if(!ctrl && e.key.toLowerCase()==='q'){ e.preventDefault(); quantizeSelection(e.shiftKey?'end':'start', state.quantIterative||e.altKey); return; }
@@ -11133,6 +11501,7 @@
   // ---------- Init ----------
   function init(){
     schedWorker=makeWorker();
+    renderMarkerBar();
     // Setup panel toggle
     // Opening Setup re-reads the playhead / View CH / channel names, the same
     // way the TS and Tempo panels below re-seed their bar field on open —
