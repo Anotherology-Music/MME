@@ -97,6 +97,14 @@ function buildTestHtml() {
       '  window._TEST_setMidiInById = (id) => setMidiInById(id);',
       '  window._TEST_loadAudio = (file) => loadAudio(file);',
       '  window._TEST_audioBufDuration = () => (typeof audioBuf !== "undefined" && audioBuf) ? audioBuf.duration : null;',
+      // v0.9.45 section markers. All top-level, alongside state.
+      '  window._TEST_markers = () => JSON.parse(JSON.stringify(state.markers || []));',
+      '  window._TEST_addMarker = (tick, name) => { addMarker(tick, name); renderMarkerBar(); requestDraw(); };',
+      '  window._TEST_addMarkerAtPlayhead = () => addMarkerAtPlayhead();',
+      '  window._TEST_parseMarkerList = (t) => parseMarkerList(t);',
+      '  window._TEST_gotoAdjacentMarker = (d) => gotoAdjacentMarker(d);',
+      '  window._TEST_markerLabel = (i) => markerLabel(state.markers[i]);',
+      '  window._TEST_setMarkers = (ms) => { state.markers = ms; renderMarkerBar(); requestDraw(); };',
       // v0.9.44: long-song support. zoomHAt is the only place zoom is set, so
       // driving it directly is the same path a Ctrl+wheel takes.
       '  window._TEST_zoomH = (f) => zoomHAt(f, 700);',
@@ -9591,6 +9599,211 @@ async function run() {
     await page.waitForTimeout(80);
     const undone = await page.evaluate(() => window._TEST_state.bars);
     check('...and growing the timeline is undoable in one step', undone === 1, undone);
+  });
+
+  // ---------------- v0.9.45: section markers ----------------
+
+  await withPage(browser, async (page) => {
+    const ui = await page.evaluate(() => ({
+      row: !!document.getElementById('markerRow'),
+      canvas: !!document.getElementById('markerCanvas'),
+      prev: (document.getElementById('prevMarkerBtn') || {}).textContent,
+      next: (document.getElementById('nextMarkerBtn') || {}).textContent,
+      barHidden: getComputedStyle(document.getElementById('markerBar')).display === 'none',
+    }));
+    check('the timeline gains a marker row and the transport gains |<< and >>|',
+      ui.row && ui.canvas && /◀◀/.test(ui.prev) && /▶▶/.test(ui.next), ui);
+    check('the marker index bar takes no space until there is a marker', ui.barHidden, ui);
+
+    // Sorted on insert, so "marker N" is positional and prev/next is a scan.
+    const sorted = await page.evaluate(() => {
+      window._TEST_addMarker(3840, 'Third');
+      window._TEST_addMarker(0, 'First');
+      window._TEST_addMarker(1920, 'Second');
+      return window._TEST_markers().map(m => m.tick + ':' + m.name);
+    });
+    check('markers are kept sorted by tick however they are added',
+      sorted.join(',') === '0:First,1920:Second,3840:Third', sorted);
+
+    const shown = await page.evaluate(() => ({
+      hidden: getComputedStyle(document.getElementById('markerBar')).display === 'none',
+      chips: [...document.querySelectorAll('.marker-chip')].map(c => c.textContent),
+    }));
+    check('...and the index bar appears, numbered by position', !shown.hidden && shown.chips.join(',') === '1,2,3', shown);
+
+    // Numbering is positional and never stored, so inserting a section
+    // renumbers everything after it — what you want when a show gains a scene.
+    const renum = await page.evaluate(() => {
+      window._TEST_addMarker(960, 'Inserted');
+      return {
+        chips: [...document.querySelectorAll('.marker-chip')].map(c => c.textContent),
+        names: window._TEST_markers().map(m => m.name),
+      };
+    });
+    check('inserting a marker renumbers the ones after it automatically',
+      renum.chips.join(',') === '1,2,3,4' && renum.names.join(',') === 'First,Inserted,Second,Third', renum);
+
+    // A second drop on an occupied tick would be unreachable underneath the
+    // first, so it renames instead of stacking.
+    const dupe = await page.evaluate(() => {
+      window._TEST_addMarker(0, 'Renamed');
+      return window._TEST_markers();
+    });
+    check('dropping a marker on an occupied tick renames rather than stacking an unreachable duplicate',
+      dupe.length === 4 && dupe[0].name === 'Renamed', dupe);
+  });
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => window._TEST_setMarkers([
+      { tick: 0, name: 'A' }, { tick: 1920, name: 'B' }, { tick: 3840, name: 'C' },
+    ]));
+
+    // Clicking a number jumps to it — the whole point of the index bar.
+    await page.evaluate(() => { document.querySelectorAll('.marker-chip')[2].click(); });
+    await page.waitForTimeout(120);
+    const jumped = await page.evaluate(() => window._TEST_state.playhead);
+    check('clicking a numbered chip moves the playhead to that marker', jumped === 3840, jumped);
+
+    // "Strictly before" is what makes Previous usable: sitting exactly on
+    // marker 3, it must reach 2 rather than refuse to move.
+    await page.click('#prevMarkerBtn');
+    await page.waitForTimeout(120);
+    const prev1 = await page.evaluate(() => window._TEST_state.playhead);
+    check('|<< from exactly on a marker steps to the previous one, not itself', prev1 === 1920, prev1);
+
+    await page.click('#prevMarkerBtn');
+    await page.waitForTimeout(120);
+    const prev2 = await page.evaluate(() => window._TEST_state.playhead);
+    check('|<< again reaches the first marker', prev2 === 0, prev2);
+
+    await page.click('#prevMarkerBtn');
+    await page.waitForTimeout(120);
+    const atStart = await page.evaluate(() => ({
+      playhead: window._TEST_state.playhead,
+      msg: document.getElementById('stCtx').textContent,
+    }));
+    check('|<< at the first marker holds position and says so',
+      atStart.playhead === 0 && /first marker/i.test(atStart.msg), atStart);
+
+    await page.click('#nextMarkerBtn');
+    await page.waitForTimeout(120);
+    const next1 = await page.evaluate(() => window._TEST_state.playhead);
+    check('>>| steps forward to the next marker', next1 === 1920, next1);
+
+    // From a position between markers, not on one.
+    const between = await page.evaluate(() => {
+      window._TEST_state.playhead = 2500;
+      window._TEST_gotoAdjacentMarker(-1);
+      return window._TEST_state.playhead;
+    });
+    check('|<< from between two markers lands on the earlier one', between === 1920, between);
+
+    const noMarkers = await page.evaluate(() => {
+      window._TEST_setMarkers([]);
+      window._TEST_gotoAdjacentMarker(1);
+      return document.getElementById('stCtx').textContent;
+    });
+    check('with no markers at all, the transport buttons explain rather than doing nothing',
+      /no markers/i.test(noMarkers), noMarkers);
+  });
+
+  await withPage(browser, async (page) => {
+    // The list parser. 37 sections by hand is what stops a feature being used.
+    const r = await page.evaluate(() => ({
+      timeFirst: window._TEST_parseMarkerList('3:24 Faultline'),
+      nameFirst: window._TEST_parseMarkerList('Faultline, 3:24'),
+      hms: window._TEST_parseMarkerList('1:02:15 Curtain Call'),
+      bare: window._TEST_parseMarkerList('90 Ninety Seconds'),
+      timeOnly: window._TEST_parseMarkerList('2:30'),
+      tabbed: window._TEST_parseMarkerList('0:00\tOverture'),
+      comment: window._TEST_parseMarkerList('# not a marker\n0:10 Real'),
+      junk: window._TEST_parseMarkerList('this line has no time'),
+      // The trap: a loose time search would take the "19" out of the NAME and
+      // site this marker at 19 seconds instead of an hour in.
+      chapter19: window._TEST_parseMarkerList('Chapter 19 Curtain Call, 1:02:15'),
+    }));
+    check('"3:24 Faultline" parses as time-then-name',
+      r.timeFirst.entries.length === 1 && r.timeFirst.entries[0].sec === 204 && r.timeFirst.entries[0].name === 'Faultline', r.timeFirst);
+    check('"Faultline, 3:24" parses as name-then-time',
+      r.nameFirst.entries.length === 1 && r.nameFirst.entries[0].sec === 204 && r.nameFirst.entries[0].name === 'Faultline', r.nameFirst);
+    check('h:mm:ss is understood', r.hms.entries[0].sec === 3735 && r.hms.entries[0].name === 'Curtain Call', r.hms);
+    check('bare seconds are understood', r.bare.entries[0].sec === 90, r.bare);
+    check('a time on its own is a valid (unnamed) marker',
+      r.timeOnly.entries.length === 1 && r.timeOnly.entries[0].name === '', r.timeOnly);
+    check('tab-separated lines work', r.tabbed.entries[0].name === 'Overture', r.tabbed);
+    check('# comment lines are skipped without being counted as errors',
+      r.comment.entries.length === 1 && r.comment.bad.length === 0, r.comment);
+    check('a line with no time at all is reported rather than silently dropped',
+      r.junk.entries.length === 0 && r.junk.bad.length === 1, r.junk);
+    check('a NAME containing digits does not get mistaken for the time',
+      r.chapter19.entries.length === 1 && r.chapter19.entries[0].sec === 3735
+      && r.chapter19.entries[0].name === 'Chapter 19 Curtain Call', r.chapter19);
+  });
+
+  await withPage(browser, async (page) => {
+    // Bulk import through the real dialog, and it must grow the song rather
+    // than silently dropping sections past the end.
+    await page.evaluate(() => {
+      const el = document.getElementById('bars');
+      el.value = '4'; el.dispatchEvent(new Event('change'));   // 8 seconds of song
+      window._TEST_setMarkers([]);
+    });
+    await page.click('#markerListBtn');
+    await page.waitForTimeout(200);
+    await page.fill('#markerListText', '0:00 Overture\n3:24 Chapter One\n7:05 Bridge Two');
+    await page.waitForTimeout(150);
+    const status = await page.textContent('#markerListStatus');
+    check('the dialog previews how many markers it recognised before committing',
+      /3 markers recognised/.test(status), status);
+
+    await page.click('#markerListAdd');
+    await page.waitForTimeout(400);
+    const done = await page.evaluate(() => ({
+      markers: window._TEST_markers(),
+      bars: window._TEST_state.bars,
+      chips: [...document.querySelectorAll('.marker-chip')].length,
+      gone: !document.getElementById('markerListDialog'),
+    }));
+    check('pasting a track listing creates every marker in one go',
+      done.markers.length === 3 && done.chips === 3 && done.gone, done);
+    check('...named from the list', done.markers.map(m => m.name).join(',') === 'Overture,Chapter One,Bridge Two', done.markers);
+    check('...and the timeline grows so sections past the old end are not silently dropped',
+      done.bars > 4, { bars: done.bars, was: 4 });
+    const reach = await page.evaluate(() => ({ last: window._TEST_markers()[2].tick, total: window._TEST_totalTicks() }));
+    check('...with the last section actually inside the song', reach.last <= reach.total, reach);
+
+    // One undo step for the whole import.
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(150);
+    const undone = await page.evaluate(() => window._TEST_markers().length);
+    check('a bulk marker import is one undo step', undone === 0, undone);
+  });
+
+  await withPage(browser, async (page) => {
+    // Markers belong to the project: they survive save/load and undo.
+    await page.evaluate(() => window._TEST_setMarkers([{ tick: 480, name: 'Kept' }]));
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    check('markers are written into the project snapshot', /"Kept"/.test(snap), snap.length);
+
+    await page.evaluate(() => window._TEST_setMarkers([]));
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    await page.waitForTimeout(120);
+    const restored = await page.evaluate(() => ({
+      markers: window._TEST_markers(),
+      chips: [...document.querySelectorAll('.marker-chip')].length,
+    }));
+    check('...and come back on load, with the index bar rebuilt',
+      restored.markers.length === 1 && restored.markers[0].name === 'Kept' && restored.chips === 1, restored);
+
+    // A project saved before markers existed has no key at all.
+    const legacy = await page.evaluate(() => {
+      const o = JSON.parse(window._TEST_snapshot());
+      delete o.markers;
+      window._TEST_applyState(JSON.stringify(o));
+      return { markers: window._TEST_markers(), hidden: getComputedStyle(document.getElementById('markerBar')).display === 'none' };
+    });
+    check('a project saved before markers existed loads with none, not a crash',
+      Array.isArray(legacy.markers) && legacy.markers.length === 0 && legacy.hidden, legacy);
   });
 
   await browser.close();
