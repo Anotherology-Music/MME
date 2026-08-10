@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.43
+  MMV MIDI & CC Curve Editor v0.9.44
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1072,6 +1072,35 @@
   shipped default names no real account, since this is exactly the sort of
   thing that creeps back in unnoticed. The regression fixtures got the same
   treatment; they publish too.
+
+
+  v0.9.44 Feature-length songs. Bars was capped at 999, which sounds like a
+  lot and is not: 999 bars of 4/4 at 90bpm is 44 minutes, so a 100-minute show
+  could only ever be half-loaded. The cap is now 9999 — about five and a half
+  hours at 120bpm — and 3000 bars, the length of a 100-minute show at that
+  tempo, is an ordinary project.
+
+  Raising the number alone would have moved the wall rather than removed it.
+  Horizontal scrolling works by sizing a spacer element to totalTicks *
+  pxPerTick, and a layout box silently stops growing at 33,554,428px (2^25-4,
+  measured in Chrome rather than remembered). Ask for more and scrollWidth
+  simply stops there — no error, no warning, the end of the song just cannot
+  be scrolled to, which is the very symptom this release exists to fix. Length
+  and zoom depth therefore trade against each other, and the trade is now made
+  in favour of length: the zoom ceiling is derived from the song's own length
+  instead of being a flat 8. Nobody loses anything they would notice — a
+  3000-bar show still zooms to 2,796 pixels per beat, and a normal-length
+  project still reaches the original 8 exactly as before. It is enforced in
+  resizeCanvases, the single place the spacer is written, so loading a project
+  saved at a zoom its length cannot support, or changing PPQ, is covered by
+  the same line as the mouse wheel.
+
+  "Set Loop to Audio" (the audio row's small arrows button) clamped the loop
+  to the end of the timeline, so with audio longer than the song it quietly
+  set a loop that stopped short — the same silent truncation wearing a
+  different hat. It now grows the timeline to fit the audio and says how many
+  bars it added, in one undo step. For a long recording that is the quickest
+  route there is: load the audio, press it, and the song sizes itself.
 
 -->
 
