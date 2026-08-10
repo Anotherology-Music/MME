@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.44
+  MMV MIDI & CC Curve Editor v0.9.45
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1101,6 +1101,47 @@
   different hat. It now grows the timeline to fit the audio and says how many
   bars it added, in one undo step. For a long recording that is the quickest
   route there is: load the audio, press it, and the song sizes itself.
+
+
+  v0.9.45 Section markers, for finding your way around a long project.
+
+  A 100-minute show is 37 sections, and returning to it across several days
+  means the first thing you do every time is hunt for where you left off.
+  Markers give each section a flag, a name and a number.
+
+  They live in their own thin row under the ruler rather than as more freight
+  on the ruler itself, which already stacks a time-signature and a tempo label
+  per bar line inside 26px. Drop one with M or the row's own button, or
+  double-click the row; drag to reposition, right-click to rename or delete.
+
+  Jumping is what they are actually for, so it works two ways. A "Markers:"
+  bar of numbered chips sits above the row and stays on screen whatever the
+  scroll position — the marker for section 23 may be an hour off to the right,
+  but its number is always one click away. The chip for the section the
+  playhead is inside stays lit and follows playback, updating only when the
+  answer changes rather than rebuilding 37 chips a frame to move one
+  highlight. And the transport gains |<< and >>| (also < and >), which step
+  STRICTLY past the current position: parked exactly on marker 5, Previous
+  has to reach 4, not refuse to move because 5 counts as "at or before" the
+  playhead.
+
+  Numbering is positional and never stored, so inserting a section renumbers
+  everything after it by itself. Two markers cannot share a tick — the second
+  would be unreachable underneath the first — so a repeat drop renames instead
+  of stacking.
+
+  Placing 37 of them by hand is the kind of chore that stops a feature being
+  used, so "List…" takes a pasted track listing: a time and a name per line in
+  either order, separated by a comma, tab or spaces, in m:ss, h:mm:ss or plain
+  seconds, with # for comments. It previews the count before committing and
+  names the lines it could not read. The time is anchored to the start or end
+  of each line rather than searched for loosely — otherwise "Chapter 19
+  Curtain Call, 1:02:15" takes the 19 out of the NAME and sites that marker at
+  19 seconds. As with Set Loop to Audio, a listing that runs past the end of
+  the song grows the song rather than dropping the sections that do not fit.
+
+  Markers are part of the project: they save, load, and undo in one step, and
+  a project saved before they existed loads with none rather than failing.
 
 -->
 
