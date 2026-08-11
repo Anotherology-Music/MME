@@ -164,19 +164,6 @@ function buildTestHtml() {
       '  window._TEST_MAX_SPACER_PX = () => MAX_SPACER_PX;',
       '  window._TEST_spacerWidth = (which) => { const el = document.getElementById(which); const sp = el && el.querySelector(":scope > .spacer"); return sp ? { css: parseFloat(sp.style.width), scrollWidth: el.scrollWidth } : null; };',
       '  window._TEST_laneAudible = (id) => laneAudible(state.ccLanes.find(l => l.id === id));',
-      // v0.9.46 value display units. All top-level, beside laneRange.
-      '  window._TEST_laneUnits = (id) => laneUnits(state.ccLanes.find(l => l.id === id));',
-      '  window._TEST_setLaneUnits = (id, u) => { const l = state.ccLanes.find(x => x.id === id); l.units = u; applyValInputUnits(l); updateLaneValInput(l); };',
-      '  window._TEST_setLaneIsf = (id, isf) => { const l = state.ccLanes.find(x => x.id === id); l.isf = isf; applyValInputUnits(l); updateLaneValInput(l); };',
-      '  window._TEST_rawToDisp = (id, raw) => rawToDisp(state.ccLanes.find(l => l.id === id), raw);',
-      '  window._TEST_dispToRaw = (id, d) => dispToRaw(state.ccLanes.find(l => l.id === id), d);',
-      '  window._TEST_fmtLaneVal = (id, raw) => fmtLaneVal(state.ccLanes.find(l => l.id === id), raw);',
-      '  window._TEST_cycleLaneUnits = (id) => cycleLaneUnits(state.ccLanes.find(l => l.id === id));',
-      '  window._TEST_clickValLbl = (id) => state.ccLanes.find(l => l.id === id)._valLbl.click();',
-      '  window._TEST_valInput = (id) => { const l = state.ccLanes.find(x => x.id === id); return { value: l._valInput.value, min: l._valInput.min, max: l._valInput.max, step: l._valInput.step }; };',
-      '  window._TEST_typeVal = (id, txt) => { const l = state.ccLanes.find(x => x.id === id); l._valInput.value = txt; l._valInput.dispatchEvent(new Event("change")); };',
-      '  window._TEST_setActivePt = (id, i) => { const l = state.ccLanes.find(x => x.id === id); l._activePt = l.points[i]; ccSel.clear(); updateLaneValInput(l); };',
-      '  window._TEST_updateStatusCC = (id, x, y) => { const l = state.ccLanes.find(z => z.id === id); updateStatusCC(l, x, y); return document.getElementById("stCtx").textContent; };',
       '  window._TEST_buildPassEvents = (a, b) => buildPassEvents(a, b);',
       '  window._TEST_generate = (kind) => generate(kind);',
       '  window._TEST_autosaveTick = () => autosaveTick();',
@@ -10078,139 +10065,97 @@ async function run() {
       { nameLen: parsed.markers.length ? parsed.markers[0].name.length : null, notes: parsed.notes });
   });
 
-  // ---------------- v0.9.46: value display units ----------------
+  // ---------------- v0.9.46: percent display for the Advanced Value Range ----------------
 
   await withPage(browser, async (page) => {
-    const plain = await page.evaluate(() => {
-      const id = window._TEST_addLane(30, 0);
-      return { units: window._TEST_laneUnits(id), id };
-    });
-    check('a hand-made lane displays raw MIDI by default', plain.units === 'midi', plain);
+    await page.evaluate(() => { try { localStorage.removeItem('mmv-adv-pct'); } catch (e) {} });
+    await page.evaluate(() => window._TEST_addLane(30, 0));
+    await page.click('#genAdvBtn');
+    await page.waitForTimeout(250);
 
-    // An ISF-imported lane already carries the parameter's real range, so it
-    // can default to the shader's own units with nothing to configure.
-    const isfLane = await page.evaluate(() => {
-      const id = window._TEST_addLane(31, 0);
-      window._TEST_setLaneIsf(id, { name: 'warp', type: 'float', min: 0, max: 1 });
-      return { units: window._TEST_laneUnits(id), id };
-    });
-    check('an ISF-imported lane defaults to the shader parameter\'s own units',
-      isfLane.units === 'native', isfLane);
+    const read = () => page.evaluate(() => ({
+      toggle: document.getElementById('advPctToggle').textContent,
+      lo: document.getElementById('advLo').value,
+      hi: document.getElementById('advHi').value,
+      loR: +document.getElementById('advLoR').value,
+      hiR: +document.getElementById('advHiR').value,
+      marks: [...document.getElementById('advScaleMarks').children].map(c => c.textContent),
+      genLo: window._TEST_state.genLo, genHi: window._TEST_state.genHi,
+    }));
 
-    // THE case this exists for: 0.8 and 0.9 on a 0..1 parameter, without
-    // anyone multiplying by 127 in their head.
-    const conv = await page.evaluate((id) => ({
-      p8: window._TEST_dispToRaw(id, 0.8),
-      p9: window._TEST_dispToRaw(id, 0.9),
-      back102: window._TEST_rawToDisp(id, 102),
-      fmt102: window._TEST_fmtLaneVal(id, 102),
-    }), isfLane.id);
-    check('typing 0.8 on a 0..1 ISF parameter resolves to MIDI 102',
-      Math.round(conv.p8) === 102, conv);
-    check('...and 0.9 resolves to MIDI 114', Math.round(conv.p9) === 114, conv);
-    check('...and MIDI 102 reads back as approximately 0.8',
-      Math.abs(conv.back102 - 0.803) < 0.01 && /^0\.80/.test(conv.fmt102), conv);
+    const midi = await read();
+    check('the Value Range starts in raw MIDI, as it always did',
+      midi.toggle === '0-127' && midi.lo === '0' && midi.hi === '127'
+      && midi.marks.join(',') === '0,32,64,96,127', midi);
 
-    // Through the real input, not just the maths.
-    const typed = await page.evaluate((id) => {
-      window._TEST_setLanePoints(id, [{ t: 0, v: 0 }]);
-      window._TEST_setActivePt(id, 0);
-      window._TEST_typeVal(id, '0.9');
-      return { raw: window._TEST_lanePoints(id)[0].v, shown: window._TEST_valInput(id).value };
-    }, isfLane.id);
-    check('typing 0.9 into the V field stores MIDI 114 and shows it back in native units',
-      typed.raw === 114 && /^0\.9/.test(typed.shown), typed);
+    await page.click('#advPctToggle');
+    await page.waitForTimeout(150);
+    const pct = await read();
+    check('the toggle relabels Lo/Hi and the scale as a percentage',
+      pct.toggle === '%' && pct.hi === '100.0' && pct.marks[4] === '100.0', pct);
+    check('...while the sliders and the stored values stay raw 0-127',
+      pct.loR === 0 && pct.hiR === 127 && pct.genLo === 0 && pct.genHi === 127, pct);
+    // 128 raw values but only 101 whole percentages: without a decimal, 27 of
+    // them would print as a duplicate of their neighbour.
+    check('...shown to one decimal, so adjacent raw values never look identical',
+      pct.marks[1] === '25.2' && pct.marks[2] === '50.4', pct);
 
-    // The number input's own min/max must follow, or the browser clamps a
-    // perfectly good 0.9 against a field still advertising min=0 max=127.
-    const attrs = await page.evaluate((id) => window._TEST_valInput(id), isfLane.id);
-    check('the V field\'s min/max/step follow the units rather than staying 0-127',
-      attrs.min === '0' && attrs.max === '1' && attrs.step === 'any', attrs);
+    // The actual chore this removes: 0.8 and 0.9 of an ISF parameter.
+    await page.fill('#advLo', '80'); await page.dispatchEvent('#advLo', 'change');
+    await page.fill('#advHi', '90'); await page.dispatchEvent('#advHi', 'change');
+    await page.waitForTimeout(150);
+    const typed = await read();
+    check('typing 80 in percent mode stores raw MIDI 102 — 0.8 of an ISF parameter',
+      typed.genLo === 102 && typed.loR === 102, typed);
+    check('...and 90 stores raw MIDI 114', typed.genHi === 114 && typed.hiR === 114, typed);
+    // 102 is 80.3% of 127, not 80%. Showing the true figure rather than the
+    // typed one is deliberate: it is what the lane will actually send.
+    check('...and the field then shows what was really stored, not what was typed',
+      typed.lo === '80.3' && typed.hi === '89.8', typed);
 
-    // Percent, and the decimal that stops 27 of 128 values printing as their
-    // neighbour.
-    const pct = await page.evaluate((id) => {
-      window._TEST_setLaneUnits(id, 'pct');
-      return {
-        units: window._TEST_laneUnits(id),
-        at102: window._TEST_fmtLaneVal(id, 102),
-        at103: window._TEST_fmtLaneVal(id, 103),
-        at127: window._TEST_fmtLaneVal(id, 127),
-        raw80: Math.round(window._TEST_dispToRaw(id, 80)),
-      };
-    }, isfLane.id);
-    check('percent mode shows 0-100 with a decimal place', pct.at127 === '100.0' && /^80\./.test(pct.at102), pct);
-    check('...and two adjacent MIDI values never print identically in percent',
-      pct.at102 !== pct.at103, pct);
-    check('...and typing 80% resolves to MIDI 102', pct.raw80 === 102, pct);
+    await page.click('#advPctToggle');
+    await page.waitForTimeout(150);
+    const back = await read();
+    check('switching back to 0-127 shows the same values as raw MIDI',
+      back.toggle === '0-127' && back.lo === '102' && back.hi === '114'
+      && back.genLo === 102 && back.genHi === 114, back);
 
-    // Cycling, via the actual label the user clicks.
-    const cycled = await page.evaluate((id) => {
-      const seen = [];
-      for (let i = 0; i < 4; i++) { window._TEST_clickValLbl(id); seen.push(window._TEST_laneUnits(id)); }
-      return seen;
-    }, isfLane.id);
-    check('clicking the V label cycles native -> percent -> MIDI and back round',
-      new Set(cycled).size === 3 && cycled[3] === cycled[0], cycled);
-
-    // A lane whose ISF metadata has gone (import undone) must not divide by an
-    // undefined range and print NaN.
-    const orphan = await page.evaluate((id) => {
-      window._TEST_setLaneUnits(id, 'native');
-      window._TEST_setLaneIsf(id, null);
-      return { units: window._TEST_laneUnits(id), fmt: window._TEST_fmtLaneVal(id, 64) };
-    }, isfLane.id);
-    check('"native" on a lane that has lost its ISF metadata falls back to MIDI, not NaN',
-      orphan.units === 'midi' && orphan.fmt === '64', orphan);
-  });
-
-  await withPage(browser, async (page) => {
-    // Units are a display choice and belong to the project.
-    const id = await page.evaluate(() => {
-      const id = window._TEST_addLane(40, 0);
-      window._TEST_setLaneUnits(id, 'pct');
-      return id;
-    });
-    const snap = await page.evaluate(() => window._TEST_snapshot());
-    await page.evaluate((i) => window._TEST_setLaneUnits(i, 'midi'), id);
-    await page.evaluate((s) => window._TEST_applyState(s), snap);
-    await page.waitForTimeout(100);
-    const restored = await page.evaluate(() => window._TEST_laneUnits(window._TEST_state.ccLanes[0].id));
-    check('a lane\'s display units survive save/load and undo', restored === 'pct', restored);
-
-    // The whole contract: what goes down the wire never changes.
+    // The whole contract: this is a label, and Generate cannot tell it exists.
     const same = await page.evaluate(() => {
-      const lid = window._TEST_state.ccLanes[0].id;
-      window._TEST_setLanePoints(lid, [{ t: 0, v: 20 }, { t: 960, v: 100 }]);
-      window._TEST_setLaneUnits(lid, 'midi');
-      const a = Array.from(window._TEST_buildMidi());
-      window._TEST_setLaneUnits(lid, 'pct');
-      const b = Array.from(window._TEST_buildMidi());
-      return { equal: a.length === b.length && a.every((v, i) => v === b[i]), len: a.length };
+      const id = window._TEST_state.ccLanes[0].id;
+      const s = window._TEST_state;
+      s.locStart = 0; s.locEnd = 1920;
+      s.genLo = 102; s.genHi = 114;
+      document.getElementById('advPctToggle').click();           // -> percent
+      window._TEST_generate('sine');
+      const withPct = window._TEST_lanePoints(id).map(p => p.v);
+      document.getElementById('advPctToggle').click();           // -> raw
+      window._TEST_generate('sine');
+      const withMidi = window._TEST_lanePoints(id).map(p => p.v);
+      return { equal: withPct.length === withMidi.length && withPct.every((v, i) => v === withMidi[i]),
+               n: withPct.length, lo: Math.min(...withPct), hi: Math.max(...withPct) };
     });
-    check('changing display units cannot change a single exported byte', same.equal, same);
+    check('the display toggle cannot change a single generated value',
+      same.equal && same.n > 2, same);
+    check('...and the generated curve really does span the raw 102-114 that 0.8-0.9 asks for',
+      same.lo === 102 && same.hi === 114, same);
   });
 
   await withPage(browser, async (page) => {
-    // updateStatusCC runs on EVERY lane canvas but was hardcoded to the CC
-    // label and a 0-127 scale, so a PB lane reported a CC number it does not
-    // have on a third of its real range.
-    const res = await page.evaluate(() => {
-      const cc = window._TEST_addLane(22, 0);
-      const pb = window._TEST_addPbLane(3);
-      const h = window._TEST_state.ccLanes.find(l => l.id === pb)._canvas.height;
-      return {
-        ccTop: window._TEST_updateStatusCC(cc, 100, 0),
-        pbTop: window._TEST_updateStatusCC(pb, 100, 0),
-        pbBottom: window._TEST_updateStatusCC(pb, 100, h),
-      };
-    });
-    check('hovering a CC lane names the CC number and its 0-127 top',
-      /CC22 = 127$/.test(res.ccTop), res);
-    check('hovering a Pitch Bend lane says PB with its channel, not a CC number it lacks',
-      /Ch4 PB/.test(res.pbTop) && !/CC/.test(res.pbTop), res);
-    check('...and reads its real 14-bit range, not 0-127',
-      /8191$/.test(res.pbTop) && /-8192$/.test(res.pbBottom), res);
+    // The preference is a per-machine display choice, like Enable Preview.
+    await page.evaluate(() => { try { localStorage.setItem('mmv-adv-pct', '1'); } catch (e) {} });
+    await page.reload();
+    await page.waitForTimeout(400);
+    await page.click('#genAdvBtn');
+    await page.waitForTimeout(250);
+    const restored = await page.evaluate(() => ({
+      toggle: document.getElementById('advPctToggle').textContent,
+      hi: document.getElementById('advHi').value,
+      genHi: window._TEST_state.genHi,
+    }));
+    check('the percent preference survives a reload, and is display-only on load',
+      restored.toggle === '%' && restored.hi === '100.0' && restored.genHi === 127, restored);
+    await page.evaluate(() => { try { localStorage.removeItem('mmv-adv-pct'); } catch (e) {} });
   });
 
   await browser.close();
