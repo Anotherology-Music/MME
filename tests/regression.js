@@ -211,6 +211,12 @@ function buildTestHtml() {
       '  window._TEST_showMacroCaptureDialog = () => showMacroCaptureDialog();',
       '  window._TEST_assignMacroToNote = (noteId, macroId) => assignMacroToNote(state.notes.find(n => n.id === noteId), macroById(macroId));',
       '  window._TEST_resyncMacros = () => resyncMacros();',
+      // v0.9.47 stretch / bounce / time-order.
+      '  window._TEST_setMacroStretch = (mid, on) => { const m = macroById(mid); m.stretch = !!on; renderMacroList(); };',
+      '  window._TEST_macroSpanFor = (noteId, mid) => macroSpanFor(state.notes.find(n => n.id === noteId), macroById(mid));',
+      '  window._TEST_bounceMacroOnNote = (noteId) => bounceMacroOnNote(state.notes.find(n => n.id === noteId));',
+      '  window._TEST_setNoteLen = (noteId, len) => { const n = state.notes.find(x => x.id === noteId); n.length = len; resyncMacros(); requestDraw(); };',
+      '  window._TEST_taggedPoints = (laneId) => { const l = state.ccLanes.find(x => x.id === laneId); return l.points.map(p => ({ t: p.t, v: p.v, mi: p.mi == null ? null : p.mi })); };',
       '  window._TEST_laneValueAt = (laneId, t) => laneValueAt(state.ccLanes.find(l => l.id === laneId), t);',
       '  window._TEST_lanePoints = (laneId) => { const l = state.ccLanes.find(x => x.id === laneId); return l ? JSON.parse(JSON.stringify(l.points)) : null; };',
       '  window._TEST_noteById = (id) => { const n = state.notes.find(x => x.id === id); return n ? { ...n } : null; };',
@@ -10175,6 +10181,181 @@ async function run() {
     check('the percent preference survives a reload, and is display-only on load',
       restored.toggle === '%' && restored.hi === '100.0' && restored.genHi === 127, restored);
     await page.evaluate(() => { try { localStorage.removeItem('mmv-adv-pct'); } catch (e) {} });
+  });
+
+  // ---------------- v0.9.47: stretch, bounce-down, time-order ----------------
+
+  const BAR47 = 1920;
+  await withPage(browser, async (page) => {
+    // A macro captured over one bar, then put on notes of different lengths.
+    const setup = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: BAR / 2, v: 127 }, { t: BAR, v: 0 }]);
+      const s = window._TEST_state;
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Fade', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      return { laneId, mid };
+    }, BAR47);
+
+    // Fixed is the default, and a resize must NOT move it.
+    const fixed = await page.evaluate(({ BAR, mid }) => {
+      const nid = window._TEST_addNote({ start: BAR * 2, pitch: 60, length: BAR });
+      window._TEST_assignMacroToNote(nid, mid);
+      const before = window._TEST_macroSpanFor(nid, mid);
+      window._TEST_setNoteLen(nid, BAR / 2);
+      return { nid, before, after: window._TEST_macroSpanFor(nid, mid),
+               pts: window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).filter(p => p.mi != null).length };
+    }, { BAR: BAR47, mid: setup.mid });
+    check('a macro is Fixed by default — halving the note leaves its span alone',
+      fixed.before === BAR47 && fixed.after === BAR47, fixed);
+
+    // Turn stretch on: the span becomes the note's own length.
+    const stretched = await page.evaluate(({ BAR, mid, nid }) => {
+      window._TEST_setMacroStretch(mid, true);
+      window._TEST_resyncMacros();
+      const half = window._TEST_macroSpanFor(nid, mid);
+      window._TEST_setNoteLen(nid, BAR * 2);
+      const dbl = window._TEST_macroSpanFor(nid, mid);
+      const pts = window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).filter(p => p.mi != null);
+      return { half, dbl, lo: Math.min(...pts.map(p => p.t)), hi: Math.max(...pts.map(p => p.t)) };
+    }, { BAR: BAR47, mid: setup.mid, nid: fixed.nid });
+    check('with Stretch on, a half-length note gives a half-length span',
+      stretched.half === BAR47 / 2, stretched);
+    check('...and a double-length note gives a double-length span', stretched.dbl === BAR47 * 2, stretched);
+    check('...with the baked points actually spanning the note, not the capture',
+      stretched.hi - stretched.lo >= BAR47 * 2 - 4, stretched);
+
+    // The shape survives the stretch: the peak stays at the middle.
+    const shape = await page.evaluate(() => {
+      const lane = window._TEST_state.ccLanes[0];
+      const pts = window._TEST_lanePoints(lane.id).filter(p => p.mi != null).sort((a, b) => a.t - b.t);
+      const peak = pts.reduce((best, p) => (p.v > best.v ? p : best), pts[0]);
+      const lo = pts[0].t, hi = pts[pts.length - 1].t;
+      return { peakV: peak.v, frac: (peak.t - lo) / (hi - lo) };
+    });
+    check('stretching scales the shape rather than distorting it — the peak stays mid-span',
+      shape.peakV === 127 && Math.abs(shape.frac - 0.5) < 0.05, shape);
+  });
+
+  await withPage(browser, async (page) => {
+    // Compressing must not stack several source points on one tick.
+    const squeezed = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(21, 0);
+      const dense = [];
+      for (let i = 0; i <= 96; i++) dense.push({ t: Math.round(i * BAR / 96), v: i % 128 });
+      window._TEST_setLanePoints(laneId, dense);
+      const s = window._TEST_state;
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dense', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      window._TEST_setMacroStretch(mid, true);
+      const nid = window._TEST_addNote({ start: BAR * 4, pitch: 62, length: 60 }); // a 1/32 note
+      window._TEST_assignMacroToNote(nid, mid);
+      const pts = window._TEST_lanePoints(laneId).filter(p => p.mi != null).map(p => p.t);
+      const uniq = new Set(pts);
+      return { n: pts.length, uniq: uniq.size, span: Math.max(...pts) - Math.min(...pts) };
+    }, BAR47);
+    check('squeezing 97 points onto a 1/32 note collapses them to one per tick, not a stack of duplicates',
+      squeezed.n === squeezed.uniq && squeezed.n <= 62, squeezed);
+  });
+
+  await withPage(browser, async (page) => {
+    // Bounce-down: keep the curve, cut it loose from the note.
+    const r = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(22, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 10 }, { t: BAR, v: 120 }]);
+      const s = window._TEST_state;
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Stamp', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      const nid = window._TEST_addNote({ start: BAR, pitch: 64, length: 240 });
+      window._TEST_assignMacroToNote(nid, mid);
+      const before = window._TEST_taggedPoints(laneId);
+      const moved = window._TEST_bounceMacroOnNote(nid);
+      const after = window._TEST_taggedPoints(laneId);
+      const note = window._TEST_noteById(nid);
+      return { moved, taggedBefore: before.filter(p => p.mi != null).length,
+               taggedAfter: after.filter(p => p.mi != null).length,
+               total: after.length, noteHasMacro: note.macroId != null, frozen: !!note.macroFrozen, nid, laneId, mid };
+    }, BAR47);
+    check('bouncing keeps every point but drops the instance tag',
+      r.moved > 0 && r.taggedBefore === r.moved && r.taggedAfter === 0 && r.total === r.taggedBefore, r);
+    check('...and the note stops carrying the macro', !r.noteHasMacro && r.frozen, r);
+
+    // The point of it: deleting the note must now leave the curve alone.
+    const afterDelete = await page.evaluate(({ nid, laneId }) => {
+      window._TEST_removeNoteById(nid);
+      return window._TEST_lanePoints(laneId).length;
+    }, r);
+    check('deleting a bounced note leaves its CC data untouched', afterDelete === r.total, { afterDelete, was: r.total });
+
+    // And a pitch binding must not re-claim a bounced note.
+    const rebind = await page.evaluate(({ mid, laneId, BAR }) => {
+      const nid = window._TEST_addNote({ start: BAR * 6, pitch: 70, length: 240 });
+      window._TEST_addMacroBinding(70, null, mid);
+      window._TEST_resyncMacros();
+      const gotBound = window._TEST_noteById(nid).macroId != null;
+      window._TEST_bounceMacroOnNote(nid);
+      window._TEST_resyncMacros();
+      const n = window._TEST_noteById(nid);
+      return { gotBound, reclaimed: n.macroId != null,
+               tagged: window._TEST_taggedPoints(laneId).filter(p => p.mi != null).length };
+    }, { mid: r.mid, laneId: r.laneId, BAR: BAR47 });
+    check('a bound note bakes as usual...', rebind.gotBound, rebind);
+    check('...but once bounced, the binding does not bake a second copy over it',
+      !rebind.reclaimed && rebind.tagged === 0, rebind);
+  });
+
+  await withPage(browser, async (page) => {
+    // Time order: where instances overlap the later bake wins, and "later"
+    // has to mean later on the TIMELINE, not later in the notes array.
+    const r = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(23, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: BAR, v: 127 }]);
+      const s = window._TEST_state;
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Ramp', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      window._TEST_setMacroStretch(mid, true);
+      // Add the LATER note first, so array order and time order disagree.
+      const late = window._TEST_addNote({ start: BAR * 3, pitch: 60, length: BAR });
+      const early = window._TEST_addNote({ start: BAR * 2, pitch: 60, length: BAR * 2 }); // overlaps `late`
+      window._TEST_addMacroBinding(60, null, mid);
+      window._TEST_resyncMacros();
+      const pts = window._TEST_lanePoints(laneId).filter(p => p.mi != null);
+      const lateInst = window._TEST_noteById(late).macroInst;
+      const earlyInst = window._TEST_noteById(early).macroInst;
+      // In the overlap (bar 3 onwards) the later note's instance must own it.
+      const inOverlap = pts.filter(p => p.t >= BAR * 3 && p.t <= BAR * 4);
+      return { total: pts.length, lateInst, earlyInst,
+               overlapOwnedByLate: inOverlap.length > 0 && inOverlap.every(p => p.mi === lateInst) };
+    }, BAR47);
+    check('where two macro instances overlap, the one later on the timeline wins — regardless of the order the notes were added',
+      r.overlapOwnedByLate, r);
+  });
+
+  await withPage(browser, async (page) => {
+    // The gap that would have made the same edit behave two ways.
+    const r = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(24, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: BAR, v: 127 }]);
+      const s = window._TEST_state;
+      s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Dur', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      window._TEST_setMacroStretch(mid, true);
+      const nid = window._TEST_addNote({ start: BAR * 2, pitch: 61, length: BAR });
+      window._TEST_assignMacroToNote(nid, mid);
+      window._TEST_selectNotes([nid]);
+      return { nid, mid, before: window._TEST_macroSpanFor(nid, mid) };
+    }, BAR47);
+    await page.fill('#noteInfoLen', '480');
+    await page.dispatchEvent('#noteInfoLen', 'change');
+    await page.waitForTimeout(150);
+    const after = await page.evaluate(({ nid, mid }) => window._TEST_macroSpanFor(nid, mid), r);
+    check('typing a duration in Note Info re-bakes a stretch macro, exactly as dragging the note end does',
+      r.before === BAR47 && after === 480, { before: r.before, after });
   });
 
   await browser.close();
