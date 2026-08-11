@@ -2132,6 +2132,7 @@
           <div class="setup-row">
             <button id="macroCaptureBtn" title="Capture the current loop range across the chosen CC lanes as a reusable macro">Capture Loop Range…</button>
             <button id="macroClearNoteBtn" title="Remove the macro from the selected note (its baked CC points go too)">Clear from selected note</button>
+            <button id="macroBounceBtn" title="Keep the curve but cut it loose from the note: the points become ordinary CC data you can edit by hand, and deleting or moving the note no longer touches them">&#x2193; Bounce to CC</button>
           </div>
           <div id="macroList" style="display:flex;flex-direction:column;gap:2px;margin-top:4px;"></div>
           <div class="hint" style="margin-top:4px;">A macro is an editing aid: attaching one to a note expands it into ordinary CC points at that note's position. Macro notes are drawn amber in the piano roll.</div>
@@ -3469,6 +3470,24 @@
       // note (whose fill is a blue whose lightness encodes velocity).
       ctx.fillStyle=(n.macroId!=null)?getCss('--accent2'):velColor(n.vel); ctx.fillRect(x,y+1,nw,nh-2);
       ctx.strokeStyle=sel?getCss('--sel'):chanColor(n.ch); ctx.lineWidth=sel?2:1; ctx.strokeRect(x+0.5,y+1.5,nw-1,nh-3);
+      // Ghost outline: a fixed-length macro on a short note (a drum-map hit,
+      // say) controls CC well past the note you can see. Without this the
+      // note gives no clue how far its curve actually reaches, which makes
+      // overlapping instances look like the app losing data. Drawn only when
+      // the span genuinely differs, so a stretch macro — whose span IS the
+      // note — never draws one.
+      if(n.macroId!=null&&n.macroInst!=null){
+        const mac=macroById(n.macroId);
+        const span=macroSpanFor(n,mac);
+        if(span>n.length+1){
+          const gw=tickToX(span);
+          ctx.save();
+          ctx.strokeStyle=getCss('--accent2'); ctx.globalAlpha=0.55;
+          ctx.lineWidth=1; ctx.setLineDash([3,3]);
+          ctx.strokeRect(x+0.5,y+1.5,Math.max(2,gw)-1,nh-3);
+          ctx.restore();
+        }
+      }
       if(nw>14&&nh>=10){ ctx.save(); ctx.beginPath(); ctx.rect(x+1,y+1,nw-2,nh-2); ctx.clip();
         ctx.fillStyle=sel?'#06223f':'#06223f'; ctx.font=Math.min(9,nh-2)+'px system-ui'; ctx.textBaseline='middle';
         // A note with a custom pitch name used to lose the note-number/name
@@ -3998,6 +4017,10 @@
       if(!state.selection.size) return;
       const len=Math.max(1,Math.round(+nlEl.value||1));
       pushUndo(); state.notes.forEach(n=>{ if(state.selection.has(n.id)) n.length=len; });
+      // Typing a duration has to re-bake a stretch macro exactly as dragging
+      // the note's end does — otherwise the same change by two routes gives
+      // two different results, which reads as a bug.
+      resyncMacros();
       updateNoteInfo(); requestDraw();
     });
     nlEl.addEventListener('keydown',e=>{ if(e.key==='Enter') nlEl.blur(); });
@@ -5293,11 +5316,16 @@
   // macroId set with no macroBound marker — always wins, so the per-note
   // escape hatch still works on a bound pitch.
   function effectiveMacroIdFor(note, idx){
+    // A bounced note has had its curve cut loose and is now ordinary CC data.
+    // It must stay invisible to bindings, or a pitch binding would simply
+    // bake a fresh instance back over it on the next resync.
+    if(note.macroFrozen) return null;
     if(note.macroId!=null && !note.macroBound) return note.macroId;
     return boundMacroIdFor(note, idx);
   }
   function clearNoteMacro(n){
     delete n.macroId; delete n.macroInst; delete n.macroAt; delete n.macroMap; delete n.macroBound;
+    delete n.macroLen;
   }
   // Notes a binding would newly claim: everything at that pitch/channel that
   // is not already spoken for by an explicit assign.
@@ -5412,7 +5440,8 @@
   // because the surrounding points happen to interpolate to it — the guard
   // would change nothing and is not added. A lane with no points at all had
   // nothing authored to preserve, so it gets no guards either.
-  function bakeMacroIntoLane(lane, ml, s, e, inst){
+  function bakeMacroIntoLane(lane, ml, s, e, inst, scale){
+    scale=(scale>0&&isFinite(scale))?scale:1;
     const orig=lane.points;
     const r=laneRange(lane);
     const q=v=>clamp(Math.round(v), r.min, r.max);
@@ -5424,7 +5453,14 @@
     // in the missing-lane dialog can legitimately point a pitch-bend capture
     // at a 7-bit CC lane, and out-of-range points would otherwise be drawn
     // and sent as garbage.
-    const baked=ml.points.map(p=>({t:Math.round(s+p.t), v:q(p.v), mi:inst}));
+    // scale<1 compresses the macro onto a shorter note. Rounding then lands
+    // several source points on one tick — a 96-point bar squeezed onto a 1/16
+    // note is a point every 1.25 ticks — so collapse them, keeping the last
+    // value at each tick. Without this the lane silently fills with redundant
+    // points that draw and save but change nothing.
+    const byTick=new Map();
+    ml.points.forEach(p=>{ byTick.set(Math.round(s+p.t*scale), q(p.v)); });
+    const baked=[...byTick.entries()].map(en=>({t:en[0], v:en[1], mi:inst}));
     const merged=kept.concat(baked).sort((x,y)=>x.t-y.t);
     const probe={type:lane.type, points:merged};
     const guards=[];
@@ -5452,17 +5488,32 @@
     }
   }
 
+  // The span a macro instance will occupy on this note. Fixed macros keep the
+  // length they were captured at; a stretch macro takes the note's own, which
+  // is what makes shortening the note shorten the curve.
+  function macroSpanFor(note, macro){
+    if(!macro) return 0;
+    if(macro.stretch && macro.spanTicks>0) return Math.max(1,Math.round(note.length));
+    return macro.spanTicks;
+  }
   function bakeMacroOnNote(note, macro, map){
     const inst=state.nextId++;
-    const s=Math.round(note.start), e=s+macro.spanTicks;
+    const s=Math.round(note.start);
+    const span=macroSpanFor(note, macro);
+    const e=s+span;
+    // spanTicks is guarded above, so this can never divide by zero.
+    const scale=(macro.stretch&&macro.spanTicks>0)?(span/macro.spanTicks):1;
     macro.lanes.forEach((ml,i)=>{
       const laneId=map[i];
       if(laneId==null) return; // "skip" — deliberately not applied to any lane
       const lane=state.ccLanes.find(l=>l.id===laneId);
       if(!lane) return;
-      bakeMacroIntoLane(lane, ml, s, e, inst);
+      bakeMacroIntoLane(lane, ml, s, e, inst, scale);
     });
     note.macroId=macro.id; note.macroInst=inst; note.macroAt=note.start; note.macroMap=map.slice();
+    // Remembered so resyncMacros() can tell a resize happened. Only meaningful
+    // for a stretch macro, but stored always so the comparison stays uniform.
+    note.macroLen=note.length;
     // A bake is explicit unless the caller says otherwise — resyncMacros()
     // re-sets the marker for the notes it baked from a binding. Doing it this
     // way round means assignMacroToNote() needs no extra step to turn a bound
@@ -5523,7 +5574,13 @@
     const orphans=new Set();
     for(const lane of state.ccLanes) for(const p of lane.points) if(p.mi!=null&&!live.has(p.mi)) orphans.add(p.mi);
     orphans.forEach(mi=>{ stripMacroInstance(mi); changed=true; });
-    for(const n of state.notes){
+    // Time order, NOT array order. Where two instances overlap the later bake
+    // wins, so the order has to be the order on the timeline — in insertion
+    // order, redrawing an early note would make it overwrite a later one's
+    // curve. Matters most for a stretch macro retriggered before the previous
+    // one has finished, which is exactly the overlap this is meant to allow.
+    const ordered=[...state.notes].sort((a,b)=>(a.start-b.start)||(a.id-b.id));
+    for(const n of ordered){
       // What this note SHOULD carry, from its explicit assign or from the
       // bindings. Recomputed rather than remembered, so a note dragged onto
       // (or off) a bound key, or moved to another channel, picks the change
@@ -5544,7 +5601,11 @@
       // explicit assign, which is exactly the condition effectiveMacroIdFor()
       // fell through on.
       const bound=!(n.macroId!=null&&!n.macroBound);
-      if(n.macroId===want && n.macroInst!=null && n.macroAt===n.start && !!n.macroBound===bound) continue;
+      // n.macroLen catches a resize. Compared only for a stretch macro: a
+      // fixed macro's span does not depend on the note's length, so a resize
+      // must NOT trigger a pointless re-bake there.
+      const lenOk=!macro.stretch || n.macroLen===n.length;
+      if(n.macroId===want && n.macroInst!=null && n.macroAt===n.start && lenOk && !!n.macroBound===bound) continue;
       if(n.macroInst!=null) stripMacroInstance(n.macroInst);
       // The stored create/map/skip answers only apply to the macro they were
       // given for; a note that just changed macro resolves afresh.
@@ -5580,6 +5641,23 @@
       const meta=document.createElement('span'); meta.dataset.col='meta'; meta.className='hint';
       meta.textContent=m.lanes.length+' lane'+(m.lanes.length!==1?'s':'')+' · '+m.spanTicks+'t';
       meta.title=m.lanes.map(macroLaneLabel).join('\n');
+      // Per-macro, opt-in, default off: a macro captured at one length keeps
+      // that length unless it is told otherwise, so nothing changes behaviour
+      // by surprise.
+      const stretch=document.createElement('button'); stretch.dataset.act='stretch';
+      stretch.textContent=m.stretch?'↔ Stretch':'↔ Fixed';
+      stretch.classList.toggle('on',!!m.stretch);
+      stretch.title=m.stretch
+        ? 'Stretch: the curve spans the note. Shorten the note and the curve shortens with it.\nClick for Fixed.'
+        : 'Fixed: the curve always spans '+m.spanTicks+' ticks, whatever the note\'s length.\nClick for Stretch.';
+      stretch.addEventListener('click',()=>{
+        pushUndo();
+        m.stretch=!m.stretch;
+        // Every note carrying it has to be re-baked at the new rule.
+        state.notes.forEach(n=>{ if(n.macroId===m.id&&n.macroInst!=null){ stripMacroInstance(n.macroInst); clearNoteMacro(n); } });
+        resyncMacros(); renderMacroList(); updateNoteInfo(); requestDraw();
+        flash('"'+m.name+'" is now '+(m.stretch?'stretched to each note\'s length':'fixed at '+m.spanTicks+' ticks'));
+      });
       const assign=document.createElement('button'); assign.dataset.act='assign'; assign.textContent='→ Note';
       assign.title='Attach this macro to the selected note';
       assign.addEventListener('click',()=>{
@@ -5598,7 +5676,7 @@
         state.macroBindings=(state.macroBindings||[]).filter(b=>b.macroId!==m.id);
         resyncMacros(); renderMacroList(); updateNoteInfo(); requestDraw();
       });
-      row.appendChild(nm); row.appendChild(meta); row.appendChild(assign); row.appendChild(del);
+      row.appendChild(nm); row.appendChild(meta); row.appendChild(stretch); row.appendChild(assign); row.appendChild(del);
       box.appendChild(row);
     });
     // The bindings list names macros and the picker offers them, so both
@@ -8182,6 +8260,35 @@
     $('playMacroBtn').classList.toggle('on',state.playMacroMode);
     if(state.playing) rescheduleCurrentPass(); });
   $('macroCaptureBtn').addEventListener('click',()=>showMacroCaptureDialog());
+  // ── Bounce down ──────────────────────────────────────────────────
+  // The opposite of stripMacroInstance(): keep every baked point, but drop
+  // the instance tag that ties it to a note. What is left is ordinary CC
+  // data — editable point by point, immune to the note being moved or
+  // deleted, and safe from the next resync. The escape hatch for two macros
+  // competing over one lane, and for keeping only part of what a macro drew.
+  function bounceMacroOnNote(note){
+    if(!note||note.macroInst==null) return 0;
+    let n=0;
+    for(const lane of state.ccLanes){
+      for(const p of lane.points){ if(p.mi===note.macroInst){ delete p.mi; n++; } }
+    }
+    clearNoteMacro(note);
+    // Without this a note sitting on a bound pitch would be re-claimed by the
+    // binding on the very next resync and bake a second copy straight over
+    // the points we just froze.
+    note.macroFrozen=1;
+    return n;
+  }
+  $('macroBounceBtn').addEventListener('click',()=>{
+    const sel=[...state.selection].map(byId).filter(Boolean);
+    const withMacro=sel.filter(n=>n.macroId!=null&&n.macroInst!=null);
+    if(!withMacro.length){ flash('No selected note carries a macro'); return; }
+    pushUndo();
+    let pts=0; withMacro.forEach(n=>{ pts+=bounceMacroOnNote(n); });
+    resyncMacros();
+    updateNoteInfo(); requestDraw();
+    flash('Bounced '+pts+' point'+(pts===1?'':'s')+' to plain CC data — the note no longer controls them');
+  });
   $('macroClearNoteBtn').addEventListener('click',()=>{
     const sel=[...state.selection].map(byId).filter(Boolean);
     const withMacro=sel.filter(n=>n.macroId!=null);
