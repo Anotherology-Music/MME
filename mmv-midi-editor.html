@@ -2342,7 +2342,7 @@
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;">
             <!-- ── Left column: Value Range + Sweep + Output Mode ── -->
             <div>
-              <div class="adv-sec">VALUE RANGE</div>
+              <div class="adv-sec">VALUE RANGE <span id="advUnitsTag" style="font-weight:400;color:var(--txt2);font-size:9px;letter-spacing:0;">MIDI 0-127</span></div>
               <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
                 <span class="adv-lbl">Lo</span>
                 <input type="number" id="advLo" min="0" max="127" value="0" class="adv-num">
@@ -2350,7 +2350,7 @@
                   <input type="range" id="advLoR" min="0" max="127" value="0" class="dual-range dr-lo">
                   <input type="range" id="advHiR" min="0" max="127" value="127" class="dual-range dr-hi">
                   <div class="dual-track" id="advTrack"></div>
-                  <div aria-hidden="true" style="position:absolute;top:20px;left:0;right:0;height:14px;pointer-events:none;">
+                  <div id="advScaleMarks" aria-hidden="true" style="position:absolute;top:20px;left:0;right:0;height:14px;pointer-events:none;">
                     <span style="position:absolute;left:0;font-size:9px;color:var(--txt2);">0</span>
                     <span style="position:absolute;left:25%;transform:translateX(-50%);font-size:9px;color:var(--txt2);">32</span>
                     <span style="position:absolute;left:50%;transform:translateX(-50%);font-size:9px;color:rgba(79,163,255,.85);font-weight:600;">64</span>
@@ -2903,7 +2903,7 @@
   // ---------- Undo / Redo ----------
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
-    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points,isf:l.isf||null})),
+    lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points,isf:l.isf||null,units:l.units||null})),
     bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
     tempoMap:state.tempoMap,
     markers:state.markers||[],
@@ -2978,7 +2978,7 @@
     const prevActiveId=state.activeLaneId;
     state.ccLanes.forEach(l=>{ if(l._row){ if(l._row.style.height) savedHeightById.set(l.id,l._row.style.height); l._row.remove(); } });
     state.ccLanes=[];
-    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,muted:!!ld.muted,soloed:!!ld.soloed,points:ld.points,isf:ld.isf||null,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
+    o.lanes.forEach(ld=>{ const lane={id:ld.id,type:ld.type||'cc',cc:ld.cc,ch:ld.ch,color:ld.color,name:ld.name||'',visible:ld.visible!==false,tags:ld.tags||[],steps:ld.steps||0,muted:!!ld.muted,soloed:!!ld.soloed,points:ld.points,isf:ld.isf||null,units:ld.units||null,_preview:null}; state.ccLanes.push(lane); buildLaneDom(lane);
       const savedH=savedHeightById.get(lane.id); if(savedH){ lane._row.style.height=savedH; lane._row.style.flex='0 0 auto'; updateLaneCompactness(lane._row); } });
     refreshMuteSoloUI();
     state.activeLaneId=state.ccLanes.some(l=>l.id===prevActiveId)?prevActiveId:(state.ccLanes.length?state.ccLanes[0].id:null); refreshActive();
@@ -3507,6 +3507,90 @@
   // per MIDI channel rather than a numbered CC.
   function laneIsCp(lane){ return lane.type==='cp'; }
   function laneRange(lane){ return laneIsPb(lane)?{min:-8192,max:8191,center:0}:{min:0,max:127,center:64}; }
+
+  // ---------- Value display units ----------
+  // What a lane STORES never changes: 0-127 for CC/CP, ±8192 for PB, which is
+  // what actually goes down the wire. This is purely how those numbers are
+  // shown and typed, because doing the conversion in your head is where the
+  // mistakes come from — 0.8 of an ISF parameter is CC102, and nobody wants
+  // to work that out to draw a curve between 0.8 and 0.9.
+  //
+  //   midi   — the raw value. Default for hand-made lanes.
+  //   pct    — 0-100 across the lane's full range (Cubase's CC display).
+  //   native — the ISF parameter's own range, e.g. 0.00-6.28 or -2.00-2.00.
+  //            Only meaningful on a lane that came from an ISF import, which
+  //            is exactly where lane.isf.min/max are already recorded.
+  function laneHasNative(lane){
+    return !!(lane&&lane.isf&&typeof lane.isf.min==='number'&&typeof lane.isf.max==='number'&&lane.isf.max!==lane.isf.min);
+  }
+  // An ISF lane defaults to its own units, everything else to raw MIDI. A
+  // stored choice always wins, except that 'native' on a lane with no ISF
+  // metadata (the shader import was undone, say) falls back rather than
+  // dividing by an undefined range.
+  function laneUnits(lane){
+    const u=lane&&lane.units;
+    if(u==='pct'||u==='midi') return u;
+    if(u==='native') return laneHasNative(lane)?'native':'midi';
+    return laneHasNative(lane)?'native':'midi';
+  }
+  function laneUnitSuffix(lane){ return laneUnits(lane)==='pct'?'%':''; }
+  // Decimals are chosen from how much range one raw step covers, so the
+  // display can always distinguish two adjacent values. Integer percent would
+  // be wrong: 128 MIDI values collapse onto 101 whole percentages, so 27 of
+  // them would print as a duplicate of their neighbour.
+  function laneUnitDecimals(lane){
+    const u=laneUnits(lane);
+    if(u==='midi') return 0;
+    if(u==='pct') return 1;
+    const span=Math.abs(lane.isf.max-lane.isf.min);
+    return span<=2?3:span<=20?2:1;
+  }
+  function rawToDisp(lane,raw){
+    const r=laneRange(lane), u=laneUnits(lane);
+    if(u==='midi') return raw;
+    const f=(raw-r.min)/((r.max-r.min)||1);
+    return u==='pct' ? f*100 : lane.isf.min+f*(lane.isf.max-lane.isf.min);
+  }
+  function dispToRaw(lane,disp){
+    const r=laneRange(lane), u=laneUnits(lane);
+    if(u==='midi') return disp;
+    const f=u==='pct' ? disp/100 : (disp-lane.isf.min)/((lane.isf.max-lane.isf.min)||1);
+    return r.min+f*(r.max-r.min);
+  }
+  function fmtLaneVal(lane,raw){
+    if(raw==null||!isFinite(raw)) return '';
+    return rawToDisp(lane,raw).toFixed(laneUnitDecimals(lane));
+  }
+  // The <input type=number> min/max/step have to follow the units too, or the
+  // browser silently clamps a perfectly valid 0.85 back to 0 on a field still
+  // advertising min=0 max=127.
+  function applyValInputUnits(lane){
+    const inp=lane._valInput; if(!inp) return;
+    const r=laneRange(lane), u=laneUnits(lane);
+    const lo=rawToDisp(lane,r.min), hi=rawToDisp(lane,r.max);
+    inp.min=String(Math.min(lo,hi)); inp.max=String(Math.max(lo,hi));
+    inp.step=u==='midi'?'1':'any';
+    if(lane._valLbl){
+      lane._valLbl.textContent=laneIsPb(lane)?'PB':laneIsCp(lane)?'CP':'V';
+      const uname=u==='midi'?(laneIsPb(lane)?'raw ±8192':'raw 0-127'):u==='pct'?'0-100%'
+        :('native '+fmtNum(lane.isf.min)+'–'+fmtNum(lane.isf.max));
+      lane._valLbl.title='Value of the selected point, shown in '+uname
+        +'\nClick to switch units (raw MIDI / percent'+(laneHasNative(lane)?' / the shader\'s own range':'')+')'
+        +'\nWhat gets sent and exported never changes — only how it is displayed.';
+      lane._valLbl.style.cursor='pointer';
+      lane._valLbl.style.textDecoration=u==='midi'?'':'underline dotted';
+    }
+  }
+  function cycleLaneUnits(lane){
+    const order=laneHasNative(lane)?['native','pct','midi']:['pct','midi'];
+    const i=order.indexOf(laneUnits(lane));
+    lane.units=order[(i+1)%order.length];
+    applyValInputUnits(lane); updateLaneValInput(lane); requestDraw();
+    if(window.__refreshAdvUnits) window.__refreshAdvUnits();
+    const u=laneUnits(lane);
+    flash(lane.name||('CC'+lane.cc)+' values shown in '
+      +(u==='midi'?'raw MIDI':u==='pct'?'percent (0-100)':'the shader\'s own range'));
+  }
   // Whether a lane actually plays right now: while any lane in the project
   // is soloed, only soloed lanes are audible (everyone else is suppressed
   // regardless of their own Mute state); otherwise a lane plays unless it's
@@ -4092,14 +4176,14 @@
       // if they all agree, blank only when they actually differ. Position has
       // no single common answer for a multi-point selection, so stays blank.
       const vals=[...ccSel].map(p=>Math.round(p.v));
-      lane._valInput.value=vals.every(v=>v===vals[0])?vals[0]:'';
+      lane._valInput.value=vals.every(v=>v===vals[0])?fmtLaneVal(lane,vals[0]):'';
       if(lane._posInput) lane._posInput.value='';
       if(lane._stepBadge) lane._stepBadge.style.display='none';
       return;
     }
     const pt=lane._activePt;
     const valid=pt&&lane.points.indexOf(pt)>=0;
-    lane._valInput.value=valid?Math.round(pt.v):'';
+    lane._valInput.value=valid?fmtLaneVal(lane,Math.round(pt.v)):'';
     if(lane._posInput) lane._posInput.value=valid?tickToBBT(pt.t):'';
     if(lane._stepBadge){
       const label=valid?stepIndexLabel(lane,pt.v):'';
@@ -4712,7 +4796,8 @@
     // is a real >=16px hit target with visible spacing between them.
     const row2=document.createElement('div'); row2.className='lr row2';
     const xBtn=document.createElement('button'); xBtn.className='x'; xBtn.title='Remove lane'; xBtn.textContent='×';
-    const valLbl=document.createElement('span'); valLbl.className='mini-lbl'; valLbl.textContent=laneIsPb(lane)?'PB':laneIsCp(lane)?'CP':'V'; valLbl.title=laneIsPb(lane)?'Pitch bend value':laneIsCp(lane)?'Channel pressure value':'Value';
+    const valLbl=document.createElement('span'); valLbl.className='mini-lbl'; valLbl.textContent=laneIsPb(lane)?'PB':laneIsCp(lane)?'CP':'V';
+    valLbl.addEventListener('click',()=>cycleLaneUnits(lane));
     const valInput=document.createElement('input'); valInput.type='number'; valInput.className='val-input';
     const rng=laneRange(lane); valInput.min=rng.min; valInput.max=rng.max; valInput.placeholder='—';
     valInput.title='Value of selected point\nScroll/↑↓=±1  Shift=±5  Ctrl=±10\nAlt+scroll=snap to % steps';
@@ -4778,7 +4863,8 @@
     const leftInner=document.createElement('div'); leftInner.className='leftcol-inner';
     leftInner.appendChild(row2); leftInner.appendChild(row3);
     left.appendChild(leftInner);
-    lane._valInput=valInput; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
+    lane._valInput=valInput; lane._valLbl=valLbl; lane._posInput=posInput; lane._stepBadge=stepBadge; lane._activePt=null;
+    applyValInputUnits(lane);
     // Stable-by-role refs (not otherwise needed by the lane itself) so undo/
     // redo's view-preservation can refocus "the same field on the same lane"
     // after applyState() tears down and rebuilds this row — see
@@ -4910,15 +4996,20 @@
       pushUndo(); rebuildLanesDom(srcId); });
 
     valInput.addEventListener('change',()=>{
-      const r=laneRange(lane); const newV=clamp(Math.round(snapToSteps(+valInput.value||0,r,lane.steps)),r.min,r.max);
+      const r=laneRange(lane);
+      // Typed text is in whatever units the lane is displaying; convert to raw
+      // FIRST, then snap and clamp, so Steps and the range still work on the
+      // real value rather than on a percentage that means nothing to them.
+      const raw=dispToRaw(lane,parseFloat(valInput.value)||0);
+      const newV=clamp(Math.round(snapToSteps(raw,r,lane.steps)),r.min,r.max);
       if(ccSel.size>0){
         ccSel.forEach(p=>{ if(lane.points.indexOf(p)>=0) p.v=newV; });
-        valInput.value=newV;
+        valInput.value=fmtLaneVal(lane,newV);
         if(lane._activePt&&lane.points.indexOf(lane._activePt)>=0) sendLaneVal(lane,lane._activePt.v);
         pushUndo(); requestDraw();
       } else {
         const pt=lane._activePt; if(!pt||lane.points.indexOf(pt)<0) return;
-        pt.v=newV; valInput.value=pt.v; sendLaneVal(lane,pt.v); pushUndo(); requestDraw();
+        pt.v=newV; valInput.value=fmtLaneVal(lane,pt.v); sendLaneVal(lane,pt.v); pushUndo(); requestDraw();
       }
     });
     valInput.addEventListener('keydown',e=>{ if(e.key==='Enter') valInput.blur(); });
@@ -5137,7 +5228,10 @@
     dlg.showModal();
   }
 
-  function setActiveLane(id){ state.activeLaneId=id; refreshActive(); }
+  function setActiveLane(id){ state.activeLaneId=id; refreshActive();
+    // The Advanced panel acts on the active lane, and a project mixes lanes
+    // with different ranges — so its units have to follow the switch.
+    if(window.__refreshAdvUnits) window.__refreshAdvUnits(); }
   function refreshActive(){
     const hasActive=state.ccLanes.some(l=>l.id===state.activeLaneId);
     state.ccLanes.forEach(l=>{
@@ -8876,7 +8970,17 @@
   function updateStatus(x,y){ const p=yToPitch(y); const cn=pitchName(p,state.viewCh??state.defCh); const t=Math.max(0,xToTick(x));
     $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClockTenths(tickToSeconds(t)); $('stCtx').textContent=noteName(p)+(cn?' – '+cn:''); }
   function updateStatusPos(x){ const t=clamp(xToTick(x),0,totalTicks()); $('stPos').textContent=tickToBBT(t); $('stPosSec').textContent=fmtClockTenths(tickToSeconds(t)); }
-  function updateStatusCC(lane,x,y){ $('stPos').textContent=tickToBBT(Math.max(0,xToTick(x))); $('stCtx').textContent='CC'+lane.cc+' = '+clamp(Math.round((1-y/lane._canvas.height)*127),0,127); }
+  // Was hardcoded to 'CC'+lane.cc and a 0-127 scale, and this runs on EVERY
+  // lane canvas — so hovering a Pitch Bend lane reported a CC number it does
+  // not have, on a scale a third of its real ±8192 range. Named and scaled
+  // from the lane itself now, and shown in the lane's display units.
+  function updateStatusCC(lane,x,y){
+    const r=laneRange(lane);
+    const raw=clamp(Math.round(r.min+(1-y/lane._canvas.height)*(r.max-r.min)),r.min,r.max);
+    const who=laneIsPb(lane)?('Ch'+(lane.ch+1)+' PB'):laneIsCp(lane)?('Ch'+(lane.ch+1)+' CP'):('CC'+lane.cc);
+    $('stPos').textContent=tickToBBT(Math.max(0,xToTick(x)));
+    $('stCtx').textContent=who+' = '+fmtLaneVal(lane,raw)+laneUnitSuffix(lane);
+  }
   function flash(msg){ $('stCtx').textContent=msg; }
 
   // ---------- Keys/lane column resize (delegated to all leftcols) ----------
@@ -11665,7 +11769,7 @@
     let computeTransformPreview=()=>null;      // reassigned to the real impl inside the IIFE
     (()=>{
       const btn=$('genAdvBtn'), panel=$('genAdvPanel');
-      function openAdv(){ panel.style.display='block'; btn.textContent='Advanced ▴'; updateAdvSelCount(); captureAbA(); drawAbPreview(); if(typeof window._updateShapeControls==='function') window._updateShapeControls($('advGenKind').value||'sine'); }
+      function openAdv(){ panel.style.display='block'; btn.textContent='Advanced ▴'; updateAdvSelCount(); captureAbA(); drawAbPreview(); if(window.__refreshAdvUnits) window.__refreshAdvUnits(); if(typeof window._updateShapeControls==='function') window._updateShapeControls($('advGenKind').value||'sine'); }
       function closeAdv(){ panel.style.display='none'; btn.textContent='Advanced ▾'; }
       btn.addEventListener('click',e=>{ e.stopPropagation(); panel.style.display==='none'?openAdv():closeAdv(); });
       $('genAdvClose').addEventListener('click',closeAdv);
@@ -11700,12 +11804,47 @@
         const plo=lo/127*100, phi=hi/127*100;
         $('advTrack').style.left=plo+'%'; $('advTrack').style.width=(phi-plo)+'%';
       }
-      function syncLo(v){ v=clamp(parseInt(v)||0,0,parseInt($('advHiR').value)); state.genLo=v; $('advLoR').value=v; $('advLo').value=v; updateDualTrack(); drawAbPreview(); }
-      function syncHi(v){ v=clamp(parseInt(v)||127,parseInt($('advLoR').value),127); state.genHi=v; $('advHiR').value=v; $('advHi').value=v; updateDualTrack(); drawAbPreview(); }
-      $('advLoR').addEventListener('input',e=>syncLo(e.target.value));
-      $('advLo').addEventListener('change',e=>syncLo(e.target.value));
-      $('advHiR').addEventListener('input',e=>syncHi(e.target.value));
-      $('advHi').addEventListener('change',e=>syncHi(e.target.value));
+      // state.genLo/genHi stay RAW 0-127 throughout — the sliders are
+      // positional and Generate works in raw. Only the two number boxes and
+      // the scale beneath the sliders speak the active lane's units, because
+      // typing "0.85" is the entire point of the exercise.
+      function advUnitLane(){ return activeLane(); }
+      function advFmt(raw){ const l=advUnitLane(); return l?fmtLaneVal(l,raw):String(raw); }
+      function syncLo(v){ v=clamp(Math.round(v),0,parseInt($('advHiR').value)); state.genLo=v; $('advLoR').value=v; $('advLo').value=advFmt(v); updateDualTrack(); drawAbPreview(); }
+      function syncHi(v){ v=clamp(Math.round(v),parseInt($('advLoR').value),127); state.genHi=v; $('advHiR').value=v; $('advHi').value=advFmt(v); updateDualTrack(); drawAbPreview(); }
+      // Typed text is in display units; the sliders hand over raw already.
+      function typedToRaw(txt,fallback){
+        const l=advUnitLane(); const n=parseFloat(txt);
+        if(!isFinite(n)) return fallback;
+        return l?dispToRaw(l,n):n;
+      }
+      $('advLoR').addEventListener('input',e=>syncLo(+e.target.value));
+      $('advLo').addEventListener('change',e=>syncLo(typedToRaw(e.target.value,0)));
+      $('advHiR').addEventListener('input',e=>syncHi(+e.target.value));
+      $('advHi').addEventListener('change',e=>syncHi(typedToRaw(e.target.value,127)));
+
+      // Re-labels the two boxes and the scale under the sliders for whichever
+      // lane is active. Called when the panel opens and when the active lane
+      // changes, since a project mixes lanes with different ranges.
+      window.__refreshAdvUnits=function(){
+        const l=advUnitLane();
+        const box=[$('advLo'),$('advHi')];
+        box.forEach(function(b){ if(!b) return;
+          if(l){ const r=laneRange(l), lo=rawToDisp(l,r.min), hi=rawToDisp(l,r.max);
+            b.min=String(Math.min(lo,hi)); b.max=String(Math.max(lo,hi));
+            b.step=laneUnits(l)==='midi'?'1':'any';
+          } else { b.min='0'; b.max='127'; b.step='1'; }
+        });
+        $('advLo').value=advFmt(state.genLo); $('advHi').value=advFmt(state.genHi);
+        const sc=$('advScaleMarks');
+        if(sc){
+          const marks=[0,32,64,96,127];
+          [...sc.children].forEach(function(el,i){ el.textContent=advFmt(marks[i]); });
+        }
+        const u=$('advUnitsTag');
+        if(u) u.textContent=l?(laneUnits(l)==='midi'?'MIDI 0-127':laneUnits(l)==='pct'?'percent 0-100'
+          :('native '+fmtNum(l.isf.min)+'–'+fmtNum(l.isf.max))):'MIDI 0-127';
+      };
       updateDualTrack();
 
       // Output mode — wire radios + toggle Generate/Transform panels
