@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.45
+  MMV MIDI & CC Curve Editor v0.9.46
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1142,6 +1142,42 @@
 
   Markers are part of the project: they save, load, and undo in one step, and
   a project saved before they existed loads with none rather than failing.
+
+
+  v0.9.46 Markers travel in the .mid, and the Value Range can read as a
+  percentage.
+
+  Section markers now export as standard MIDI Marker meta-events (FF 06), so
+  the structure of a show survives into Cubase and anything else that reads
+  them, and import brings them back — offset with everything else on an
+  insert-at-position import, merged rather than replacing. The text is UTF-8,
+  the length is a proper variable-length quantity rather than a single byte
+  (a long name would otherwise corrupt everything after it), and names are
+  capped at 127 bytes on a character boundary so a multi-byte character can
+  never be cut in half. Markers deliberately take no part in the "first event"
+  calculation that anchors an insert: that anchor is about audible material,
+  and a marker at tick 0 would otherwise drag the imported pattern with it.
+
+  The Generate ▸ Advanced VALUE RANGE gained a small 0-127 / % toggle. Working
+  against an ISF parameter that runs 0.00-1.00 means converting by hand —
+  0.8 x 127 = 101.6, so CC102 — and that arithmetic is where the mistakes come
+  from. In percent mode you type 80 and 90 and get exactly those values.
+
+  It is a relabelling of two number boxes and the scale beneath the sliders,
+  and nothing else. state.genLo/genHi stay raw 0-127, the sliders stay raw,
+  the lanes keep showing raw MIDI, and flipping the toggle leaves the
+  serialised project byte-identical — asserted directly, by comparing
+  snapshot() either side of a click, which covers every downstream feature at
+  once rather than one at a time. An earlier draft applied units per-lane
+  including the V field, which meant a typed value passed through a conversion
+  before being stored; that put a rounding bug within reach of curves already
+  drawn, for the sake of saving some arithmetic, and was withdrawn. A display
+  convenience is not worth any risk at all to the data.
+
+  Values read to one decimal in percent, because 128 raw values map onto only
+  101 whole percentages and 27 of them would otherwise print as a duplicate of
+  their neighbour. After typing 80 the field shows 80.3, which is what CC102
+  genuinely is — the true stored value, not the typed one.
 
 -->
 
