@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.46
+  MMV MIDI & CC Curve Editor v0.9.47
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1178,6 +1178,50 @@
   101 whole percentages and 27 of them would otherwise print as a duplicate of
   their neighbour. After typing 80 the field shows 80.3, which is what CC102
   genuinely is — the true stored value, not the typed one.
+
+
+  v0.9.47 Macros: stretch to note length, bounce down, and a fix to which
+  instance wins an overlap.
+
+  A macro can now be set to Stretch, per macro, in Setup > CC Macros. A
+  stretched macro spans whatever the note is long — halve the note and the
+  curve halves with it, at the same shape. Fixed is the default and the
+  existing behaviour: the span is the length it was captured at, whatever the
+  note does. Only a stretch macro re-bakes on a resize, so a fixed one costs
+  nothing when notes are edited. Tempo was never in question: macros hold tick
+  offsets, so they already follow the tempo map without anything being added.
+
+  The overlap rule was wrong in a way that only a stretch macro would have made
+  obvious. Where two instances cover the same ticks the later bake wins, but
+  resyncMacros walked state.notes in ARRAY order — so "later" meant added
+  later, not later in the piece, and drawing an early note after a late one
+  would have had it overwrite the later note's curve. Baking now runs in
+  timeline order. Retriggering an effect before the previous one has finished
+  therefore does what it looks like: the new instance takes the overlap, the
+  earlier note keeps its own length and so its own speed, and nothing is
+  truncated.
+
+  Bounce to CC cuts a curve loose from its note. The points stay exactly where
+  they are and simply stop being a macro instance: editable by hand, untouched
+  when the note is moved or deleted, and safe from the next resync. It is the
+  answer to two macros competing over one lane, and to wanting only part of
+  what a macro drew. A bounced note is also marked so a pitch binding cannot
+  quietly bake a second copy over the top of it, which would have undone the
+  bounce on the very next edit.
+
+  A fixed-length macro on a short note controls CC well past the note you can
+  see — an ordinary situation with a drum map, where every hit is a 1/32. Those
+  notes now draw a dashed amber outline showing how far their curve actually
+  reaches. It appears only when the span really does exceed the note, so a
+  stretch macro never draws one.
+
+  Two smaller things. Compressing a macro onto a short note used to round
+  several source points onto the same tick and keep them all; they are now
+  collapsed to one point per tick, which is also why no minimum note length is
+  needed — a 1/32 note is 60 ticks and can hold at most 60 points. And the Note
+  Info Duration field did not call resyncMacros at all, which was harmless
+  while length could not affect a bake and would have meant typing a duration
+  and dragging the note's end gave different results.
 
 -->
 
