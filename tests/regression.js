@@ -10199,41 +10199,45 @@ async function run() {
     }, BAR47);
 
     // Fixed is the default, and a resize must NOT move it.
-    const fixed = await page.evaluate(({ BAR, mid }) => {
+    // withPage seeds a baseline lane, so always use the id captured above —
+    // ccLanes[0] is not the lane this test created.
+    const fixed = await page.evaluate(({ BAR, mid, laneId }) => {
       const nid = window._TEST_addNote({ start: BAR * 2, pitch: 60, length: BAR });
       window._TEST_assignMacroToNote(nid, mid);
       const before = window._TEST_macroSpanFor(nid, mid);
       window._TEST_setNoteLen(nid, BAR / 2);
       return { nid, before, after: window._TEST_macroSpanFor(nid, mid),
-               pts: window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).filter(p => p.mi != null).length };
-    }, { BAR: BAR47, mid: setup.mid });
+               pts: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length };
+    }, { BAR: BAR47, mid: setup.mid, laneId: setup.laneId });
     check('a macro is Fixed by default — halving the note leaves its span alone',
       fixed.before === BAR47 && fixed.after === BAR47, fixed);
 
     // Turn stretch on: the span becomes the note's own length.
-    const stretched = await page.evaluate(({ BAR, mid, nid }) => {
+    const stretched = await page.evaluate(({ BAR, mid, nid, laneId }) => {
       window._TEST_setMacroStretch(mid, true);
       window._TEST_resyncMacros();
       const half = window._TEST_macroSpanFor(nid, mid);
       window._TEST_setNoteLen(nid, BAR * 2);
       const dbl = window._TEST_macroSpanFor(nid, mid);
-      const pts = window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).filter(p => p.mi != null);
-      return { half, dbl, lo: Math.min(...pts.map(p => p.t)), hi: Math.max(...pts.map(p => p.t)) };
-    }, { BAR: BAR47, mid: setup.mid, nid: fixed.nid });
+      const pts = window._TEST_lanePoints(laneId).filter(p => p.mi != null);
+      return { half, dbl, n: pts.length,
+               lo: pts.length ? Math.min(...pts.map(p => p.t)) : null,
+               hi: pts.length ? Math.max(...pts.map(p => p.t)) : null };
+    }, { BAR: BAR47, mid: setup.mid, nid: fixed.nid, laneId: setup.laneId });
     check('with Stretch on, a half-length note gives a half-length span',
       stretched.half === BAR47 / 2, stretched);
     check('...and a double-length note gives a double-length span', stretched.dbl === BAR47 * 2, stretched);
     check('...with the baked points actually spanning the note, not the capture',
-      stretched.hi - stretched.lo >= BAR47 * 2 - 4, stretched);
+      stretched.n > 2 && stretched.hi - stretched.lo >= BAR47 * 2 - 4, stretched);
 
     // The shape survives the stretch: the peak stays at the middle.
-    const shape = await page.evaluate(() => {
-      const lane = window._TEST_state.ccLanes[0];
-      const pts = window._TEST_lanePoints(lane.id).filter(p => p.mi != null).sort((a, b) => a.t - b.t);
+    const shape = await page.evaluate((laneId) => {
+      const pts = window._TEST_lanePoints(laneId).filter(p => p.mi != null).sort((a, b) => a.t - b.t);
+      if (pts.length < 3) return { n: pts.length, peakV: null, frac: null };
       const peak = pts.reduce((best, p) => (p.v > best.v ? p : best), pts[0]);
       const lo = pts[0].t, hi = pts[pts.length - 1].t;
-      return { peakV: peak.v, frac: (peak.t - lo) / (hi - lo) };
-    });
+      return { n: pts.length, peakV: peak.v, frac: (peak.t - lo) / (hi - lo) };
+    }, setup.laneId);
     check('stretching scales the shape rather than distorting it — the peak stays mid-span',
       shape.peakV === 127 && Math.abs(shape.frac - 0.5) < 0.05, shape);
   });
