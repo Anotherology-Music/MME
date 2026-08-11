@@ -6170,6 +6170,29 @@
     const bytes=[...MMV_SIG,...Array.from(new TextEncoder().encode(json))];
     return [0xFF,0x7F,...writeVarLen(bytes.length),...bytes];
   }
+  // Section markers travel as standard Marker meta-events (0xFF 0x06), so
+  // Cubase/Logic/Reaper show them on their own marker tracks.
+  // Two traps this avoids: the length is a variable-length quantity, not a
+  // single byte (a 128-character section name written with a one-byte length
+  // would make every event after it unreadable), and the text is UTF-8 — an
+  // em dash in "Chapter 1 — Built For Good" is three bytes, not one, so
+  // charCodeAt would write garbage. The name is also capped at 127 bytes so
+  // the common case stays a single length byte, cut on a character boundary
+  // so a multi-byte character is never chopped in half.
+  const MARKER_TEXT_MAX_BYTES=127;
+  function utf8Trunc(text,maxBytes){
+    const enc=new TextEncoder(), all=enc.encode(String(text||''));
+    if(all.length<=maxBytes) return all;
+    // Walk whole code points (Array.from keeps surrogate pairs together) and
+    // stop before the one that would cross the limit.
+    let n=0;
+    for(const cp of Array.from(String(text))){ const len=enc.encode(cp).length; if(n+len>maxBytes) break; n+=len; }
+    return all.subarray(0,n);
+  }
+  function markerMetaBytes(text){
+    const bytes=utf8Trunc(text,MARKER_TEXT_MAX_BYTES);
+    return [0xFF,0x06,...writeVarLen(bytes.length),...bytes];
+  }
   // opts.soloOnly: only include lanes with .soloed (ignored if nothing is
   // soloed, rather than silently exporting an empty CC set). opts.excludeMuted:
   // leave out any .muted lane. Both default off — Mute/Solo are ignored by
@@ -6180,6 +6203,9 @@
     tempoMapSorted().forEach(s=>{ const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
     tsMapSorted().forEach(s=>{ const dd=Math.round(Math.log2(s.den)); ev.push({tick:s.tick,o:0,d:[0xFF,0x58,0x04,s.num,dd,24,8]}); });
     ev.push({tick:0,o:0,d:buildMmvMeta()});
+    // Markers are song structure, not automation, so Solo/Mute-only export
+    // (which is about which CC lanes go out) never removes them.
+    (state.markers||[]).forEach(m=>{ ev.push({tick:Math.max(0,Math.round(m.tick)),o:0,d:markerMetaBytes(markerLabel(m))}); });
     for(const n of state.notes){ const ch=n.ch&15; ev.push({tick:Math.round(n.start),o:2,d:[0x90|ch,n.pitch&127,clamp(n.vel,1,127)]}); ev.push({tick:Math.round(n.start+Math.max(1,n.length)),o:1,d:[0x80|ch,n.pitch&127,0]}); }
     const end=totalTicks(), step=Math.max(1,Math.round(state.ppq/state.ccRes));
     for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue;
@@ -6463,13 +6489,18 @@
 
   function parseMidi(buf){ const dv=new DataView(buf); let p=0; const rd=n=>{let v=0;for(let i=0;i<n;i++){v=(v<<8)|dv.getUint8(p++);}return v;};
     if(rd(4)!==0x4D546864) throw new Error('Not a MIDI file'); rd(4); const fmt=rd(2), ntrk=rd(2), div=rd(2);
-    const notes=[], ccMap={}, pbMap={}, cpMap={}, tsEvents=[], tempoEvents=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
+    const notes=[], ccMap={}, pbMap={}, cpMap={}, tsEvents=[], tempoEvents=[], markers=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
     for(let ti=0;ti<ntrk;ti++){ if(rd(4)!==0x4D54726B) break; const len=rd(4); const end=p+len; let abs=0, status=0; const open={};
       while(p<end){ let delta=0,b; do{ b=dv.getUint8(p++); delta=(delta<<7)|(b&0x7F);}while(b&0x80); abs+=delta;
         let s=dv.getUint8(p); if(s&0x80){ status=s; p++; } else { s=status; } const type=s&0xF0, ch=s&0x0F;
         if(s===0xFF){ const meta=dv.getUint8(p++); let l=0,bb; do{bb=dv.getUint8(p++);l=(l<<7)|(bb&0x7F);}while(bb&0x80);
           if(meta===0x51 && l===3){ const t=(dv.getUint8(p)<<16)|(dv.getUint8(p+1)<<8)|dv.getUint8(p+2); bpm=Math.round(60000000/t); tempoEvents.push({tick:abs,bpm}); }
           if(meta===0x58 && l>=2){ tsN=dv.getUint8(p); tsD=Math.pow(2,dv.getUint8(p+1)); tsEvents.push({tick:abs,num:tsN,den:tsD}); }
+          // 0x06 Marker: section names. Decoded as UTF-8 — that is what MME
+          // writes, and it degrades gracefully for the plain-ASCII names
+          // other sequencers produce.
+          if(meta===0x06 && l>0){
+            try{ const name=new TextDecoder().decode(dv.buffer.slice(p,p+l)).replace(/\0+$/,'').trim(); if(name) markers.push({tick:abs,name}); }catch(e){} }
           if(meta===0x7F && l>3 && dv.getUint8(p)===0x4D && dv.getUint8(p+1)===0x4D && dv.getUint8(p+2)===0x56){
             try{ mmvMeta=JSON.parse(new TextDecoder().decode(dv.buffer.slice(p+3,p+l))); }catch(e){} }
           p+=l; continue; }
@@ -6481,7 +6512,8 @@
         else if(type===0xE0){ const lsb=dv.getUint8(p++),msb=dv.getUint8(p++); const pv=(lsb|(msb<<7))-8192; const k='pb_'+ch; (pbMap[k]=pbMap[k]||{ch,points:[]}).points.push({t:abs,v:pv}); }
         else if(type===0xD0){ const v=dv.getUint8(p++); const k='cp_'+ch; (cpMap[k]=cpMap[k]||{ch,points:[]}).points.push({t:abs,v}); }
         else if(type===0xC0){ p+=1; } else { p++; } } p=end; }
-    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,cpMap,mmvMeta,tsEvents,tempoEvents}; }
+    markers.sort((a,b)=>a.tick-b.tick);
+    return {fmt,div,bpm,tsN,tsD,notes,ccMap,pbMap,cpMap,mmvMeta,tsEvents,tempoEvents,markers}; }
   function closeNote(open,ch,pitch,abs,notes){ const arr=open[ch+'_'+pitch]; if(arr&&arr.length){ const o=arr.shift(); notes.push({start:o.start,length:Math.max(1,abs-o.start),pitch,vel:o.vel,ch}); } }
   // Reads the Setup panel's Import .mid options. Kept separate from
   // importMidi() so the parsing of the "Insert at" field (which can hold
@@ -6863,7 +6895,14 @@
       state.tempoMap=tempoMapFromEvents(r.tempoEvents,clamp(r.bpm,20,400),1);
       state.bpm=state.tempoMap[0].bpm;
       state.notes=r.notes.map(n=>({id:state.nextId++,...n}));
+      // Marker meta-events become section markers. Replace means replace: the
+      // file's structure is the project's structure now.
+      state.markers=(r.markers||[]).map(m=>({tick:Math.max(0,Math.round(m.tick)),name:m.name||''}));
+      sortMarkers();
       let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+n.length)); Object.values(r.ccMap).forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,pt.t)));
+      // A marker past the last note still has to fit inside the song, or it
+      // would be unreachable the moment it arrived.
+      state.markers.forEach(m=>maxT=Math.max(maxT,m.tick));
       state.bars=Math.max(1,Math.ceil(maxT/ticksPerBar())+1);
       state.ccLanes.forEach(l=>l._row&&l._row.remove()); state.ccLanes=[];
       Object.values(r.ccMap).forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:64},{t:totalTicks(),v:64}]; });
@@ -6875,7 +6914,7 @@
         const ln=r.mmvMeta.laneNames||{};
         state.ccLanes.forEach(l=>{ const name=ln[l.cc+'_'+l.ch]; if(name){ l.name=name; l._row.querySelector('.lname').value=name; } });
       }
-      syncInputs(); updateDuration(); resizeCanvases();
+      syncInputs(); updateDuration(); resizeCanvases(); renderMarkerBar();
       return;
     }
     // merge / insert — add the imported notes/lanes alongside whatever is already in the project
@@ -6933,7 +6972,16 @@
     ccList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
     pbList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
     cpList.forEach(l=>l.points.forEach(pt=>maxT=Math.max(maxT,shiftPt(pt).t)));
+    // Imported markers ride the same rescale + insert offset as the notes, and
+    // join the project's existing markers instead of wiping them — a merge or
+    // an insert is adding a section to a song, not replacing its structure.
+    const mkList=(r.markers||[]).map(m=>({tick:Math.max(0,Math.round(m.tick*scale)+shift),name:m.name||''}));
+    mkList.forEach(m=>maxT=Math.max(maxT,m.tick));
     state.bars=Math.max(state.bars,Math.ceil(maxT/ticksPerBar())+1);
+    // After the song has grown, so a late section is not clamped back to the
+    // old end. addMarker keeps the list sorted and collapses a collision onto
+    // the marker already there rather than hiding one underneath another.
+    mkList.forEach(m=>addMarker(m.tick,m.name));
     const newLanes=[];
     ccList.forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:64},{t:totalTicks(),v:64}]; newLanes.push(lane); });
     pbList.forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
@@ -6947,7 +6995,7 @@
     // its target lanes, and resolving them before this point would silently
     // "skip" lanes that were about to be created a few lines above.
     resyncMacros();
-    syncInputs(); updateDuration(); resizeCanvases();
+    syncInputs(); updateDuration(); resizeCanvases(); renderMarkerBar();
   }
 
   // ---------- Web MIDI out + in ----------

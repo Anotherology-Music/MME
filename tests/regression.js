@@ -34,6 +34,57 @@ function makeWavBytes(seconds) {
   return [...buf];
 }
 
+// Independent byte-level walker for exported .mid files. Deliberately NOT the
+// app's own parseMidi: a round trip through one codebase happily agrees with
+// itself about a mis-encoded length, so the export tests decode the real bytes
+// here and assert on them (meta type, absolute tick, and how many bytes the
+// length itself took) instead of trusting the app to check its own work.
+function decodeMidiEvents(bytes) {
+  const b = Uint8Array.from(bytes);
+  let p = 0;
+  const rd = (n) => { let v = 0; for (let i = 0; i < n; i++) v = (v << 8) | b[p++]; return v; };
+  if (rd(4) !== 0x4D546864) throw new Error('not a MIDI file');
+  const hlen = rd(4);
+  const fmt = rd(2), ntrk = rd(2), div = rd(2);
+  p += Math.max(0, hlen - 6);
+  const events = [];
+  for (let t = 0; t < ntrk; t++) {
+    if (rd(4) !== 0x4D54726B) throw new Error('missing track chunk');
+    const len = rd(4), end = p + len;
+    let abs = 0, status = 0;
+    while (p < end) {
+      let delta = 0, x;
+      do { x = b[p++]; delta = (delta << 7) | (x & 0x7F); } while (x & 0x80);
+      abs += delta;
+      let s = b[p];
+      if (s & 0x80) { status = s; p++; } else { s = status; }
+      if (s === 0xFF) {
+        const meta = b[p++], lenStart = p;
+        let l = 0, y;
+        do { y = b[p++]; l = (l << 7) | (y & 0x7F); } while (y & 0x80);
+        const lenByteCount = p - lenStart;
+        const data = [...b.slice(p, p + l)];
+        p += l;
+        if (p > end) throw new Error('meta event ' + meta + ' overran the track chunk');
+        events.push({ kind: 'meta', meta, tick: abs, len: l, lenByteCount, data,
+          text: Buffer.from(data).toString('utf8') });
+        continue;
+      }
+      if (s === 0xF0 || s === 0xF7) {
+        let l = 0, y;
+        do { y = b[p++]; l = (l << 7) | (y & 0x7F); } while (y & 0x80);
+        p += l; continue;
+      }
+      const type = s & 0xF0, nData = (type === 0xC0 || type === 0xD0) ? 1 : 2;
+      events.push({ kind: 'chan', type, ch: s & 0x0F, tick: abs, data: [...b.slice(p, p + nData)] });
+      p += nData;
+    }
+    if (p !== end) throw new Error('track chunk did not end where its length said it would');
+    p = end;
+  }
+  return { fmt, ntrk, div, events };
+}
+
 function buildTestHtml() {
   let html = fs.readFileSync(APP_PATH, 'utf8');
   html = html.replace('  const state = {', '  window._TEST_state = null;\n  const state = {');
@@ -48,7 +99,7 @@ function buildTestHtml() {
       '  window._TEST_snapshot = snapshot;',
       '  window._TEST_applyState = applyState;',
       '  window._TEST_buildMidi = (opts) => Array.from(buildMidi(opts));',
-      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, pbMap: r.pbMap, cpMap: r.cpMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents, tempoEvents: r.tempoEvents }; };',
+      '  window._TEST_parseMidi = (bytes) => { const r = parseMidi(new Uint8Array(bytes).buffer); return { notes: r.notes, ccMap: r.ccMap, pbMap: r.pbMap, cpMap: r.cpMap, bpm: r.bpm, tsN: r.tsN, tsD: r.tsD, div: r.div, tsEvents: r.tsEvents, tempoEvents: r.tempoEvents, markers: r.markers }; };',
       '  window._TEST_addLane = (cc, ch) => { const l = addLane(cc, ch); return l.id; };',
       '  window._TEST_addPbLane = (ch) => { const l = addPbLane(ch); return l.id; };',
       '  window._TEST_addCpLane = (ch) => { const l = addCpLane(ch); return l.id; };',
@@ -9804,6 +9855,214 @@ async function run() {
     });
     check('a project saved before markers existed loads with none, not a crash',
       Array.isArray(legacy.markers) && legacy.markers.length === 0 && legacy.hidden, legacy);
+  });
+
+  // ---------------- markers <-> MIDI Marker meta-events (FF 06) ----------------
+
+  // Exported once, then re-imported by the tests below, so what goes into the
+  // file and what comes back out of it are provably the same bytes.
+  let markerFileBytes = null;
+
+  await withPage(browser, async (page) => {
+    await page.evaluate(() => {
+      window._TEST_setMarkers([
+        { tick: 0, name: 'Overture' },
+        { tick: 1920, name: 'Chapter 1 — Built For Good' },
+        { tick: 3840, name: '' },
+      ]);
+      window._TEST_addNote({ pitch: 60, start: 1920, length: 240, vel: 100, ch: 0 });
+    });
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    markerFileBytes = bytes;
+    const marks = decodeMidiEvents(bytes).events.filter(e => e.kind === 'meta' && e.meta === 0x06);
+    check('every section marker is exported as a standard Marker meta-event (FF 06)',
+      marks.length === 3, marks.map(m => m.text));
+    check('...sited at the marker\'s own tick', marks.map(m => m.tick).join(',') === '0,1920,3840', marks.map(m => m.tick));
+    check('...with the text length written as a variable-length quantity — one byte for a short name',
+      marks.every(m => m.lenByteCount === 1 && m.len === m.data.length),
+      marks.map(m => ({ len: m.len, lenBytes: m.lenByteCount })));
+    check('an unnamed marker exports under the name shown on screen, not as an empty event',
+      marks[2].text === 'Marker 3' && marks[2].len === 8, marks[2].text);
+    // The em-dash trap: charCodeAt would have written one bogus byte for it.
+    check('a name with a non-ASCII character is written as UTF-8, not one byte per character',
+      marks[1].text === 'Chapter 1 — Built For Good' && marks[1].len === Buffer.byteLength(marks[1].text, 'utf8'),
+      { text: marks[1].text, len: marks[1].len });
+
+    const parsed = await page.evaluate((b) => window._TEST_parseMidi(b), bytes);
+    check('markers round-trip back out of a .mid with their ticks and names intact',
+      parsed.markers.map(m => m.tick + ':' + m.name).join(',')
+      === '0:Overture,1920:Chapter 1 — Built For Good,3840:Marker 3', parsed.markers);
+  });
+
+  await withPage(browser, async (page) => {
+    // The failure that actually destroys a file: a name past 127 bytes whose
+    // length is written as a single byte swallows everything after it.
+    const longName = 'A'.repeat(120) + '—'.repeat(10);   // 120 + 30 = 150 bytes
+    await page.evaluate((n) => {
+      window._TEST_setMarkers([{ tick: 0, name: n }, { tick: 3840, name: 'Later Section' }]);
+      window._TEST_addNote({ pitch: 64, start: 1920, length: 240, vel: 101, ch: 0 });
+      const id = window._TEST_addLane(74, 0);
+      window._TEST_upsertPoint(id, 2400, 90);
+    }, longName);
+    const bytes = await page.evaluate(() => window._TEST_buildMidi());
+    let decoded = null, decodeErr = null;
+    try { decoded = decodeMidiEvents(bytes); } catch (e) { decodeErr = e.message; }
+    check('a marker name longer than 127 bytes still produces a structurally valid file', !!decoded, decodeErr);
+    const evs = decoded ? decoded.events : [];
+    const marks = evs.filter(e => e.kind === 'meta' && e.meta === 0x06);
+    check('...with the over-long name capped so its length stays a single byte',
+      marks.length === 2 && marks[0].len <= 127 && marks[0].lenByteCount === 1,
+      marks.map(m => ({ len: m.len, lenBytes: m.lenByteCount })));
+    check('...cut on a character boundary, never through the middle of a UTF-8 character',
+      marks.length === 2 && !/\uFFFD/.test(marks[0].text) && marks[0].text === 'A'.repeat(120) + '—'.repeat(2),
+      marks.length ? marks[0].text.length : null);
+    // What a broken length byte really destroys is everything AFTER it.
+    const noteOns = evs.filter(e => e.kind === 'chan' && e.type === 0x90 && e.data[1] > 0);
+    check('...and the note written after the long marker is still exactly where it was',
+      noteOns.length === 1 && noteOns[0].tick === 1920 && noteOns[0].data[0] === 64, noteOns);
+    const cc74 = evs.filter(e => e.kind === 'chan' && e.type === 0xB0 && e.data[0] === 74);
+    check('...and the CC written after it is still readable',
+      cc74.some(e => e.tick === 2400 && e.data[1] === 90), cc74.slice(-3));
+    check('...and the NEXT marker still arrives at its own tick with its own name',
+      marks.length === 2 && marks[1].tick === 3840 && marks[1].text === 'Later Section', marks[1]);
+
+    const parsed = await page.evaluate((b) => window._TEST_parseMidi(b), bytes);
+    check('...and the app reads its own long-marker file back without losing the rest of the song',
+      parsed.markers.length === 2 && parsed.markers[1].name === 'Later Section'
+      && parsed.notes.length === 1 && parsed.notes[0].start === 1920,
+      { markers: parsed.markers.map(m => m.tick), notes: parsed.notes.length });
+  });
+
+  await withPage(browser, async (page) => {
+    // Solo/Mute-only export is about which CC lanes go out; song structure is
+    // not automation and must survive either switch.
+    await page.evaluate(() => {
+      const muted = window._TEST_addLane(11, 0), soloed = window._TEST_addLane(74, 0);
+      window._TEST_upsertPoint(muted, 960, 20);
+      window._TEST_upsertPoint(soloed, 960, 90);
+      const s = window._TEST_state;
+      s.ccLanes.find(l => l.id === muted).muted = true;
+      s.ccLanes.find(l => l.id === soloed).soloed = true;
+      window._TEST_setMarkers([{ tick: 0, name: 'Intro' }, { tick: 960, name: 'Drop' }]);
+    });
+    for (const opts of [{ soloOnly: true }, { excludeMuted: true }, { soloOnly: true, excludeMuted: true }]) {
+      const bytes = await page.evaluate((o) => window._TEST_buildMidi(o), opts);
+      const marks = decodeMidiEvents(bytes).events.filter(e => e.kind === 'meta' && e.meta === 0x06);
+      check('markers are exported with ' + JSON.stringify(opts) + ' set — Solo/Mute leaves song structure alone',
+        marks.length === 2 && marks[0].text === 'Intro' && marks[1].text === 'Drop', marks.map(m => m.text));
+    }
+  });
+
+  await withPage(browser, async (page) => {
+    // Opening a .mid that carries markers, through the real import path.
+    const before = await page.evaluate(() => window._TEST_markers().length);
+    await page.evaluate((b) => window._TEST_importMidi(b, 'sections.mid'), markerFileBytes);
+    await page.waitForTimeout(200);
+    const after = await page.evaluate(() => ({
+      markers: window._TEST_markers(),
+      chips: [...document.querySelectorAll('.marker-chip')].map(c => c.textContent),
+      hidden: getComputedStyle(document.getElementById('markerBar')).display === 'none',
+    }));
+    check('importing a .mid containing markers fills the project in with them',
+      before === 0 && after.markers.map(m => m.tick + ':' + m.name).join(',')
+      === '0:Overture,1920:Chapter 1 — Built For Good,3840:Marker 3', after.markers);
+    check('...and the numbered index bar appears, one chip per section',
+      !after.hidden && after.chips.join(',') === '1,2,3', after.chips);
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(200);
+    const undone = await page.evaluate(() => window._TEST_markers().length);
+    check('...with the whole import, markers included, undone in one step', undone === 0, undone);
+  });
+
+  await withPage(browser, async (page) => {
+    // Insert at a position: the file's sections move with its notes, and the
+    // sections already in the project are left where they are.
+    await page.evaluate(() => {
+      window._TEST_setMarkers([{ tick: 0, name: 'Existing' }]);
+      window._TEST_addNote({ pitch: 72, start: 0, length: 240, vel: 100, ch: 5 });
+      document.getElementById('midiImportInsert').click();
+      document.getElementById('midiInsertChMode').value = 'keep';
+      const at = document.getElementById('midiInsertAt');
+      at.value = '5.1.1.0'; at.dispatchEvent(new Event('change'));
+    });
+    await page.evaluate((b) => window._TEST_importMidi(b, 'sections.mid'), markerFileBytes);
+    await page.waitForTimeout(200);
+    const res = await page.evaluate(() => ({
+      bar5: window._TEST_barToTick(4),
+      markers: window._TEST_markers(),
+      chips: [...document.querySelectorAll('.marker-chip')].length,
+    }));
+    check('an Insert-at-position import keeps the markers the project already had',
+      res.markers.length === 4 && res.markers[0].tick === 0 && res.markers[0].name === 'Existing', res.markers);
+    check('...and offsets the imported ones by the insert position, exactly as it does the notes',
+      res.markers.slice(1).map(m => m.tick - res.bar5).join(',') === '0,1920,3840',
+      { markers: res.markers.map(m => m.tick), bar5: res.bar5 });
+    check('...then refreshes the index bar to match', res.chips === 4, res.chips);
+  });
+
+  await withPage(browser, async (page) => {
+    const plain = await page.evaluate(() => {
+      window._TEST_setMarkers([]);
+      window._TEST_addNote({ pitch: 60, start: 0, length: 240, vel: 100, ch: 0 });
+      return window._TEST_buildMidi();
+    });
+    const marks = decodeMidiEvents(plain).events.filter(e => e.kind === 'meta' && e.meta === 0x06);
+    check('a project with no markers writes no Marker meta-events at all', marks.length === 0, marks.length);
+
+    await page.evaluate(() => {
+      window._TEST_setMarkers([{ tick: 480, name: 'Mine' }]);
+      document.getElementById('midiImportInsert').click();
+      const at = document.getElementById('midiInsertAt');
+      at.value = '3.1.1.0'; at.dispatchEvent(new Event('change'));
+    });
+    await page.evaluate((b) => window._TEST_importMidi(b, 'plain.mid'), plain);
+    await page.waitForTimeout(200);
+    const kept = await page.evaluate(() => window._TEST_markers());
+    check('inserting a marker-less .mid leaves the project\'s own markers exactly as they were',
+      kept.length === 1 && kept[0].tick === 480 && kept[0].name === 'Mine', kept);
+  });
+
+  await withPage(browser, async (page) => {
+    const plain = await page.evaluate(() => {
+      window._TEST_addNote({ pitch: 60, start: 0, length: 240, vel: 100, ch: 0 });
+      const b = window._TEST_buildMidi();
+      window._TEST_state.notes = [];   // back to an empty project, so this opens rather than asking
+      return b;
+    });
+    await page.evaluate((b) => window._TEST_importMidi(b, 'plain.mid'), plain);
+    await page.waitForTimeout(200);
+    const res = await page.evaluate(() => ({
+      markers: window._TEST_markers(),
+      hidden: getComputedStyle(document.getElementById('markerBar')).display === 'none',
+    }));
+    check('opening a marker-less .mid into a fresh project leaves it with no markers and no index bar',
+      res.markers.length === 0 && res.hidden, res);
+  });
+
+  await withPage(browser, async (page) => {
+    // Another sequencer's marker can run past 127 bytes, so its length arrives
+    // as a two-byte variable-length quantity. Reading only one byte of it
+    // would desynchronise the rest of the track.
+    const name = 'Section ' + 'x'.repeat(200);
+    const enc = [...Buffer.from(name, 'utf8')];
+    const vlq = (v) => { const out = [v & 0x7F]; v >>= 7; while (v > 0) { out.push((v & 0x7F) | 0x80); v >>= 7; } return out.reverse(); };
+    const trk = [
+      0x00, 0xFF, 0x06, ...vlq(enc.length), ...enc,
+      0x00, 0x90, 0x3C, 0x64,
+      0x83, 0x60, 0x80, 0x3C, 0x00,      // note off 480 ticks later
+      0x00, 0xFF, 0x2F, 0x00,
+    ];
+    const bytes = [
+      0x4D, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0,
+      0x4D, 0x54, 0x72, 0x6B, (trk.length >> 24) & 255, (trk.length >> 16) & 255, (trk.length >> 8) & 255, trk.length & 255,
+      ...trk,
+    ];
+    const parsed = await page.evaluate((b) => window._TEST_parseMidi(b), bytes);
+    check('a foreign marker whose length needs two bytes is read without losing the events after it',
+      parsed.markers.length === 1 && parsed.markers[0].name === name
+      && parsed.notes.length === 1 && parsed.notes[0].length === 480,
+      { nameLen: parsed.markers.length ? parsed.markers[0].name.length : null, notes: parsed.notes });
   });
 
   await browser.close();
