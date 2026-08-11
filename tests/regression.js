@@ -10069,7 +10069,9 @@ async function run() {
 
   await withPage(browser, async (page) => {
     await page.evaluate(() => { try { localStorage.removeItem('mmv-adv-pct'); } catch (e) {} });
-    await page.evaluate(() => window._TEST_addLane(30, 0));
+    // withPage seeds a baseline lane, so hold on to the id of the one added
+    // here rather than assuming ccLanes[0].
+    const pctLaneId = await page.evaluate(() => window._TEST_addLane(30, 0));
     await page.click('#genAdvBtn');
     await page.waitForTimeout(250);
 
@@ -10120,21 +10122,38 @@ async function run() {
       back.toggle === '0-127' && back.lo === '102' && back.hi === '114'
       && back.genLo === 102 && back.genHi === 114, back);
 
-    // The whole contract: this is a label, and Generate cannot tell it exists.
-    const same = await page.evaluate(() => {
-      const id = window._TEST_state.ccLanes[0].id;
-      const s = window._TEST_state;
-      s.locStart = 0; s.locEnd = 1920;
-      s.genLo = 102; s.genHi = 114;
-      document.getElementById('advPctToggle').click();           // -> percent
-      window._TEST_generate('sine');
-      const withPct = window._TEST_lanePoints(id).map(p => p.v);
-      document.getElementById('advPctToggle').click();           // -> raw
-      window._TEST_generate('sine');
-      const withMidi = window._TEST_lanePoints(id).map(p => p.v);
-      return { equal: withPct.length === withMidi.length && withPct.every((v, i) => v === withMidi[i]),
-               n: withPct.length, lo: Math.min(...withPct), hi: Math.max(...withPct) };
+    // The strongest statement of the contract: flipping the toggle must not
+    // alter one byte of project state. This covers everything downstream at
+    // once — curves, notes, ranges — rather than one feature at a time.
+    const untouched = await page.evaluate(() => {
+      const before = window._TEST_snapshot();
+      document.getElementById('advPctToggle').click();
+      const afterOn = window._TEST_snapshot();
+      document.getElementById('advPctToggle').click();
+      const afterOff = window._TEST_snapshot();
+      return { onSame: before === afterOn, offSame: before === afterOff, len: before.length };
     });
+    check('flipping the display toggle changes nothing in the project at all',
+      untouched.onSame && untouched.offSame, untouched);
+
+    // And end-to-end: the same Generate, run under each display mode.
+    const same = await page.evaluate((id) => {
+      const s = window._TEST_state;
+      s.activeLaneId = id; s.locStart = 0; s.locEnd = 1920;
+      s.genLo = 102; s.genHi = 114;
+      function run() {
+        window._TEST_setLanePoints(id, [{ t: 0, v: 0 }]);
+        window._TEST_generate('sine');
+        return window._TEST_lanePoints(id).map(p => p.v);
+      }
+      document.getElementById('advPctToggle').click();           // -> percent
+      const withPct = run();
+      document.getElementById('advPctToggle').click();           // -> raw
+      const withMidi = run();
+      const gen = withPct.filter(v => v > 0);
+      return { equal: withPct.length === withMidi.length && withPct.every((v, i) => v === withMidi[i]),
+               n: withPct.length, lo: Math.min(...gen), hi: Math.max(...gen) };
+    }, pctLaneId);
     check('the display toggle cannot change a single generated value',
       same.equal && same.n > 2, same);
     check('...and the generated curve really does span the raw 102-114 that 0.8-0.9 asks for',
