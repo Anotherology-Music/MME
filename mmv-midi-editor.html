@@ -3534,6 +3534,13 @@
     return laneHasNative(lane)?'native':'midi';
   }
   function laneUnitSuffix(lane){ return laneUnits(lane)==='pct'?'%':''; }
+  // A tidy number for labels: trims trailing zeros so a 0..1 range reads
+  // "0–1" rather than "0.000–1.000". Deliberately NOT the ISF block's
+  // fmtNum() — that lives inside its own IIFE and is not visible out here.
+  function fmtRangeNum(v){
+    if(!isFinite(v)) return '?';
+    return String(Math.round(v*1000)/1000);
+  }
   // Decimals are chosen from how much range one raw step covers, so the
   // display can always distinguish two adjacent values. Integer percent would
   // be wrong: 128 MIDI values collapse onto 101 whole percentages, so 27 of
@@ -3573,7 +3580,7 @@
     if(lane._valLbl){
       lane._valLbl.textContent=laneIsPb(lane)?'PB':laneIsCp(lane)?'CP':'V';
       const uname=u==='midi'?(laneIsPb(lane)?'raw ±8192':'raw 0-127'):u==='pct'?'0-100%'
-        :('native '+fmtNum(lane.isf.min)+'–'+fmtNum(lane.isf.max));
+        :('native '+fmtRangeNum(lane.isf.min)+'–'+fmtRangeNum(lane.isf.max));
       lane._valLbl.title='Value of the selected point, shown in '+uname
         +'\nClick to switch units (raw MIDI / percent'+(laneHasNative(lane)?' / the shader\'s own range':'')+')'
         +'\nWhat gets sent and exported never changes — only how it is displayed.';
@@ -11843,7 +11850,7 @@
         }
         const u=$('advUnitsTag');
         if(u) u.textContent=l?(laneUnits(l)==='midi'?'MIDI 0-127':laneUnits(l)==='pct'?'percent 0-100'
-          :('native '+fmtNum(l.isf.min)+'–'+fmtNum(l.isf.max))):'MIDI 0-127';
+          :('native '+fmtRangeNum(l.isf.min)+'–'+fmtRangeNum(l.isf.max))):'MIDI 0-127';
       };
       updateDualTrack();
 
