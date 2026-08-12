@@ -10531,6 +10531,67 @@ async function run() {
     await page.click('#macroDeleteCancel');
   });
 
+  // ---------------- v0.9.48: renaming a macro ----------------
+
+  await withPage(browser, async (page) => {
+    const s = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(25, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: BAR, v: 127 }]);
+      const st = window._TEST_state; st.locStart = 0; st.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Old Name', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      const nid = window._TEST_addNote({ start: BAR * 2, pitch: 40, length: BAR });
+      window._TEST_assignMacroToNote(nid, mid);
+      window._TEST_addMacroBinding(41, null, mid);
+      window._TEST_renderMacroBindings();
+      return { laneId, mid, nid, tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length };
+    }, 1920);
+
+    const shown = await page.evaluate((mid) =>
+      document.querySelector('#macroList [data-macro-id="' + mid + '"] [data-col="name"]').textContent, s.mid);
+    check('the macro list shows the captured name', shown === 'Old Name', shown);
+
+    page.once('dialog', d => d.accept('New Name'));
+    await page.evaluate((mid) =>
+      document.querySelector('#macroList [data-macro-id="' + mid + '"] [data-col="name"]').click(), s.mid);
+    await page.waitForTimeout(200);
+
+    const after = await page.evaluate((s) => ({
+      listed: document.querySelector('#macroList [data-macro-id="' + s.mid + '"] [data-col="name"]').textContent,
+      stored: window._TEST_macros()[0].name,
+      // Everything else reads the name back through macroById(), so it must
+      // follow without its own bookkeeping.
+      bindingText: document.getElementById('macroBindList').textContent,
+      pickerText: document.getElementById('macroBindMacro').textContent,
+      tagged: window._TEST_lanePoints(s.laneId).filter(p => p.mi != null).length,
+      noteStillLinked: window._TEST_noteById(s.nid).macroId === s.mid,
+    }), s);
+    check('clicking the name renames the macro', after.listed === 'New Name' && after.stored === 'New Name', after);
+    check('...and the bindings list and picker follow it without separate bookkeeping',
+      /New Name/.test(after.bindingText) && /New Name/.test(after.pickerText)
+      && !/Old Name/.test(after.bindingText), after);
+    check('...while the baked CC data and the note\'s link are untouched',
+      after.tagged === s.tagged && after.noteStillLinked, { after, was: s.tagged });
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(150);
+    const undone = await page.evaluate(() => window._TEST_macros()[0].name);
+    check('a rename is undoable', undone === 'Old Name', undone);
+
+    // Cancelling and clearing must both be no-ops rather than blanking it.
+    page.once('dialog', d => d.dismiss());
+    await page.evaluate((mid) =>
+      document.querySelector('#macroList [data-macro-id="' + mid + '"] [data-col="name"]').click(), s.mid);
+    await page.waitForTimeout(150);
+    page.once('dialog', d => d.accept('   '));
+    await page.evaluate((mid) =>
+      document.querySelector('#macroList [data-macro-id="' + mid + '"] [data-col="name"]').click(), s.mid);
+    await page.waitForTimeout(150);
+    const stillNamed = await page.evaluate(() => window._TEST_macros()[0].name);
+    check('cancelling, or entering only spaces, leaves the name alone rather than blanking it',
+      stillNamed === 'Old Name', stillNamed);
+  });
+
   await browser.close();
   server.close();
 

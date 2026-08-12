@@ -5774,7 +5774,23 @@
       row.className='setup-row'; row.dataset.macroId=m.id;
       row.style.cssText='padding:2px 0;';
       const nm=document.createElement('span'); nm.dataset.col='name'; nm.textContent=m.name;
-      nm.style.cssText='flex:1;min-width:80px;font-size:11px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      nm.style.cssText='flex:1;min-width:80px;font-size:11px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;'
+        +'white-space:nowrap;cursor:text;text-decoration:underline dotted rgba(140,147,161,.5);';
+      nm.title='Click to rename';
+      // Nothing stores a macro's name but the definition itself — the bindings
+      // list, the binding picker and Note Info all read it back through
+      // macroById() — so a rename is one assignment plus a redraw, and every
+      // note already carrying the macro keeps working untouched.
+      nm.addEventListener('click',()=>{
+        const v=prompt('Macro name:', m.name);
+        if(v===null) return;
+        const name=v.trim();
+        if(!name||name===m.name) return;
+        pushUndo();
+        m.name=name;
+        renderMacroList(); updateNoteInfo(); requestDraw();
+        flash('Renamed to "'+name+'"');
+      });
       const meta=document.createElement('span'); meta.dataset.col='meta'; meta.className='hint';
       meta.textContent=m.lanes.length+' lane'+(m.lanes.length!==1?'s':'')+' · '+m.spanTicks+'t';
       meta.title=m.lanes.map(macroLaneLabel).join('\n');
