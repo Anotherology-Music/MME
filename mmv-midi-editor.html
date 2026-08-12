@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.48
+  MMV MIDI & CC Curve Editor v0.9.49
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1266,6 +1266,27 @@
   v0.9.47 — so the lookup is built once per frame instead of scanning the
   macro list per note. On a bound drum pattern that is hundreds of scans a
   frame turned into one map build.
+
+
+  v0.9.49 The toolbar fits the window.
+
+  View moves to row 2, after Move All. That alone only relocated the problem:
+  row 1 was flex-wrap:nowrap and about 1740px wide, so on any narrower window
+  its right-hand end — Library and Setup — sat off-screen with no way to reach
+  it but zooming the browser out, and row 2 with View added came to 1646px and
+  overflowed in its turn. Both rows wrap now, which is what the setupPanel
+  comment in this file had already identified as the actual fix and set aside
+  as a separate job. It is the same job.
+
+  A wide screen looks exactly as it did — the second line only appears when
+  the window really is too narrow for one. The push spacer keeps flex-basis 0
+  so it absorbs slack without ever being the thing that forces a wrap.
+
+  Checked at 1100, 1280, 1440 and 1920px, and pinned there. The width sweep is
+  the point: at 1920 everything fitted on one line and nothing looked wrong at
+  all, so a test at a single comfortable width would have passed happily while
+  Setup was unreachable on an ordinary laptop. That is also why this survived
+  as long as it did — the cause was written down, but nothing failed.
 
 -->
 
