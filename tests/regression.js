@@ -10595,6 +10595,44 @@ async function run() {
       stillNamed === 'Old Name', stillNamed);
   });
 
+  // ---------------- v0.9.49: the toolbar fits the window ----------------
+
+  {
+    // Row 1 was flex-wrap:nowrap and wider than a normal laptop screen, so
+    // Library and Setup were unreachable without zooming the browser out.
+    // Checked at several widths because the failure only appears below the
+    // row's own natural width — at 1920 it looked perfectly fine.
+    for (const w of [1100, 1280, 1440, 1920]) {
+      const page = await browser.newPage({ viewport: { width: w, height: 900 } });
+      await page.goto(URL);
+      await page.waitForTimeout(250);
+      const m = await page.evaluate(() => {
+        const q = s => document.querySelector(s);
+        const onScreen = el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.left >= -1 && r.right <= window.innerWidth + 1;
+        };
+        const r1 = q('.toolbar-r1'), r2 = q('.toolbar-r2');
+        return {
+          setup: onScreen(q('#setupWrapper')),
+          library: onScreen(q('#libraryBtn')),
+          view: onScreen(q('.view-grp')),
+          transport: onScreen(q('.transport-grp')),
+          r1Overflow: r1.scrollWidth > r1.clientWidth + 1,
+          r2Overflow: r2.scrollWidth > r2.clientWidth + 1,
+          pageScrollsX: document.documentElement.scrollWidth > window.innerWidth + 1,
+          viewInRow2: !!q('.view-grp').closest('.toolbar-r2'),
+        };
+      });
+      check('at ' + w + 'px every toolbar control is on screen, including Setup and Library',
+        m.setup && m.library && m.view && m.transport, { width: w, ...m });
+      check('...with neither toolbar row overflowing and no horizontal page scroll',
+        !m.r1Overflow && !m.r2Overflow && !m.pageScrollsX, { width: w, ...m });
+      check('...and View sits in row 2', m.viewInRow2, { width: w, viewInRow2: m.viewInRow2 });
+      await page.close();
+    }
+  }
+
   await browser.close();
   server.close();
 
