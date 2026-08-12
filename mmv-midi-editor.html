@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.47
+  MMV MIDI & CC Curve Editor v0.9.48
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1222,6 +1222,50 @@
   Info Duration field did not call resyncMacros at all, which was harmless
   while length could not affect a bake and would have meant typing a duration
   and dragging the note's end gave different results.
+
+
+  v0.9.48 Deleting a macro offers to keep its curves; macros can be renamed;
+  and a macro note now says which macro it carries.
+
+  Deleting a macro that is in use now says what is at stake — how many notes
+  carry it and how many CC points they hold between them — and offers to bake
+  the data first. Baking bounces every instance, so the curves stay exactly
+  where they are as ordinary CC data and only the macro goes. The bake has to
+  run BEFORE the definition is removed: once it is gone those instances are
+  orphans and get stripped, which is the loss the whole feature exists to
+  prevent. Either choice is one undo step. A macro no note uses still deletes
+  without a dialog, because nothing is at stake.
+
+  The count deliberately includes notes claimed through a pitch binding, not
+  just explicit assigns. Counting only the explicit ones would have made the
+  warning quietly wrong in the case it matters most — a macro bound to a key
+  across a drum pattern would have reported no notes at all.
+
+  That work turned up a real bug, present since macros shipped. resyncMacros()
+  returns on its first line when no macros and no bindings remain, which is
+  exactly the state after deleting the only macro in a project — so the
+  cleanup the delete relied on never ran, and its baked points and the notes'
+  markers were left behind. The delete now strips its own instances, which
+  also leaves that early bail as cheap as it was; it exists to keep ordinary
+  edits free and widening it would have cost every edit to fix one.
+
+  A macro can be renamed by clicking its name in the list. Nothing stores a
+  copy — the bindings list, the binding picker and Note Info all read it back
+  through macroById() — so a rename is one assignment and a redraw, and notes
+  already carrying the macro are untouched, since they reference it by id.
+
+  A macro note now shows which macro it carries, right-aligned in italics
+  where the pitch name would otherwise repeat: the pitch is already on the
+  left and in the keys column, but which gesture a note carries cannot be
+  told by looking at all. Macro notes were already drawn amber rather than
+  velocity-shaded blue, which is easy to miss among the blues, so they also
+  gain a darker inset edge that makes them read as a distinct object.
+
+  drawNote runs for every visible note on every frame and now needs the macro
+  object twice over — for the label and for the ghost outline added in
+  v0.9.47 — so the lookup is built once per frame instead of scanning the
+  macro list per note. On a bound drum pattern that is hundreds of scans a
+  frame turned into one map build.
 
 -->
 
