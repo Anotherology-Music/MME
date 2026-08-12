@@ -5664,6 +5664,99 @@
   }
 
   // ── UI ─────────────────────────────────────────────────────────
+  // ── Deleting a macro ─────────────────────────────────────────────
+  // Every note carrying this macro, whether by an explicit assign or through
+  // a pitch binding. Counted from the notes rather than from the bindings,
+  // because a binding's reach depends on what notes actually exist.
+  function notesCarryingMacro(mid){
+    return state.notes.filter(n=>n.macroId===mid&&n.macroInst!=null);
+  }
+  function macroBakedPointCount(mid){
+    const insts=new Set(notesCarryingMacro(mid).map(n=>n.macroInst));
+    let n=0;
+    for(const lane of state.ccLanes) for(const p of lane.points) if(p.mi!=null&&insts.has(p.mi)) n++;
+    return n;
+  }
+  // Bounce every instance, so the curves survive as ordinary CC data. Must run
+  // BEFORE the macro is removed: once it is gone resyncMacros() treats its
+  // instances as orphans and strips them, which is the very loss this avoids.
+  function bounceAllForMacro(mid){
+    let pts=0;
+    notesCarryingMacro(mid).forEach(n=>{ pts+=bounceMacroOnNote(n); });
+    return pts;
+  }
+  function removeMacroDefinition(m){
+    const i=state.macros.indexOf(m); if(i>=0) state.macros.splice(i,1);
+    // A binding pointing at a macro that no longer exists is a rule that can
+    // never fire again; leaving it listed would only ever read as a bug.
+    state.macroBindings=(state.macroBindings||[]).filter(b=>b.macroId!==m.id);
+    resyncMacros(); renderMacroList(); updateNoteInfo(); requestDraw();
+  }
+  function deleteMacroWithPrompt(m){
+    const notes=notesCarryingMacro(m.id);
+    // Nothing is at stake when the macro was never used — no dialog for the
+    // sake of one.
+    if(!notes.length){ pushUndo(); removeMacroDefinition(m); flash('Deleted macro "'+m.name+'"'); return; }
+    const pts=macroBakedPointCount(m.id);
+
+    const existing=document.getElementById('macroDeleteDialog');
+    if(existing) existing.remove();
+    const dlg=document.createElement('dialog');
+    dlg.id='macroDeleteDialog';
+    dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;'
+      +'width:min(520px,94vw);overflow:hidden;display:flex;flex-direction:column;';
+    const hdr=document.createElement('div');
+    hdr.style.cssText='padding:14px 18px 12px;flex-shrink:0;';
+    // The macro name goes in as textContent, never innerHTML: it is free text
+    // the user typed, and escHtml() lives inside the ISF IIFE and is not
+    // visible from here anyway.
+    const title=document.createElement('div');
+    title.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;';
+    title.textContent='Delete \u201C'+m.name+'\u201D?';
+    const count=document.createElement('div');
+    count.style.cssText='font-size:12px;color:#c8cdd8;margin-top:8px;';
+    count.innerHTML='It is on <b>'+notes.length+'</b> note'+(notes.length===1?'':'s')
+      +', which between them carry <b>'+pts+'</b> CC point'+(pts===1?'':'s')+'.';
+    const note=document.createElement('div');
+    note.style.cssText='font-size:11px;color:#7a8099;margin-top:8px;';
+    note.textContent='Deleting the macro normally takes those curves with it. Baking first turns them into '
+      +'ordinary CC data that stays exactly where it is \u2014 editable by hand, and no longer tied to the '
+      +'notes. Either way this is one undo step.';
+    hdr.appendChild(title); hdr.appendChild(count); hdr.appendChild(note);
+    dlg.appendChild(hdr);
+    const foot=document.createElement('div');
+    foot.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
+    const cancelBtn=document.createElement('button'); cancelBtn.id='macroDeleteCancel'; cancelBtn.textContent='Cancel';
+    cancelBtn.style.cssText='background:#262b34;color:#c8cdd8;border:1px solid #3a404e;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;';
+    const spacer=document.createElement('span'); spacer.style.flex='1';
+    const dropBtn=document.createElement('button'); dropBtn.id='macroDeleteDrop'; dropBtn.textContent='Delete without baking';
+    dropBtn.style.cssText='background:#5a2020;color:#ffd0d0;border:1px solid #8a3030;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;';
+    const bakeBtn=document.createElement('button'); bakeBtn.id='macroDeleteBake'; bakeBtn.textContent='Bake CC data, then delete';
+    bakeBtn.style.cssText='background:#1f3a5c;color:#cfe4ff;border:1px solid #4fa3ff;border-radius:5px;padding:5px 11px;font-size:12px;cursor:pointer;font-weight:600;';
+    foot.appendChild(cancelBtn); foot.appendChild(spacer); foot.appendChild(dropBtn); foot.appendChild(bakeBtn);
+    dlg.appendChild(foot);
+
+    function close(){ dlg.close(); dlg.remove(); }
+    cancelBtn.addEventListener('click',close);
+    dlg.addEventListener('cancel',()=>dlg.remove());
+    dropBtn.addEventListener('click',()=>{
+      pushUndo(); removeMacroDefinition(m); close();
+      flash('Deleted "'+m.name+'" and its '+pts+' baked point'+(pts===1?'':'s'));
+    });
+    bakeBtn.addEventListener('click',()=>{
+      // One pushUndo covers the bounce and the delete together, so a single
+      // Ctrl+Z restores both the macro and its instances.
+      pushUndo();
+      const kept=bounceAllForMacro(m.id);
+      removeMacroDefinition(m);
+      close();
+      flash('Baked '+kept+' point'+(kept===1?'':'s')+' as plain CC data, then deleted "'+m.name+'"');
+    });
+    document.body.appendChild(dlg);
+    dlg.showModal();
+    bakeBtn.focus();
+  }
+
   function renderMacroList(){
     const box=$('macroList'); if(!box) return;
     box.innerHTML='';
@@ -5710,16 +5803,8 @@
         assignMacroToNote(sel[0], m);
       });
       const del=document.createElement('button'); del.dataset.act='delete'; del.textContent='✕';
-      del.title='Delete this macro (notes carrying it lose their baked points)';
-      del.addEventListener('click',()=>{
-        pushUndo();
-        const i=state.macros.indexOf(m); if(i>=0) state.macros.splice(i,1);
-        // A binding pointing at a macro that no longer exists is a rule that
-        // can never fire again; leaving it listed would only ever read as a
-        // bug. resyncMacros() already un-bakes the notes.
-        state.macroBindings=(state.macroBindings||[]).filter(b=>b.macroId!==m.id);
-        resyncMacros(); renderMacroList(); updateNoteInfo(); requestDraw();
-      });
+      del.title='Delete this macro — offers to keep its CC data first';
+      del.addEventListener('click',()=>deleteMacroWithPrompt(m));
       row.appendChild(nm); row.appendChild(meta); row.appendChild(stretch); row.appendChild(assign); row.appendChild(del);
       box.appendChild(row);
     });

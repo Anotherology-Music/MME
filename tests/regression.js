@@ -10362,6 +10362,175 @@ async function run() {
       r.before === BAR47 && after === 480, { before: r.before, after });
   });
 
+  // ---------------- v0.9.48: deleting a macro offers to keep its CC data ----------------
+
+  const BAR48 = 1920;
+  async function makeMacroWithNotes(page, name, noteCount) {
+    return page.evaluate(({ BAR, name, noteCount }) => {
+      const laneId = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: BAR / 2, v: 127 }, { t: BAR, v: 0 }]);
+      const s = window._TEST_state; s.locStart = 0; s.locEnd = BAR;
+      const mid = window._TEST_captureMacro(name, [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      const notes = [];
+      for (let i = 0; i < noteCount; i++) {
+        const nid = window._TEST_addNote({ start: BAR * (2 + i * 2), pitch: 60 + i, length: BAR });
+        window._TEST_assignMacroToNote(nid, mid);
+        notes.push(nid);
+      }
+      return { laneId, mid, notes, tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length };
+    }, { BAR: BAR48, name, noteCount });
+  }
+  const clickDelete = (page, mid) =>
+    page.evaluate((mid) => document.querySelector('#macroList [data-macro-id="' + mid + '"] [data-act="delete"]').click(), mid);
+
+  await withPage(browser, async (page) => {
+    // An unused macro has nothing at stake, so it must not nag.
+    const s = await makeMacroWithNotes(page, 'Unused', 0);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    const r = await page.evaluate(() => ({
+      dialog: !!document.getElementById('macroDeleteDialog'),
+      macros: window._TEST_macros().length,
+    }));
+    check('deleting a macro no note uses just deletes it, with no dialog',
+      !r.dialog && r.macros === 0, r);
+  });
+
+  await withPage(browser, async (page) => {
+    const s = await makeMacroWithNotes(page, 'Fade', 2);
+    check('setup: the macro is on 2 notes and has baked points', s.tagged > 2, s);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    const dlg = await page.evaluate(() => {
+      const d = document.getElementById('macroDeleteDialog');
+      return d ? { open: d.open, text: d.textContent.replace(/\s+/g, ' ') } : null;
+    });
+    check('deleting a macro that is in use warns first', !!dlg && dlg.open, dlg);
+    check('...naming how many notes and how many CC points are at stake',
+      /on 2 notes/.test(dlg.text) && new RegExp('carry ' + s.tagged + ' CC point').test(dlg.text), dlg && dlg.text.slice(0, 120));
+
+    // Cancel must change nothing at all.
+    await page.click('#macroDeleteCancel');
+    await page.waitForTimeout(150);
+    const cancelled = await page.evaluate((laneId) => ({
+      macros: window._TEST_macros().length,
+      tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+      dialog: !!document.getElementById('macroDeleteDialog'),
+    }), s.laneId);
+    check('cancelling leaves the macro and every baked point exactly as they were',
+      cancelled.macros === 1 && cancelled.tagged === s.tagged && !cancelled.dialog, cancelled);
+  });
+
+  await withPage(browser, async (page) => {
+    // Bake, then delete: the curves survive as ordinary CC data.
+    const s = await makeMacroWithNotes(page, 'Keep', 2);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    await page.click('#macroDeleteBake');
+    await page.waitForTimeout(250);
+    const r = await page.evaluate((laneId) => ({
+      macros: window._TEST_macros().length,
+      total: window._TEST_lanePoints(laneId).length,
+      tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+      notesWithMacro: window._TEST_state.notes.filter(n => n.macroId != null).length,
+    }), s.laneId);
+    check('baking first keeps every CC point the macro had drawn', r.total === s.tagged, { got: r.total, was: s.tagged });
+    check('...as plain data, with no instance tag left behind', r.tagged === 0, r);
+    check('...and the macro itself is gone, along with the notes\' link to it',
+      r.macros === 0 && r.notesWithMacro === 0, r);
+
+    // Deleting a note afterwards must not take the curve with it.
+    const afterDel = await page.evaluate(({ laneId }) => {
+      const n = window._TEST_state.notes[0];
+      window._TEST_removeNoteById(n.id);
+      return window._TEST_lanePoints(laneId).length;
+    }, s);
+    check('...so deleting one of those notes no longer removes its curve', afterDel === r.total, { afterDel, was: r.total });
+  });
+
+  await withPage(browser, async (page) => {
+    // Bake + delete is ONE undo step.
+    const s = await makeMacroWithNotes(page, 'Undoable', 2);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    await page.click('#macroDeleteBake');
+    await page.waitForTimeout(250);
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(200);
+    const r = await page.evaluate((laneId) => ({
+      macros: window._TEST_macros().length,
+      tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+      notesWithMacro: window._TEST_state.notes.filter(n => n.macroId != null).length,
+    }), s.laneId);
+    check('one Ctrl+Z puts the macro, its instances and the notes\' link all back',
+      r.macros === 1 && r.tagged === s.tagged && r.notesWithMacro === 2, { r, was: s.tagged });
+  });
+
+  await withPage(browser, async (page) => {
+    // The other branch: delete and lose the curves, as before.
+    const s = await makeMacroWithNotes(page, 'Drop', 2);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    await page.click('#macroDeleteDrop');
+    await page.waitForTimeout(250);
+    const r = await page.evaluate((laneId) => ({
+      macros: window._TEST_macros().length,
+      tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+      notesWithMacro: window._TEST_state.notes.filter(n => n.macroId != null).length,
+    }), s.laneId);
+    check('choosing "delete without baking" removes the macro and its curves together',
+      r.macros === 0 && r.tagged === 0 && r.notesWithMacro === 0, r);
+  });
+
+  await withPage(browser, async (page) => {
+    // Notes claimed by a pitch BINDING count too — the warning would be a lie
+    // if it only counted explicit assigns.
+    const s = await page.evaluate((BAR) => {
+      const laneId = window._TEST_addLane(24, 0);
+      window._TEST_setLanePoints(laneId, [{ t: 0, v: 0 }, { t: BAR, v: 127 }]);
+      const st = window._TEST_state; st.locStart = 0; st.locEnd = BAR;
+      const mid = window._TEST_captureMacro('Bound', [laneId]);
+      window._TEST_setLanePoints(laneId, []);
+      for (let i = 0; i < 3; i++) window._TEST_addNote({ start: BAR * (2 + i * 2), pitch: 36, length: BAR });
+      window._TEST_addMacroBinding(36, null, mid);
+      window._TEST_resyncMacros();
+      return { laneId, mid, tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length };
+    }, BAR48);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    const dlg = await page.evaluate(() => {
+      const d = document.getElementById('macroDeleteDialog');
+      return d ? d.textContent.replace(/\s+/g, ' ') : null;
+    });
+    check('notes that carry the macro through a pitch binding are counted in the warning too',
+      !!dlg && /on 3 notes/.test(dlg), dlg && dlg.slice(0, 120));
+
+    await page.click('#macroDeleteBake');
+    await page.waitForTimeout(250);
+    const r = await page.evaluate((laneId) => ({
+      macros: window._TEST_macros().length,
+      bindings: window._TEST_macroBindings().length,
+      total: window._TEST_lanePoints(laneId).length,
+      tagged: window._TEST_lanePoints(laneId).filter(p => p.mi != null).length,
+    }), s.laneId);
+    check('...their curves are kept, and the now-meaningless binding is removed with the macro',
+      r.total === s.tagged && r.tagged === 0 && r.macros === 0 && r.bindings === 0, { r, was: s.tagged });
+  });
+
+  await withPage(browser, async (page) => {
+    // A macro name is free text; it must never reach the dialog as markup.
+    const s = await makeMacroWithNotes(page, 'A <b>bold</b> name', 1);
+    await clickDelete(page, s.mid);
+    await page.waitForTimeout(200);
+    const r = await page.evaluate(() => {
+      const d = document.getElementById('macroDeleteDialog');
+      return { html: d.innerHTML, hasBoldEl: !!d.querySelector('b > b') || /A <b>bold<\/b> name/.test(d.innerHTML) };
+    });
+    check('a macro name containing HTML is shown as text, not rendered as markup', !r.hasBoldEl, { snippet: r.html.slice(0, 160) });
+    await page.click('#macroDeleteCancel');
+  });
+
   await browser.close();
   server.close();
 
