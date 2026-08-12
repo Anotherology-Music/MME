@@ -10468,7 +10468,10 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // The other branch: delete and lose the curves, as before.
+    // The other branch: delete and lose the curves, as before. This is also
+    // the case that caught a real bug — with only ONE macro in the project,
+    // resyncMacros() bails before cleaning up, so the delete has to strip the
+    // instances itself.
     const s = await makeMacroWithNotes(page, 'Drop', 2);
     await clickDelete(page, s.mid);
     await page.waitForTimeout(200);

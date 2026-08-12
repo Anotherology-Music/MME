@@ -3506,13 +3506,27 @@
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
     const t0=xToTick(sx),t1=xToTick(sx+vw);
     const hasSel=state.selection.size>0;
+    // Built once per frame rather than searched per note: drawNote runs for
+    // every visible note on every draw, and macroById() is a linear scan.
+    // With a bound macro on a drum pattern that is hundreds of notes a frame.
+    const macroLookup=new Map();
+    (state.macros||[]).forEach(m=>macroLookup.set(m.id,m));
     function drawNote(n,sel){
       const x=tickToX(n.start),y=pitchToY(n.pitch),nw=Math.max(2,tickToX(n.length));
       // A macro note is the handle for a whole multi-lane CC gesture, not
       // just a note — paint it in the app's existing amber/warning token so
       // it reads differently at a glance from an ordinary velocity-shaded
       // note (whose fill is a blue whose lightness encodes velocity).
+      const mac=(n.macroId!=null)?(macroLookup.get(n.macroId)||null):null;
       ctx.fillStyle=(n.macroId!=null)?getCss('--accent2'):velColor(n.vel); ctx.fillRect(x,y+1,nw,nh-2);
+      // A macro note already differed by fill colour alone, which is easy to
+      // miss among velocity-shaded blues. A solid darker edge inside the note
+      // makes it read as a distinct object rather than a lighter neighbour.
+      if(n.macroId!=null&&nh>=8){
+        ctx.save(); ctx.strokeStyle='#8a5a00'; ctx.lineWidth=1;
+        ctx.strokeRect(x+1.5,y+2.5,Math.max(1,nw-3),Math.max(1,nh-5));
+        ctx.restore();
+      }
       ctx.strokeStyle=sel?getCss('--sel'):chanColor(n.ch); ctx.lineWidth=sel?2:1; ctx.strokeRect(x+0.5,y+1.5,nw-1,nh-3);
       // Ghost outline: a fixed-length macro on a short note (a drum-map hit,
       // say) controls CC well past the note you can see. Without this the
@@ -3520,8 +3534,7 @@
       // overlapping instances look like the app losing data. Drawn only when
       // the span genuinely differs, so a stretch macro — whose span IS the
       // note — never draws one.
-      if(n.macroId!=null&&n.macroInst!=null){
-        const mac=macroById(n.macroId);
+      if(mac&&n.macroInst!=null){
         const span=macroSpanFor(n,mac);
         if(span>n.length+1){
           const gw=tickToX(span);
@@ -3546,7 +3559,17 @@
         // left-aligned label it always showed (today's noteLabel() call,
         // unchanged), same as an unnamed note.
         const customName=pitchName(n.pitch,n.ch);
-        if(customName&&nw>40){
+        // On a macro note the right-hand slot names the MACRO rather than
+        // repeating the pitch: which gesture a note carries is the thing you
+        // cannot otherwise tell by looking, and the pitch is still on the left
+        // and in the keys column. Needs more room than the plain dual label,
+        // since a macro name is free text rather than three characters.
+        if(mac&&nw>64){
+          ctx.textAlign='left'; ctx.fillText(customName||noteLabel(n.pitch,n.ch),x+2,y+nh/2);
+          ctx.textAlign='right';
+          ctx.font='italic '+Math.min(9,nh-2)+'px system-ui';
+          ctx.fillText(mac.name,x+nw-3,y+nh/2);
+        } else if(customName&&nw>40){
           ctx.textAlign='left'; ctx.fillText(customName,x+2,y+nh/2);
           ctx.textAlign='right'; ctx.fillText(noteName(n.pitch),x+nw-2,y+nh/2);
         } else {
@@ -5686,6 +5709,17 @@
     return pts;
   }
   function removeMacroDefinition(m){
+    // Strip this macro's instances HERE rather than leaving it to
+    // resyncMacros(). That returns on its first line when no macros and no
+    // bindings are left — which is precisely the case when the macro being
+    // deleted is the last one — so the baked points and the notes' markers
+    // would survive a delete that claimed to remove them. Doing it explicitly
+    // also keeps the early bail cheap, which is the whole point of it.
+    // (No-op on the bake path: bouncing has already cleared those notes.)
+    notesCarryingMacro(m.id).forEach(n=>{
+      if(n.macroInst!=null) stripMacroInstance(n.macroInst);
+      clearNoteMacro(n);
+    });
     const i=state.macros.indexOf(m); if(i>=0) state.macros.splice(i,1);
     // A binding pointing at a macro that no longer exists is a rule that can
     // never fire again; leaving it listed would only ever read as a bug.
