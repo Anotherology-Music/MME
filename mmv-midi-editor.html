@@ -1294,9 +1294,14 @@
   *::-webkit-scrollbar-corner{background:var(--panel3);}
 
   /* ── Toolbar rows ── */
-  .toolbar{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--panel);border-bottom:1px solid var(--line);}
-  .toolbar-r1{flex-wrap:nowrap;}
-  .toolbar-r1 .push{flex:1;}
+  /* Both rows wrap. Row 1 was flex-wrap:nowrap and ~1740px wide, so on any
+     window narrower than that its right-hand end — Library and Setup — sat
+     off-screen with no way to reach it but zooming the browser out. Wrapping
+     costs a second line only when the window really is too narrow; on a wide
+     screen nothing moves. The push spacer keeps flex-basis 0 so it absorbs
+     slack without ever being the thing that forces the wrap. */
+  .toolbar{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap;}
+  .toolbar-r1 .push{flex:1 1 0;min-width:0;}
   .toolbar-r2{background:var(--panel3);border-bottom:2px solid var(--line);padding:5px 10px;}
   .toolbar-r2 button{font-size:12px;padding:4px 8px;}
   .toolbar-r2 select,.toolbar-r2 input[type=number]{font-size:12px;padding:3px 5px;}
@@ -1326,11 +1331,11 @@
      group and read as unrelated controls.
      The max-width/max-height/overflow-y guards are new with the widen: the
      section grew tall enough to run past the bottom of a 900px screen, which
-     put Danger zone out of reach entirely. Note that the panel is anchored to
-     #setupWrapper at the right end of .toolbar-r1, which is flex-wrap:nowrap
-     and ~1915px wide — so on a window narrower than that the panel sits partly
-     off-screen no matter what width it is. That predates this change; fixing it
-     means letting row 1 wrap or scroll, which is a separate job. */
+     put Danger zone out of reach entirely. The panel is anchored to
+     #setupWrapper at the right end of row 1. That row used to be
+     flex-wrap:nowrap, which put the button itself off-screen on any window
+     narrower than the row and took the panel with it; both rows wrap as of
+     v0.9.49, so the anchor is always reachable. */
   #setupPanel{position:absolute;top:calc(100% + 3px);right:0;width:620px;max-width:calc(100vw - 16px);max-height:calc(100vh - 60px);overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;}
   #setupPanel.open{display:block;}
   .setup-section{padding:9px 14px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px;}
@@ -2073,21 +2078,11 @@
         <span id="durDisp" class="dur" title="Click to toggle h:m:s:cs / total seconds">00:00:00:00</span>
       </div>
     </div>
-    <!-- push View controls to the right -->
+    <!-- View moved to row 2 (after Move All) in v0.9.49 — row 1 is
+         flex-wrap:nowrap and had grown wide enough to push Setup off-screen
+         on a normal laptop. The push spacer went with it: its only purpose
+         was to shove View to the right-hand end of this row. -->
     <div class="push"></div>
-    <div class="view-grp">
-      <span class="lbl">View</span>
-      <span class="lbl2">ch</span>
-      <select id="viewCh" title="Filter piano roll to show only notes on this channel" style="width:88px;">
-      </select>
-      <span class="lbl2">timeline</span>
-      <select id="rulerMode" title="Ruler timeline format">
-        <option value="bars">Bars</option>
-        <option value="mmss">mm:ss</option>
-        <option value="hhmmss">hh:mm:ss</option>
-        <option value="secs">ssssss.ss</option>
-      </select>
-    </div>
     <div class="sep"></div>
     <!-- Setup button + dropdown -->
     <div id="setupWrapper">
@@ -2343,6 +2338,19 @@
         <option value="snap">Snap</option>
       </select>
       <button id="moveAllR" title="Shift EVERYTHING right by the step — all notes, every CC/PB/CP curve, and the audio track — locked together. Right by a bar = insert a bar at the start.">▶</button>
+    </div>
+    <div class="view-grp">
+      <span class="lbl">View</span>
+      <span class="lbl2">ch</span>
+      <select id="viewCh" title="Filter piano roll to show only notes on this channel" style="width:88px;">
+      </select>
+      <span class="lbl2">timeline</span>
+      <select id="rulerMode" title="Ruler timeline format">
+        <option value="bars">Bars</option>
+        <option value="mmss">mm:ss</option>
+        <option value="hhmmss">hh:mm:ss</option>
+        <option value="secs">ssssss.ss</option>
+      </select>
     </div>
   </div><!-- /toolbar-r2 -->
 
