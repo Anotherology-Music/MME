@@ -154,6 +154,7 @@ function buildTestHtml() {
       '  window._TEST_addMarkerAtPlayhead = () => addMarkerAtPlayhead();',
       '  window._TEST_parseMarkerList = (t) => parseMarkerList(t);',
       '  window._TEST_gotoAdjacentMarker = (d) => gotoAdjacentMarker(d);',
+      '  window._TEST_jumpToMarker = (i) => jumpToMarker(state.markers[i]);',
       // v0.9.50 loop switch + measured Follow-MMV rate.
       '  window._TEST_toggleLoop = () => toggleLoop();',
       '  window._TEST_loopEdgeAtX = (lx) => loopEdgeAtX(lx);',
@@ -10709,44 +10710,90 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // Double-clicking a marker selects that section.
-    const r = await page.evaluate((BAR) => {
+    // Driven with page.mouse, NOT a dispatched dblclick event. The first
+    // version of this test dispatched a bare dblclick, which no browser ever
+    // does on its own: a real one is preceded by two full mousedown/mouseup
+    // pairs, and it was those clicks — each jumping the playhead and scrolling
+    // the marker into view — that moved the timeline out from under the cursor
+    // and made the dblclick land on a different marker. Synthesising only the
+    // last event of the sequence tested the one part that was never broken.
+    const BAR = 1920;
+    await page.evaluate((BAR) => {
+      window._TEST_state.bars = 200;
       window._TEST_setMarkers([
-        { tick: BAR, name: 'One' }, { tick: BAR * 3, name: 'Two' }, { tick: BAR * 5, name: 'Three' },
+        { tick: BAR * 1, name: 'One' }, { tick: BAR * 3, name: 'Two' },
+        { tick: BAR * 5, name: 'Three' }, { tick: BAR * 7, name: 'Four' },
       ]);
-      const cv = document.getElementById('markerCanvas');
-      const rect = document.getElementById('markerScroll').getBoundingClientRect();
-      const s = window._TEST_state;
-      const clientX = rect.left + window._TEST_tickToX(BAR * 3) - s.scrollLeft + window._TEST_GUTTER() + 2;
-      cv.dispatchEvent(new MouseEvent('dblclick', { clientX, clientY: rect.top + 8, bubbles: true }));
-      return { locStart: s.locStart, locEnd: s.locEnd, BAR };
-    }, 1920);
+    }, BAR);
+    await page.waitForTimeout(120);
+
+    async function dblclickMarker(name) {
+      const pos = await page.evaluate((name) => {
+        const s = window._TEST_state;
+        const mk = window._TEST_markers().find(x => x.name === name);
+        const r = document.getElementById('markerScroll').getBoundingClientRect();
+        return { x: r.left + window._TEST_tickToX(mk.tick) - s.scrollLeft + window._TEST_GUTTER() + 3,
+                 y: r.top + 10, tick: mk.tick };
+      }, name);
+      if (pos.x < 0 || pos.x > 1430) return { offscreen: true, wanted: pos.tick };
+      await page.mouse.dblclick(pos.x, pos.y);
+      await page.waitForTimeout(180);
+      const got = await page.evaluate(() => ({ locStart: window._TEST_state.locStart, locEnd: window._TEST_state.locEnd }));
+      return { ...got, wanted: pos.tick };
+    }
+
+    const two = await dblclickMarker('Two');
     check('double-clicking a marker selects from it to the next marker',
-      r.locStart === r.BAR * 3 && r.locEnd === r.BAR * 5, r);
+      two.locStart === BAR * 3 && two.locEnd === BAR * 5, two);
+
+    // The one that actually broke: a SECOND double-click, on a different
+    // marker, after the first has already moved the view.
+    const three = await dblclickMarker('Three');
+    check('...and a second double-click selects the marker clicked, not the next one along',
+      three.offscreen ? false : (three.locStart === BAR * 5 && three.locEnd === BAR * 7), three);
+
+    const one = await dblclickMarker('One');
+    check('...and a third, going backwards, still selects the one clicked',
+      one.offscreen ? false : (one.locStart === BAR * 1 && one.locEnd === BAR * 3), one);
 
     // The last marker runs to the end of the project.
-    const last = await page.evaluate((BAR) => {
-      const cv = document.getElementById('markerCanvas');
-      const rect = document.getElementById('markerScroll').getBoundingClientRect();
-      const s = window._TEST_state;
-      const clientX = rect.left + window._TEST_tickToX(BAR * 5) - s.scrollLeft + window._TEST_GUTTER() + 2;
-      cv.dispatchEvent(new MouseEvent('dblclick', { clientX, clientY: rect.top + 8, bubbles: true }));
-      return { locStart: s.locStart, locEnd: s.locEnd, total: window._TEST_totalTicks() };
-    }, 1920);
+    const four = await dblclickMarker('Four');
+    const total = await page.evaluate(() => window._TEST_totalTicks());
     check('...and the last marker selects through to the end of the project',
-      last.locStart === 1920 * 5 && last.locEnd === last.total, last);
+      four.offscreen ? false : (four.locStart === BAR * 7 && four.locEnd === total), { four, total });
 
-    // Double-clicking empty space still adds a marker rather than selecting.
-    const added = await page.evaluate((BAR) => {
-      const before = window._TEST_markers().length;
-      const cv = document.getElementById('markerCanvas');
-      const rect = document.getElementById('markerScroll').getBoundingClientRect();
+    // Empty space still adds a marker rather than selecting a range.
+    const added = await page.evaluate(() => window._TEST_markers().length);
+    const emptyPos = await page.evaluate(() => {
       const s = window._TEST_state;
-      const clientX = rect.left + window._TEST_tickToX(BAR * 8) - s.scrollLeft + window._TEST_GUTTER();
-      cv.dispatchEvent(new MouseEvent('dblclick', { clientX, clientY: rect.top + 8, bubbles: true }));
-      return { before, after: window._TEST_markers().length };
+      const r = document.getElementById('markerScroll').getBoundingClientRect();
+      // A spot with no flag on it: just left of the viewport's right edge.
+      return { x: r.right - 40, y: r.top + 10 };
+    });
+    await page.mouse.dblclick(emptyPos.x, emptyPos.y);
+    await page.waitForTimeout(180);
+    const after = await page.evaluate(() => window._TEST_markers().length);
+    check('double-clicking empty marker-row space still adds a marker', after === added + 1, { before: added, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // The underlying cause: clicking something already on screen must not
+    // scroll the view out from under the pointer.
+    const r = await page.evaluate((BAR) => {
+      window._TEST_state.bars = 200;
+      window._TEST_setMarkers([{ tick: BAR * 2, name: 'Near' }, { tick: BAR * 60, name: 'Far' }]);
+      const s = window._TEST_state;
+      s.scrollLeft = 0;
+      const before = s.scrollLeft;
+      window._TEST_jumpToMarker(0);          // on screen already
+      const afterNear = s.scrollLeft;
+      window._TEST_jumpToMarker(1);          // far off to the right
+      const afterFar = s.scrollLeft;
+      return { before, afterNear, afterFar };
     }, 1920);
-    check('double-clicking empty marker-row space still adds a marker', added.after === added.before + 1, added);
+    check('jumping to a marker that is already on screen leaves the scroll position alone',
+      r.afterNear === r.before, r);
+    check('...while jumping to one off screen still brings it into view', r.afterFar > r.before, r);
   });
 
   await withPage(browser, async (page) => {

@@ -8892,6 +8892,14 @@
   // the edge, so arriving at a section shows what follows it.
   function scrollTickIntoView(tick){
     const viewW=prScroll.clientWidth||600;
+    const x=tickToX(tick)-state.scrollLeft;
+    // Already comfortably on screen: leave the view alone. Scrolling anyway
+    // moved the timeline out from under the cursor between the two clicks of a
+    // double-click, so the second click — and the dblclick after it — landed on
+    // whichever marker had slid into that screen position. It is also just
+    // better behaviour: clicking something you can see should not yank the view.
+    const margin=Math.min(120,viewW*0.15);
+    if(x>=margin&&x<=viewW-margin) return;
     const target=clamp(tickToX(tick)-viewW/3,0,Math.max(0,contentW()+GUTTER-viewW));
     hScrollers().forEach(s=>{ s.scrollLeft=target; });
     state.scrollLeft=target; applyTransforms(); updatePlayheadEl(); requestDraw();
@@ -8986,9 +8994,23 @@
   }
 
   let markerDrag=null;
+  // What the FIRST click of a double-click landed on. Re-hit-testing when the
+  // dblclick arrives is not safe: the click itself moves the playhead, and
+  // anything that shifts the view between the two clicks changes what sits
+  // under the cursor. Recorded here and used there instead.
+  let markerDownHit=null, markerDownAt=0, markerDownX=-1e9;
   markerCanvas.addEventListener('mousedown',e=>{
     if(e.button===2) return;
     const m=markerAtX(markerLocalX(e));
+    const now=performance.now();
+    // Keep the first answer only for the SECOND click of an actual
+    // double-click — near in time AND in position, the same pair of conditions
+    // the browser itself uses. Time alone was not enough: a genuinely new
+    // click landing soon after a previous double-click would inherit its
+    // target and select the wrong section.
+    const isSecondOfPair=(now-markerDownAt)<400 && Math.abs(e.clientX-markerDownX)<5;
+    if(!isSecondOfPair) markerDownHit=m;
+    markerDownAt=now; markerDownX=e.clientX;
     if(!m) return;
     markerDrag={m,startX:e.clientX,moved:false};
     e.preventDefault();
@@ -9012,7 +9034,7 @@
   });
   markerCanvas.addEventListener('dblclick',e=>{
     const x=markerLocalX(e);
-    const hit=markerAtX(x);
+    const hit=markerDownHit||markerAtX(x);
     if(hit){
       // Select this section: from this marker to the next one, or to the end
       // of the project for the last. Turning a 37-section show into a set of
