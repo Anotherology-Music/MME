@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.50
+  MMV MIDI & CC Curve Editor v0.9.51
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1330,6 +1330,36 @@
   use on a project measured in thousands of seconds; and the elapsed readout
   beside it was sized for "0:00.00" while fmtClockHundredths switches to
   h:mm:ss.cc past the hour. Both widened.
+
+
+  v0.9.51 Fix: double-clicking a marker selected the wrong section.
+
+  The first double-click worked and the next one selected a later marker, or
+  sometimes set no range at all. A double-click is preceded by two ordinary
+  clicks, each of which jumps the playhead — and jumping scrolled the marker to
+  sit a third in from the left. That moved the timeline out from under the
+  pointer, so the second click, and the dblclick after it, landed on whichever
+  marker had slid into that screen position.
+
+  Two changes. scrollTickIntoView() now leaves a tick that is already
+  comfortably on screen exactly where it is, which was the right behaviour
+  regardless: clicking something you can already see should not yank the view.
+  And the dblclick decides from the marker recorded at the FIRST click of the
+  pair rather than re-testing what is under the cursor by then. A first attempt
+  matched that pair on timing alone, which was wrong in a way the repro caught
+  at once — a genuinely new click soon after a previous double-click inherited
+  the old target. Position is what separates "second click of a pair" from
+  "another click that happens to be soon after", and the browser's own
+  double-click test uses both for the same reason.
+
+  The test that should have caught this dispatched a bare dblclick event, which
+  no browser ever fires by itself: a real one always follows two full
+  mousedown/mouseup pairs, and it was those clicks that did the damage. It
+  synthesised the one event in the sequence that was never broken. It now
+  drives page.mouse and double-clicks four markers in a row, forwards and
+  backwards, since a single double-click passed throughout — reaching an
+  off-screen one by its numbered chip, which is how the UI intends it and
+  exercises the chip and the flag together.
 
 -->
 
