@@ -154,6 +154,12 @@ function buildTestHtml() {
       '  window._TEST_addMarkerAtPlayhead = () => addMarkerAtPlayhead();',
       '  window._TEST_parseMarkerList = (t) => parseMarkerList(t);',
       '  window._TEST_gotoAdjacentMarker = (d) => gotoAdjacentMarker(d);',
+      // v0.9.50 loop switch + measured Follow-MMV rate.
+      '  window._TEST_toggleLoop = () => toggleLoop();',
+      '  window._TEST_loopEdgeAtX = (lx) => loopEdgeAtX(lx);',
+      '  window._TEST_syncRate = () => ({ msPerTick: syncMsPerTick, shown: syncShown });',
+      '  window._TEST_feedSyncBeat = (beatIdx, wallMs) => { const st = 0x9F; const pitch = beatIdx % 128, vel = Math.floor(beatIdx / 128) + 1; handleFollowIn({ data: [st, pitch, vel], timeStamp: wallMs }); };',
+      '  window._TEST_syncFrame = (now) => { syncRaf = 0; syncFrame(now); };',
       '  window._TEST_markerLabel = (i) => markerLabel(state.markers[i]);',
       '  window._TEST_setMarkers = (ms) => { state.markers = ms; renderMarkerBar(); requestDraw(); };',
       // v0.9.44: long-song support. zoomHAt is the only place zoom is set, so
@@ -4126,18 +4132,32 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
-    // With no A/B loop range selected, playing the whole track should play
-    // through once and STOP at the end — not wrap back to bar 1. Shrink the
-    // project to 1 bar @ 120bpm/4-4 (2 real seconds) so the test can just
-    // wait it out on the real clock instead of faking performance.now().
-    await page.evaluate(() => { window._TEST_state.bars = 1; window._TEST_state.locStart = null; window._TEST_state.locEnd = null; window._TEST_state.playhead = 0; });
+    // With Loop OFF, playing the whole track plays through once and STOPS at
+    // the end rather than wrapping to bar 1. Until v0.9.50 this was decided by
+    // "is a range selected", so it could not be had at all with one selected;
+    // it is the Loop switch now, which is the point of the switch. Shrink the
+    // project to 1 bar @ 120bpm/4-4 (2 real seconds) so the test can wait it
+    // out on the real clock instead of faking performance.now().
+    await page.evaluate(() => { const s = window._TEST_state; s.bars = 1; s.locStart = null; s.locEnd = null; s.playhead = 0; s.loopOn = false; });
     await page.evaluate(() => window._TEST_play());
     await page.waitForTimeout(700);
     const midPlay = await page.evaluate(() => window._TEST_state.playing);
     await page.waitForTimeout(1800); // past the ~2s whole-track duration
     const after = await page.evaluate(() => ({ playing: window._TEST_state.playing, playhead: window._TEST_state.playhead, totalTicks: window._TEST_totalTicks() }));
-    check('with no loop range selected, playback stops at the end instead of looping back to bar 1',
+    check('with Loop off, playback stops at the end instead of looping back to bar 1',
       midPlay === true && after.playing === false && after.playhead === after.totalTicks, { midPlay, after });
+  });
+
+  await withPage(browser, async (page) => {
+    // ...and the other half of the same switch: Loop ON with nothing selected
+    // repeats the whole project rather than stopping.
+    await page.evaluate(() => { const s = window._TEST_state; s.bars = 1; s.locStart = null; s.locEnd = null; s.playhead = 0; s.loopOn = true; });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(2500); // well past the ~2s whole-track duration
+    const after = await page.evaluate(() => ({ playing: window._TEST_state.playing, playhead: window._TEST_state.playhead }));
+    check('with Loop on and no range selected, the whole project repeats instead of stopping',
+      after.playing === true, after);
+    await page.evaluate(() => window._TEST_stop());
   });
 
   await withPage(browser, async (page) => {
@@ -10632,6 +10652,166 @@ async function run() {
       await page.close();
     }
   }
+
+  // ---------------- v0.9.50: loop switch, marker ranges, range edges ----------------
+
+  await withPage(browser, async (page) => {
+    const btn = await page.evaluate(() => {
+      const b = document.getElementById('loopBtn');
+      return { exists: !!b, inTransport: !!b.closest('.transport-grp'), on: b.classList.contains('on') };
+    });
+    check('the transport has a Loop button, lit by default', btn.exists && btn.inTransport && btn.on, btn);
+
+    // Selecting a range must no longer force looping on or off — the point of
+    // separating them.
+    const decoupled = await page.evaluate(() => {
+      const s = window._TEST_state;
+      window._TEST_setLoopRange(0, 1920);
+      window._TEST_toggleLoop();                       // -> off, range still set
+      return { loopOn: s.loopOn, locStart: s.locStart, locEnd: s.locEnd,
+               lit: document.getElementById('loopBtn').classList.contains('on'),
+               status: document.getElementById('stLoop').textContent };
+    });
+    check('turning Loop off leaves the selected range exactly where it was',
+      decoupled.loopOn === false && decoupled.locStart === 0 && decoupled.locEnd === 1920, decoupled);
+    check('...and the button unlights, with the status bar saying so',
+      !decoupled.lit && /loop off/i.test(decoupled.status), decoupled);
+
+    // Ctrl+L drives the same switch.
+    await page.keyboard.press('Control+l');
+    await page.waitForTimeout(120);
+    const viaKey = await page.evaluate(() => ({
+      loopOn: window._TEST_state.loopOn,
+      lit: document.getElementById('loopBtn').classList.contains('on'),
+      locEnd: window._TEST_state.locEnd,
+    }));
+    check('Ctrl+L toggles Loop back on and still does not disturb the range',
+      viaKey.loopOn === true && viaKey.lit && viaKey.locEnd === 1920, viaKey);
+
+    // It belongs to the project.
+    const snap = await page.evaluate(() => { window._TEST_state.loopOn = false; return window._TEST_snapshot(); });
+    await page.evaluate(() => { window._TEST_state.loopOn = true; });
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    await page.waitForTimeout(100);
+    const restored = await page.evaluate(() => ({ loopOn: window._TEST_state.loopOn,
+      lit: document.getElementById('loopBtn').classList.contains('on') }));
+    check('the Loop setting saves and loads with the project', restored.loopOn === false && !restored.lit, restored);
+
+    // A project saved before the switch existed should arrive looping, which
+    // is what it did then.
+    const legacy = await page.evaluate(() => {
+      const o = JSON.parse(window._TEST_snapshot());
+      delete o.loopOn;
+      window._TEST_applyState(JSON.stringify(o));
+      return window._TEST_state.loopOn;
+    });
+    check('a project saved before the Loop switch existed loads with Loop on', legacy === true, legacy);
+  });
+
+  await withPage(browser, async (page) => {
+    // Double-clicking a marker selects that section.
+    const r = await page.evaluate((BAR) => {
+      window._TEST_setMarkers([
+        { tick: BAR, name: 'One' }, { tick: BAR * 3, name: 'Two' }, { tick: BAR * 5, name: 'Three' },
+      ]);
+      const cv = document.getElementById('markerCanvas');
+      const rect = document.getElementById('markerScroll').getBoundingClientRect();
+      const s = window._TEST_state;
+      const clientX = rect.left + window._TEST_tickToX(BAR * 3) - s.scrollLeft + window._TEST_GUTTER() + 2;
+      cv.dispatchEvent(new MouseEvent('dblclick', { clientX, clientY: rect.top + 8, bubbles: true }));
+      return { locStart: s.locStart, locEnd: s.locEnd, BAR };
+    }, 1920);
+    check('double-clicking a marker selects from it to the next marker',
+      r.locStart === r.BAR * 3 && r.locEnd === r.BAR * 5, r);
+
+    // The last marker runs to the end of the project.
+    const last = await page.evaluate((BAR) => {
+      const cv = document.getElementById('markerCanvas');
+      const rect = document.getElementById('markerScroll').getBoundingClientRect();
+      const s = window._TEST_state;
+      const clientX = rect.left + window._TEST_tickToX(BAR * 5) - s.scrollLeft + window._TEST_GUTTER() + 2;
+      cv.dispatchEvent(new MouseEvent('dblclick', { clientX, clientY: rect.top + 8, bubbles: true }));
+      return { locStart: s.locStart, locEnd: s.locEnd, total: window._TEST_totalTicks() };
+    }, 1920);
+    check('...and the last marker selects through to the end of the project',
+      last.locStart === 1920 * 5 && last.locEnd === last.total, last);
+
+    // Double-clicking empty space still adds a marker rather than selecting.
+    const added = await page.evaluate((BAR) => {
+      const before = window._TEST_markers().length;
+      const cv = document.getElementById('markerCanvas');
+      const rect = document.getElementById('markerScroll').getBoundingClientRect();
+      const s = window._TEST_state;
+      const clientX = rect.left + window._TEST_tickToX(BAR * 8) - s.scrollLeft + window._TEST_GUTTER();
+      cv.dispatchEvent(new MouseEvent('dblclick', { clientX, clientY: rect.top + 8, bubbles: true }));
+      return { before, after: window._TEST_markers().length };
+    }, 1920);
+    check('double-clicking empty marker-row space still adds a marker', added.after === added.before + 1, added);
+  });
+
+  await withPage(browser, async (page) => {
+    // The range edges are grabbable, and grabbing one anchors the other.
+    const r = await page.evaluate((BAR) => {
+      window._TEST_setLoopRange(BAR * 2, BAR * 4);
+      const xs = window._TEST_tickToX(BAR * 2), xe = window._TEST_tickToX(BAR * 4);
+      return {
+        atStart: window._TEST_loopEdgeAtX(xs),
+        atEnd: window._TEST_loopEdgeAtX(xe),
+        justInside: window._TEST_loopEdgeAtX(xs + 3),
+        wellInside: window._TEST_loopEdgeAtX((xs + xe) / 2),
+        BAR,
+      };
+    }, 1920);
+    check('the start of the range is grabbable, anchoring the end',
+      r.atStart && r.atStart.which === 'start' && r.atStart.anchorT === r.BAR * 4, r.atStart);
+    check('the end of the range is grabbable, anchoring the start',
+      r.atEnd && r.atEnd.which === 'end' && r.atEnd.anchorT === r.BAR * 2, r.atEnd);
+    check('...within a few pixels, but not from the middle of the range',
+      !!r.justInside && r.wellInside === null, { justInside: r.justInside, wellInside: r.wellInside });
+
+    const none = await page.evaluate(() => {
+      window._TEST_state.locStart = null; window._TEST_state.locEnd = null;
+      return window._TEST_loopEdgeAtX(100);
+    });
+    check('with no range selected there is no edge to grab', none === null, none);
+  });
+
+  await withPage(browser, async (page) => {
+    // Follow MMV extrapolates at the rate beats actually arrive. Feed beats at
+    // a rate that disagrees with the project tempo and the prediction must
+    // track the FEED, not state.bpm — that mismatch is what made the playhead
+    // step backwards once per beat.
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bpm = 120; s.tempoMap = [{ tick: 0, bpm: 120 }]; s.syncFollow = true; s.playing = false;
+      // 120bpm = 500ms per beat. Feed 600ms per beat: MME's own tempo would
+      // predict 20% fast.
+      const t0 = 10000;
+      for (let i = 0; i < 6; i++) window._TEST_feedSyncBeat(i, t0 + i * 600);
+      const rate = window._TEST_syncRate();
+      const nominal = 60000 / (120 * s.ppq);          // ms per tick at 120bpm
+      const observed = 600 / s.ppq;                    // ms per tick actually fed
+      return { measured: rate.msPerTick, nominal, observed, ppq: s.ppq };
+    });
+    check('Follow MMV measures the real beat rate rather than trusting the project tempo',
+      r.measured != null && Math.abs(r.measured - r.observed) < Math.abs(r.nominal - r.observed) * 0.5,
+      { measured: r.measured, observed: r.observed, nominal: r.nominal });
+
+    // And with that rate, the prediction lands on the next beat instead of
+    // overshooting it — which is what removes the backward step.
+    const land = await page.evaluate(() => {
+      const s = window._TEST_state;
+      const t0 = 10000, beat6 = t0 + 6 * 600;
+      // Predict forward to where beat 6 should be, from beat 5's anchor.
+      window._TEST_syncFrame(beat6);
+      const predicted = s.playhead;
+      window._TEST_feedSyncBeat(6, beat6);            // the real beat arrives
+      return { predicted, actual: s.playhead, ppq: s.ppq };
+    });
+    check('...so the predicted position at the next beat matches where that beat really lands',
+      Math.abs(land.predicted - land.actual) < land.ppq * 0.25,
+      { predicted: land.predicted, actual: land.actual, tolerance: land.ppq * 0.25 });
+  });
 
   await browser.close();
   server.close();
