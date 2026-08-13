@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.49
+  MMV MIDI & CC Curve Editor v0.9.50
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1287,6 +1287,49 @@
   all, so a test at a single comfortable width would have passed happily while
   Setup was unreachable on an ordinary laptop. That is also why this survived
   as long as it did — the cause was written down, but nothing failed.
+
+
+  v0.9.50 Follow MMV tracks the beats it is actually being sent; looping
+  becomes its own switch; markers select their section; loop-range edges drag.
+
+  Follow MMV used to predict between beats using MME's own tempo. Any
+  disagreement with MMV — a sync track exported before a tempo change being
+  the usual one — made that prediction run fast or slow, and every arriving
+  beat hard-reset the playhead, so it visibly stepped backwards (or forwards)
+  once per quarter note. It was never a performance problem: position comes
+  from wall-clock time, so a slow machine makes the motion choppier and cannot
+  make it run fast. The rate is now measured from the gap between arriving
+  beats, as an exponential moving average with a sanity band against the
+  nominal tempo, so a dropped beat cannot read as half speed and stick. What
+  remains after that is a few ms of delivery jitter, and corrections ease over
+  a few frames rather than being assigned outright — a move larger than a beat
+  is a real seek or loop and still snaps at once. No per-frame cost: the
+  measurement happens on beat messages, a few times a second.
+
+  Looping is now a Loop button in the transport (Ctrl+L), saved with the
+  project, rather than a side effect of having a range selected. A range is
+  also how a span is chosen to capture a macro from, and tying the two
+  together meant clearing the range just to hear the piece play through. Loop
+  off keeps the range and plays to the end; Loop on with no range repeats the
+  whole project. That last part reverses v0.9.32's "no range plays once and
+  stops" — both are still reachable, which is the point of a switch, and the
+  test that pinned the old rule now pins the new one.
+
+  Double-clicking a marker selects from it to the next marker, or to the end
+  of the project for the last one, turning a 37-section show into a set of
+  one-click range selections. Double-clicking empty space in that row still
+  adds a marker.
+
+  A selected range's start and end can be dragged on the ruler, within a few
+  pixels of each edge, with the cursor changing to show it. Grabbing one edge
+  anchors the other, which is the same shape the existing drag-to-select
+  already had. The end is tested first, so a range dragged down to nothing can
+  still be opened back up.
+
+  Also: the Go to seconds field fitted "12.5" and nothing longer, which is no
+  use on a project measured in thousands of seconds; and the elapsed readout
+  beside it was sized for "0:00.00" while fmtClockHundredths switches to
+  h:mm:ss.cc past the hour. Both widened.
 
 -->
 
