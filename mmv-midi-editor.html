@@ -2023,6 +2023,7 @@
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
         <button id="nextMarkerBtn" title="Jump to the next section marker (.)">&#x25B6;&#x25B6;|</button>
+        <button id="loopBtn" class="icon-btn" title="Loop (Ctrl+L) — repeat the selected range, or the whole project when no range is selected. Turn it off to keep a range selected and still play straight through."><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button>
         <div id="recWrapper">
           <button id="recordBtn" title="Record incoming MIDI notes (R) — right-click to change channel, count-in, offset">
             <span class="recDot">⏺</span><span id="recChBadge">1</span>
@@ -2703,6 +2704,11 @@
     lastNoteLen:480, scrollLeft:0, scrollTop:0,
     playing:false, playhead:0, lastPlayStart:0, midiOut:null, clipboard:null,
     locStart:null, locEnd:null, syncFollow:false, mmvSmooth:true, scrollLock:false,
+    // Looping is now its own switch rather than "is a range selected". A range
+    // is also how you pick a span to capture a macro from, and having that
+    // force looping meant clearing the range just to hear the piece play
+    // through.
+    loopOn:true,
     audioOffset:0, audioLatencyMs:0,
     // CC macros: captured multi-lane automation gestures, each attachable to a
     // note (see the "CC Macros" section further down). Project data, so it
@@ -3065,7 +3071,7 @@
   let undoStack=[], redoStack=[], pending=null;
   function snapshot(){ return JSON.stringify({ notes:state.notes,
     lanes:state.ccLanes.map(l=>({id:l.id,type:l.type||'cc',cc:l.cc,ch:l.ch,color:l.color,name:l.name,visible:l.visible!==false,tags:l.tags||[],steps:l.steps||0,muted:!!l.muted,soloed:!!l.soloed,points:l.points,isf:l.isf||null})),
-    bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,
+    bars:state.bars,bpm:state.bpm,ppq:state.ppq,tsNum:state.tsNum,tsDen:state.tsDen,tsMap:state.tsMap,loopOn:state.loopOn!==false,
     tempoMap:state.tempoMap,
     markers:state.markers||[],
     isfHistory:state.isfHistory||[],
@@ -3100,7 +3106,7 @@
     // Projects saved before markers existed have no key at all; an empty list
     // is the right reading, and keeps undo of a marker edit symmetrical.
     state.markers=Array.isArray(o.markers)?o.markers:[];
-    state.locStart=o.locS; state.locEnd=o.locE; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
+    state.locStart=o.locS; state.locEnd=o.locE; state.loopOn=o.loopOn!==false; state.nextId=o.next; state.pitchNames=o.pitchNames||{};
     state.projectName=o.projectName||''; if($('projectName')) $('projectName').value=state.projectName;
     if(o.isfHistory) state.isfHistory=o.isfHistory;
     // Projects saved before macros existed have no `macros` key at all — an
@@ -3775,6 +3781,18 @@
   function rulerY(e){ const r=rulerScroll.getBoundingClientRect(); return e.clientY-r.top; }
   function snapLoc(t){ if(state.snap==='off') return Math.round(t); return Math.round(snapT(t)); }
   let rulerDrag=null;
+  const LOOP_EDGE_PX=6;
+  // Which end of the loop range, if either, is under this local x. Returns the
+  // OPPOSITE end as the anchor, since dragging one edge holds the other still.
+  function loopEdgeAtX(lx){
+    if(state.locStart==null||state.locEnd==null||state.locEnd<=state.locStart) return null;
+    const xs=tickToX(state.locStart), xe=tickToX(state.locEnd);
+    // End first: on a range dragged down to nothing the two are on top of each
+    // other, and grabbing the end is the one that lets you open it back up.
+    if(Math.abs(lx-xe)<=LOOP_EDGE_PX) return {which:'end', anchorT:state.locStart};
+    if(Math.abs(lx-xs)<=LOOP_EDGE_PX) return {which:'start', anchorT:state.locEnd};
+    return null;
+  }
 
   // ---------- Ruler markers: TS/tempo markers are directly selectable —
   // click one to edit its value (or remove it) in a small popover, or drag
@@ -3842,6 +3860,14 @@
       if(hit!=null){ tempoDrag={tick0:hit, curLocalX:lx, moved:false, isExistingMarker:false}; altBeatHint=null; requestDraw(); }
       return; // Alt held: either started a tempo drag / TS-create click, or a deliberate no-op near no beat line
     }
+    // Grab an existing range edge before starting a fresh drag, so adjusting a
+    // selection does not mean redrawing it from scratch. The far edge becomes
+    // the anchor, which is exactly the shape the normal drag already uses.
+    const edge=loopEdgeAtX(lx);
+    if(edge){
+      rulerDrag={startX:e.clientX, startT:edge.anchorT, moved:true, edge:true};
+      return;
+    }
     const x=lx; rulerDrag={startX:e.clientX, startT:clamp(snapLoc(xToTick(x)),0,totalTicks()), moved:false};
   });
   window.addEventListener('mousemove',e=>{
@@ -3892,7 +3918,9 @@
       const overBeat=(tsHit||tempoHit)?null:beatLineHitTest(lx);
       const hint=(overBeat!=null&&e.altKey&&overBeat>0)?overBeat:null;
       if(hint!==altBeatHint){ altBeatHint=hint; requestDraw(); }
-      if(tsHit){ rulerCanvas.style.cursor=tsHit.isStart?'pointer':'grab'; rulerCanvas.title=tsHit.isStart?'Click to edit the project\'s starting time signature':'Click to edit or remove this time signature change — drag to move it to a different bar'; }
+      const loopEdge=(tsHit||tempoHit)?null:loopEdgeAtX(lx);
+      if(loopEdge){ rulerCanvas.style.cursor='ew-resize'; rulerCanvas.title='Drag to move the '+(loopEdge.which==='end'?'end':'start')+' of the loop range'; }
+      else if(tsHit){ rulerCanvas.style.cursor=tsHit.isStart?'pointer':'grab'; rulerCanvas.title=tsHit.isStart?'Click to edit the project\'s starting time signature':'Click to edit or remove this time signature change — drag to move it to a different bar'; }
       else if(tempoHit){ rulerCanvas.style.cursor=tempoHit.isStart?'pointer':'grab'; rulerCanvas.title=tempoHit.isStart?'Click to edit the project\'s starting tempo':'Click to edit or remove this tempo change — drag to re-align it with a point in the audio waveform'; }
       else if(overBeat!=null){ rulerCanvas.style.cursor=e.altKey?'ew-resize':''; rulerCanvas.title=TEMPO_DRAG_TIP; }
       else { rulerCanvas.style.cursor=''; rulerCanvas.title=''; }
@@ -7488,6 +7516,8 @@
   function followReset(){ followScheduledBeats.clear(); followSentNotes.clear(); }
 
   let syncAnchor=null; // {wallMs, tick} — updated on each incoming Ch16 beat note
+  // Measured from consecutive beats, and the rate syncFrame() actually uses.
+  let syncMsPerTick=null, syncPrevBeat=null, syncShown=null;
   let syncRaf=null, syncHeartbeat=null;
   // Same cleanup the manual Follow-MMV-off toggle does, minus turning Follow
   // itself off — used when the Ch16 beat feed goes stale while MME was only
@@ -7497,7 +7527,7 @@
   // equivalent cleanup via stopTransport(), so this only needs to cover the
   // path stop() doesn't reach.
   function syncFeedStale(){
-    syncAnchor=null; followReset();
+    syncAnchor=null; syncMsPerTick=null; syncPrevBeat=null; syncShown=null; followReset();
     if(syncRaf){ cancelAnimationFrame(syncRaf); syncRaf=null; }
     allNotesOff();
     if(state.midiOut){ try{ state.midiOut.clear&&state.midiOut.clear(); }catch(e){} }
@@ -7522,8 +7552,21 @@
     syncRaf=null;
     if(!state.syncFollow||state.playing) return;
     if(syncAnchor){
-      const msPerTick=60000/(tempoSegAt(syncAnchor.tick).bpm*state.ppq);
-      state.playhead=clamp(Math.round(syncAnchor.tick+(now-syncAnchor.wallMs)/msPerTick),0,totalTicks());
+      // Extrapolate at the rate beats are ACTUALLY arriving, not at the rate
+      // MME's own tempo says they should. Predicting from state.bpm meant any
+      // disagreement with MMV — a sync track exported before a tempo change is
+      // the usual one — made the prediction run fast or slow, so every arriving
+      // beat hard-reset the playhead and it visibly stepped backwards (or
+      // forwards) once per beat. Measured, the disagreement stops mattering.
+      const msPerTick=syncMsPerTick||(60000/(tempoSegAt(syncAnchor.tick).bpm*state.ppq));
+      const target=clamp(Math.round(syncAnchor.tick+(now-syncAnchor.wallMs)/msPerTick),0,totalTicks());
+      // Ease onto the target instead of assigning it. What is left after the
+      // rate is measured is jitter of a few ms in message delivery, and a hard
+      // assignment turns that into a visible twitch every beat. Anything
+      // bigger than a beat is a real move (loop, seek) and snaps at once.
+      if(syncShown==null||Math.abs(target-syncShown)>ticksPerBeat()) syncShown=target;
+      else syncShown+=(target-syncShown)*0.25;
+      state.playhead=clamp(Math.round(syncShown),0,totalTicks());
       applyScrollLock(); updatePlayheadEl(); updatePlayPos();
     }
     if(state.syncFollow&&!state.playing) syncRaf=requestAnimationFrame(syncFrame);
@@ -7546,6 +7589,20 @@
     const isLoop=beatIdx<lastSyncBeatIdx;
     const isSeek=beatIdx>lastSyncBeatIdx+2;
     if(isLoop||isSeek) followReset();
+    if(isLoop||isSeek){ syncPrevBeat=null; syncShown=null; }
+    // Rate from the gap between this beat and the last. An EMA so one late
+    // message nudges rather than swings it, and a sanity band against MME's
+    // own tempo so a dropped or duplicated beat cannot poison the rate — a
+    // missed beat would otherwise read as half speed and stick.
+    if(syncPrevBeat && tick>syncPrevBeat.tick){
+      const dt=wallMs-syncPrevBeat.wallMs, dTick=tick-syncPrevBeat.tick;
+      const nominal=60000/(tempoSegAt(tick).bpm*state.ppq);
+      const inst=dt/dTick;
+      if(dt>1 && inst>nominal*0.4 && inst<nominal*2.5){
+        syncMsPerTick = syncMsPerTick==null ? inst : (syncMsPerTick*0.7 + inst*0.3);
+      }
+    }
+    syncPrevBeat={wallMs, tick};
     lastSyncBeatIdx=beatIdx;
     syncAnchor={wallMs, tick};
     if(!state.playing){ state.playhead=tick; updatePlayheadEl(); updatePlayPos(); }
@@ -7778,13 +7835,12 @@
   // after a mid-playback jump) — assumes the caller has already confirmed
   // state.playing is false.
   function beginPlayback(explicitT0){ const {a,b}=getLoop(); if(b<=a) return;
-    // Only loop indefinitely when the user has an explicit A/B loop range
-    // selected on the ruler. With nothing selected, getLoop() still returns
-    // the whole-track span (0..totalTicks()) so a single pass plays the
-    // whole project, but that pass should play once and stop at the end
-    // rather than wrap back to the start — see the `!s.loops` branch in
+    // Looping is the Loop switch, not "is a range selected". With no range
+    // getLoop() returns the whole-track span, so Loop on and nothing selected
+    // repeats the whole project — and Loop off plays one pass and stops at the
+    // end, whether a range is selected or not. See the `!s.loops` branch in
     // schedulerTick() and the audioSrc.loop assignment below.
-    const loops=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
+    const loops=state.loopOn!==false;
     let startTick=state.playhead; if(startTick<a||startTick>=b) startTick=a;
     state.lastPlayStart=startTick;
     state.playing=true; updateTransportBtns();
@@ -8002,7 +8058,13 @@
   function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockHundredths(tickToSeconds(state.playhead)); }
   function updateLoopStatus(){
     const hasRange=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
-    $('stLoop').textContent=hasRange?(tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd)):'whole track';
+    const on=state.loopOn!==false;
+    const lb=$('loopBtn');
+    if(lb){ lb.classList.toggle('on',on);
+      lb.title='Loop is '+(on?'ON':'OFF')+' (Ctrl+L) — '
+        +(on?(hasRange?'the selected range repeats':'the whole project repeats; select a range to loop part of it')
+            :'playback runs to the end and stops, and a selected range stays selected'); }
+    $('stLoop').textContent=(hasRange?(tickToBBT(state.locStart)+' – '+tickToBBT(state.locEnd)):'whole track')+(on?'':' (loop off)');
     updateGenLenEnabled(hasRange);
     // Capture's only prerequisite is the loop range, so this is the one place
     // that already knows when to enable it — ruler drag, ruler dblclick and
@@ -8907,7 +8969,19 @@
   });
   markerCanvas.addEventListener('dblclick',e=>{
     const x=markerLocalX(e);
-    if(markerAtX(x)) return; // on a flag, that was two jumps, not a new marker
+    const hit=markerAtX(x);
+    if(hit){
+      // Select this section: from this marker to the next one, or to the end
+      // of the project for the last. Turning a 37-section show into a set of
+      // one-click range selections is most of what markers are for here.
+      const i=state.markers.indexOf(hit);
+      const next=state.markers[i+1];
+      state.locStart=hit.tick;
+      state.locEnd=next?next.tick:totalTicks();
+      updateLoopStatus(); requestDraw();
+      flash('Range set to "'+markerLabel(hit)+'" — '+tickToBBT(state.locStart)+' to '+tickToBBT(state.locEnd));
+      return;
+    }
     pushUndo();
     addMarker(e.shiftKey?xToTick(x):snapT(xToTick(x)),'');
     renderMarkerBar(); requestDraw();
@@ -8929,6 +9003,15 @@
     flash(markerLabel(m)+' added at '+fmtClockHundredths(tickToSeconds(m.tick)));
   }
   $('markerAddBtn').addEventListener('click',addMarkerAtPlayhead);
+  function toggleLoop(){
+    state.loopOn=!(state.loopOn!==false);
+    updateLoopStatus(); requestDraw();
+    // Takes effect on the next pass rather than mid-flight: changing a running
+    // scheduler's loop flag underneath it would drop or duplicate the events
+    // already queued for the current pass.
+    flash('Loop '+(state.loopOn?'on':'off')+(state.playing?' — from the next pass':''));
+  }
+  $('loopBtn').addEventListener('click',toggleLoop);
   $('prevMarkerBtn').addEventListener('click',()=>gotoAdjacentMarker(-1));
   $('nextMarkerBtn').addEventListener('click',()=>gotoAdjacentMarker(1));
 
@@ -9191,6 +9274,7 @@
     const ctrl=e.ctrlKey||e.metaKey;
     if(ctrl && e.key.toLowerCase()==='z'){ e.preventDefault(); e.shiftKey?redo():undo(); return; }
     if(ctrl && e.key.toLowerCase()==='y'){ e.preventDefault(); redo(); return; }
+    if(ctrl && e.key.toLowerCase()==='l'){ e.preventDefault(); toggleLoop(); return; }
     if(ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); copySel(); return; }
     if(ctrl && e.key.toLowerCase()==='v'){ e.preventDefault(); paste(); return; }
     if(ctrl && e.key.toLowerCase()==='a'){ e.preventDefault();
