@@ -10727,15 +10727,26 @@ async function run() {
     }, BAR);
     await page.waitForTimeout(120);
 
+    const markerScreenX = (name) => page.evaluate((name) => {
+      const s = window._TEST_state;
+      const i = window._TEST_markers().findIndex(x => x.name === name);
+      const mk = window._TEST_markers()[i];
+      const r = document.getElementById('markerScroll').getBoundingClientRect();
+      return { i, x: r.left + window._TEST_tickToX(mk.tick) - s.scrollLeft + window._TEST_GUTTER() + 3,
+               y: r.top + 10, tick: mk.tick };
+    }, name);
+
     async function dblclickMarker(name) {
-      const pos = await page.evaluate((name) => {
-        const s = window._TEST_state;
-        const mk = window._TEST_markers().find(x => x.name === name);
-        const r = document.getElementById('markerScroll').getBoundingClientRect();
-        return { x: r.left + window._TEST_tickToX(mk.tick) - s.scrollLeft + window._TEST_GUTTER() + 3,
-                 y: r.top + 10, tick: mk.tick };
-      }, name);
-      if (pos.x < 0 || pos.x > 1430) return { offscreen: true, wanted: pos.tick };
+      let pos = await markerScreenX(name);
+      if (pos.x < 0 || pos.x > 1430) {
+        // Off screen after a previous jump — reach it the way the UI intends,
+        // by its numbered chip, which scrolls it into view. That also exercises
+        // the chip and the flag together.
+        await page.evaluate((i) => document.querySelectorAll('.marker-chip')[i].click(), pos.i);
+        await page.waitForTimeout(180);
+        pos = await markerScreenX(name);
+      }
+      if (pos.x < 0 || pos.x > 1430) return { offscreen: true, wanted: pos.tick, x: Math.round(pos.x) };
       await page.mouse.dblclick(pos.x, pos.y);
       await page.waitForTimeout(180);
       const got = await page.evaluate(() => ({ locStart: window._TEST_state.locStart, locEnd: window._TEST_state.locEnd }));
