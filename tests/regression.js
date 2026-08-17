@@ -146,8 +146,23 @@ function buildTestHtml() {
       '  window._TEST_audioFileName = () => document.getElementById(\'audioFileName\').textContent;',
       '  window._TEST_setMidiOutById = (id) => setMidiOutById(id);',
       '  window._TEST_setMidiInById = (id) => setMidiInById(id);',
-      '  window._TEST_loadAudio = (file) => loadAudio(file);',
-      '  window._TEST_audioBufDuration = () => (typeof audioBuf !== "undefined" && audioBuf) ? audioBuf.duration : null;',
+      '  window._TEST_loadAudio = (file, opts) => loadAudio(file, opts);',
+      // v0.9.52 multi-clip audio. audioBufDuration keeps its old meaning
+      // ("the loaded audio", i.e. the first clip's) so pre-existing checks
+      // still read what they always read.
+      '  window._TEST_loadAudioFiles = (files) => loadAudioFiles(files);',
+      '  window._TEST_audioBufDuration = () => { const c = audioClips()[0]; const b = audioBufOf(c); return b ? b.duration : null; };',
+      '  window._TEST_audioClips = () => audioClips().map(c => ({ id: c.id, name: c.name, startTick: c.startTick, durSec: c.durSec, loaded: audioBufs.has(c.id) }));',
+      '  window._TEST_setClipStart = (i, t) => { const c = audioClips()[i]; if (c) { c.startTick = t; sortAudioClips(); updateAudioUI(); requestDraw(); } };',
+      // By id, for tests that reposition several clips: moving one re-sorts
+      // the list, so a second call by index would land on a different clip.
+      '  window._TEST_setClipStartById = (id, t) => { const c = audioClips().find(x => x.id === id); if (c) { c.startTick = t; sortAudioClips(); updateAudioUI(); requestDraw(); } };',
+      '  window._TEST_audioSel = () => audioSel;',
+      '  window._TEST_setAudioSel = (id) => { audioSel = id; updateAudioUI(); requestDraw(); };',
+      '  window._TEST_clipEndTick = (i) => { const c = audioClips()[i]; return c ? clipEndTick(c) : null; };',
+      '  window._TEST_packAudioClips = () => packAudioClips();',
+      '  window._TEST_audioEndTick = () => audioEndTick();',
+      '  window._TEST_updateAudioOffsetBadge = () => updateAudioOffsetBadge();',
       // v0.9.45 section markers. All top-level, alongside state.
       '  window._TEST_markers = () => JSON.parse(JSON.stringify(state.markers || []));',
       '  window._TEST_addMarker = (tick, name) => { addMarker(tick, name); renderMarkerBar(); requestDraw(); };',
@@ -3929,8 +3944,13 @@ async function run() {
     check('the service worker (mmv-sw.js) registers and activates', swReg && swReg.active === true, swReg);
   });
 
-  // ---------------- Audio track: draggable start offset ----------------
+  // ---------------- Audio track: draggable clips ----------------
 
+  // Since v0.9.52 the audio row holds a list of clips and the positioning
+  // gestures (drag, double-click, arrow keys) act on the clip you clicked
+  // rather than on one global offset. state.audioOffset survives as the
+  // GLOBAL shift — what Move All nudges, and what a pre-v0.9.52 project
+  // saved as its single file's position — so both are checked here.
   await withPage(browser, async (page) => {
     const bytes = makeWavBytes(0.5);
     await page.evaluate((bytes) => {
@@ -3941,51 +3961,66 @@ async function run() {
     check('audio file loads', await page.evaluate(() => window._TEST_audioBufDuration()) === 0.5,
       await page.evaluate(() => window._TEST_audioBufDuration()));
 
-    // Dragging the waveform (default: snaps to the global Snap grid, 1/16 here).
+    const firstClip = await page.evaluate(() => window._TEST_audioClips());
+    check('a loaded file becomes a clip at tick 0, named and selected',
+      firstClip.length === 1 && firstClip[0].startTick === 0 && firstClip[0].name === 'test.wav'
+      && firstClip[0].loaded === true && firstClip[0].durSec === 0.5, firstClip);
+
+    // Dragging a clip (default: snaps to the global Snap grid, 1/16 here).
+    // Grab a few px into the clip, which starts at the gutter's right edge.
     const canvasBox = await page.locator('#audioCanvas').boundingBox();
     const y = canvasBox.y + canvasBox.height / 2;
-    await page.mouse.move(canvasBox.x + 50, y);
+    const GUTTER = 44;
+    const grabX = canvasBox.x + GUTTER + 6;
+    await page.mouse.move(grabX, y);
     await page.mouse.down();
-    await page.mouse.move(canvasBox.x + 250, y, { steps: 5 });
+    await page.mouse.move(grabX + 200, y, { steps: 5 });
     await page.mouse.up();
     await page.waitForTimeout(50);
-    const snapped = await page.evaluate(() => window._TEST_state.audioOffset);
+    const snapped = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
     const sixteenth = await page.evaluate(() => window._TEST_state.ppq / 4);
-    check('dragging the audio waveform snaps the offset to the Snap grid by default',
+    check('dragging a clip snaps its start to the Snap grid by default',
       snapped !== 0 && snapped % sixteenth === 0, { snapped, sixteenth });
+    check('dragging a clip does NOT touch the global audio offset',
+      await page.evaluate(() => window._TEST_state.audioOffset) === 0, null);
 
+    // The offset badge tracks the global shift, which is what Move All sets.
+    await page.evaluate((t) => { window._TEST_state.audioOffset = t; window._TEST_updateAudioOffsetBadge(); }, 1234);
     const badge = await page.evaluate(() => ({
       text: document.getElementById('audioOffsetBadge').textContent,
       visible: document.getElementById('audioOffsetBadge').style.display !== 'none',
     }));
-    check('the offset badge shows and displays a +/- duration once dragged', badge.visible && /^Off [+-]/.test(badge.text), badge);
+    check('the offset badge shows and displays a +/- duration once the row is shifted', badge.visible && /^Off [+-]/.test(badge.text), badge);
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_updateAudioOffsetBadge(); });
 
-    // Shift-drag bypasses the snap for a free-form offset (reset to 0 first
-    // so the drag delta below isn't added on top of the previous sub-test's
-    // leftover offset).
-    await page.evaluate(() => { window._TEST_state.audioOffset = 0; });
+    // Shift-drag bypasses the snap for a free-form position (reset the clip
+    // to 0 first so the drag delta below isn't added on top of the previous
+    // sub-test's leftover position).
+    await page.evaluate(() => window._TEST_setClipStart(0, 0));
     await page.keyboard.down('Shift');
-    await page.mouse.move(canvasBox.x + 50, y);
+    await page.mouse.move(grabX, y);
     await page.mouse.down();
-    await page.mouse.move(canvasBox.x + 50 + 137, y, { steps: 5 });
+    await page.mouse.move(grabX + 137, y, { steps: 5 });
     await page.mouse.up();
     await page.keyboard.up('Shift');
     await page.waitForTimeout(50);
-    const free = await page.evaluate(() => window._TEST_state.audioOffset);
+    const free = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
     const pxPerTick = await page.evaluate(() => window._TEST_state.pxPerTick);
-    check('holding Shift while dragging bypasses the snap for a free offset',
+    check('holding Shift while dragging bypasses the snap for a free position',
       Math.abs(free - Math.round(137 / pxPerTick)) <= 1, { free, expected: Math.round(137 / pxPerTick) });
 
-    // Double-click resets the offset, and it's undoable.
-    await page.mouse.dblclick(canvasBox.x + 300, y);
+    // Double-clicking the only clip sends it back to the start of the
+    // timeline (with clips before it, it butts up against the previous one),
+    // and it's undoable.
+    await page.mouse.dblclick(grabX + 137 + 6, y);
     await page.waitForTimeout(50);
-    const afterReset = await page.evaluate(() => window._TEST_state.audioOffset);
-    check('double-clicking the waveform resets the offset to 0', afterReset === 0, afterReset);
+    const afterReset = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
+    check('double-clicking the first clip sends it back to the start of the timeline', afterReset === 0, afterReset);
 
     await page.evaluate(() => window._TEST_undo());
     await page.waitForTimeout(50);
-    const afterUndo = await page.evaluate(() => window._TEST_state.audioOffset);
-    check('the offset drag is undoable', afterUndo === free, { afterUndo, free });
+    const afterUndo = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
+    check('the clip drag is undoable', afterUndo === free, { afterUndo, free });
 
     // Roundtrips through snapshot/applyState (and therefore .mmvp saves).
     await page.evaluate((t) => { window._TEST_state.audioOffset = t; }, sixteenth * 5);
@@ -4029,35 +4064,40 @@ async function run() {
 
     const oneBarTicks = await page.evaluate(() => window._TEST_state.ppq * 4);
 
+    // Each run reads the FIRST source scheduled, not the last: since v0.9.52
+    // playback queues the next loop pass as well as the current one, and that
+    // later pass starts from the top of the loop range, not the playhead.
+
     // Playhead before the audio's mapped start -> delayed start, buffer offset 0.
-    await page.evaluate((off) => { window._TEST_state.audioOffset = off; window._TEST_state.playhead = 0; }, oneBarTicks);
+    await page.evaluate((off) => { window.__startCalls = []; window._TEST_state.audioOffset = off; window._TEST_state.playhead = 0; }, oneBarTicks);
     await page.evaluate(() => window._TEST_play());
     await page.waitForTimeout(80);
     await page.evaluate(() => window._TEST_stop());
-    const call1 = await page.evaluate(() => window.__startCalls[window.__startCalls.length - 1]);
+    const call1 = await page.evaluate(() => window.__startCalls[0]);
     const expectedDelay = await page.evaluate((off) => window._TEST_tickToSeconds(off), oneBarTicks);
     check('play() delays the audio source until the playhead reaches a positive offset (silent lead-in)',
       call1.offset === 0 && (call1.when - call1.currentTime) > expectedDelay * 0.9, call1);
 
     // Playhead already past the offset -> starts immediately at the right buffer position.
     await page.evaluate((off) => {
+      window.__startCalls = [];
       window._TEST_state.audioOffset = off;
       window._TEST_state.playhead = off + window._TEST_state.ppq * 2;
     }, oneBarTicks);
     await page.evaluate(() => window._TEST_play());
     await page.waitForTimeout(80);
     await page.evaluate(() => window._TEST_stop());
-    const call2 = await page.evaluate(() => window.__startCalls[window.__startCalls.length - 1]);
+    const call2 = await page.evaluate(() => window.__startCalls[0]);
     const expectedOffsetSec = await page.evaluate(() => window._TEST_tickToSeconds(window._TEST_state.ppq * 2));
     check('play() starts immediately at the correct buffer position once the playhead is past the offset',
       Math.abs(call2.offset - expectedOffsetSec) < 0.02, { got: call2.offset, expected: expectedOffsetSec });
 
     // Negative offset (trim) -> starts immediately, buffer offset = |offset| + playhead.
-    await page.evaluate(() => { window._TEST_state.audioOffset = -window._TEST_state.ppq; window._TEST_state.playhead = 0; });
+    await page.evaluate(() => { window.__startCalls = []; window._TEST_state.audioOffset = -window._TEST_state.ppq; window._TEST_state.playhead = 0; });
     await page.evaluate(() => window._TEST_play());
     await page.waitForTimeout(80);
     await page.evaluate(() => window._TEST_stop());
-    const call3 = await page.evaluate(() => window.__startCalls[window.__startCalls.length - 1]);
+    const call3 = await page.evaluate(() => window.__startCalls[0]);
     const expectedTrimSec = await page.evaluate(() => window._TEST_tickToSeconds(window._TEST_state.ppq));
     check('a negative offset trims the buffer start (plays from partway into the file, no delay)',
       Math.abs(call3.offset - expectedTrimSec) < 0.02, { got: call3.offset, expected: expectedTrimSec });
@@ -4238,13 +4278,13 @@ async function run() {
       return window._TEST_loadAudio(file);
     }, bytes);
     await page.waitForTimeout(150);
-    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.focus = 'piano'; });
+    await page.evaluate(() => { window._TEST_setClipStart(0, 0); window._TEST_state.focus = 'piano'; });
 
-    // Without audio focus, arrow keys must not touch audioOffset.
+    // Without audio focus, arrow keys must not move the clip.
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(30);
-    const untouched = await page.evaluate(() => window._TEST_state.audioOffset);
-    check('arrow keys do not nudge the audio offset unless the audio row has focus', untouched === 0, untouched);
+    const untouched = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
+    check('arrow keys do not nudge the audio unless the audio row has focus', untouched === 0, untouched);
 
     // Click the waveform once (without dragging) to give it focus, then nudge.
     const canvasBox = await page.locator('#audioCanvas').boundingBox();
@@ -4252,22 +4292,195 @@ async function run() {
     await page.waitForTimeout(30);
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(30);
-    const afterOneNudge = await page.evaluate(() => window._TEST_state.audioOffset);
-    check('ArrowRight nudges the audio offset by 1 tick once focused', afterOneNudge === 1, afterOneNudge);
+    const afterOneNudge = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
+    check('ArrowRight nudges the selected clip by 1 tick once focused', afterOneNudge === 1, afterOneNudge);
 
     await page.keyboard.press('ArrowLeft');
     await page.waitForTimeout(30);
-    const afterBack = await page.evaluate(() => window._TEST_state.audioOffset);
+    const afterBack = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
     check('ArrowLeft nudges it back', afterBack === 0, afterBack);
 
     await page.keyboard.down('Shift');
     await page.keyboard.press('ArrowRight');
     await page.keyboard.up('Shift');
     await page.waitForTimeout(30);
-    const afterShiftNudge = await page.evaluate(() => window._TEST_state.audioOffset);
+    const afterShiftNudge = await page.evaluate(() => window._TEST_audioClips()[0].startTick);
     const snapTick = await page.evaluate(() => window._TEST_state.ppq / 4);
     check('Shift+ArrowRight nudges by a full snap-grid step instead of 1 tick',
       afterShiftNudge === snapTick, { afterShiftNudge, snapTick });
+  });
+
+  // ---------------- Audio: several clips in one row (v0.9.52) ----------------
+
+  await withPage(browser, async (page) => {
+    // The headline case: pick the whole show at once and have it lay itself
+    // out in running order, rather than dragging 37 files into place. The
+    // sort has to be numeric-aware — "10" must not land before "2".
+    const bytes1 = makeWavBytes(1), bytes2 = makeWavBytes(2), bytes3 = makeWavBytes(0.5);
+    await page.evaluate(([b1, b2, b3]) => {
+      const mk = (bytes, name) => new File([new Uint8Array(bytes)], name, { type: 'audio/wav' });
+      // Handed over deliberately out of order, and with a two-digit name that
+      // a plain string sort would put in the wrong place.
+      return window._TEST_loadAudioFiles([mk(b2, '10-third.wav'), mk(b3, '02-second.wav'), mk(b1, '01-first.wav')]);
+    }, [bytes1, bytes2, bytes3]);
+    await page.waitForTimeout(400);
+
+    const clips = await page.evaluate(() => window._TEST_audioClips());
+    check('loading several files at once creates one clip each', clips.length === 3, clips.map(c => c.name));
+    check('...ordered by filename, numeric-aware (01, 02, 10 — not 01, 10, 02)',
+      clips.map(c => c.name).join(',') === '01-first.wav,02-second.wav,10-third.wav', clips.map(c => c.name));
+    check('...with the first at tick 0 and each one butted up against the end of the last',
+      clips[0].startTick === 0 && clips[1].startTick > 0 && clips[2].startTick > clips[1].startTick,
+      clips.map(c => c.startTick));
+
+    const ends = await page.evaluate(() => [0, 1, 2].map(i => window._TEST_clipEndTick(i)));
+    check('...leaving no gap and no overlap between them',
+      Math.abs(ends[0] - clips[1].startTick) < 2 && Math.abs(ends[1] - clips[2].startTick) < 2,
+      { ends, starts: clips.map(c => c.startTick) });
+    check('...and each clip keeps its own duration',
+      Math.abs(clips[0].durSec - 1) < 0.01 && Math.abs(clips[1].durSec - 0.5) < 0.01 && Math.abs(clips[2].durSec - 2) < 0.01,
+      clips.map(c => c.durSec));
+
+    // Set Loop to Audio now spans the whole arrangement, not just one file.
+    await page.click('#audioSetLoopBtn');
+    await page.waitForTimeout(80);
+    const loop = await page.evaluate(() => ({ a: window._TEST_state.locStart, b: window._TEST_state.locEnd, end: window._TEST_audioEndTick() }));
+    check('Set Loop to Audio spans from the first clip\'s start to the last clip\'s end',
+      loop.a === 0 && Math.abs(loop.b - loop.end) < 2, loop);
+  });
+
+  await withPage(browser, async (page) => {
+    // Pack closes gaps left by dragging (or by swapping in a file of a
+    // different length) without disturbing where the run starts.
+    const bytes = makeWavBytes(1);
+    await page.evaluate((b) => {
+      const mk = (n) => new File([new Uint8Array(b)], n, { type: 'audio/wav' });
+      return window._TEST_loadAudioFiles([mk('a.wav'), mk('b.wav'), mk('c.wav')]);
+    }, bytes);
+    await page.waitForTimeout(400);
+
+    // By id, not index: repositioning a clip re-sorts the list, so setting
+    // "clip 1" twice by index would move two different clips.
+    await page.evaluate(() => {
+      const ids = window._TEST_audioClips().map(c => c.id);
+      window._TEST_setClipStartById(ids[0], 960);        // move the whole run right...
+      window._TEST_setClipStartById(ids[1], 100000);     // ...and blow gaps in it
+      window._TEST_setClipStartById(ids[2], 200000);
+    });
+    await page.evaluate(() => window._TEST_packAudioClips());
+    await page.waitForTimeout(80);
+    const packed = await page.evaluate(() => window._TEST_audioClips());
+    const packedEnds = await page.evaluate(() => [0, 1].map(i => window._TEST_clipEndTick(i)));
+    check('Pack keeps the first clip where it is', packed[0].startTick === 960, packed.map(c => c.startTick));
+    check('...and closes every gap after it',
+      Math.abs(packed[1].startTick - packedEnds[0]) < 2 && Math.abs(packed[2].startTick - packedEnds[1]) < 2,
+      { starts: packed.map(c => c.startTick), ends: packedEnds });
+
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(80);
+    const unpacked = await page.evaluate(() => window._TEST_audioClips());
+    check('...and packing is one undo step', unpacked[1].startTick === 100000, unpacked.map(c => c.startTick));
+  });
+
+  await withPage(browser, async (page) => {
+    // Replacing one song's file — the workflow the whole feature exists for.
+    // The clip keeps its position; only its audio and length change.
+    const short = makeWavBytes(1), long = makeWavBytes(3);
+    await page.evaluate((b) => {
+      const mk = (n) => new File([new Uint8Array(b)], n, { type: 'audio/wav' });
+      return window._TEST_loadAudioFiles([mk('a.wav'), mk('b.wav')]);
+    }, short);
+    await page.waitForTimeout(300);
+    const before = await page.evaluate(() => window._TEST_audioClips());
+
+    await page.evaluate((b) => {
+      const f = new File([new Uint8Array(b)], 'a-v2.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(f, { replaceId: window._TEST_audioClips()[0].id });
+    }, long);
+    await page.waitForTimeout(250);
+    const after = await page.evaluate(() => window._TEST_audioClips());
+    check('replacing a clip\'s file keeps its id and its position',
+      after.length === 2 && after[0].id === before[0].id && after[0].startTick === before[0].startTick, { before, after });
+    check('...and takes on the new file\'s name and length',
+      after[0].name === 'a-v2.wav' && Math.abs(after[0].durSec - 3) < 0.01, after[0]);
+    check('...leaving the clips after it exactly where they were (Pack is what closes up)',
+      after[1].startTick === before[1].startTick, { before: before[1].startTick, after: after[1].startTick });
+  });
+
+  await withPage(browser, async (page) => {
+    // Delete removes just the selected clip, and the whole arrangement
+    // survives a snapshot/applyState roundtrip (i.e. a .mmvp save/load).
+    const bytes = makeWavBytes(1);
+    await page.evaluate((b) => {
+      const mk = (n) => new File([new Uint8Array(b)], n, { type: 'audio/wav' });
+      return window._TEST_loadAudioFiles([mk('a.wav'), mk('b.wav'), mk('c.wav')]);
+    }, bytes);
+    await page.waitForTimeout(400);
+
+    const snap = await page.evaluate(() => window._TEST_snapshot());
+    const saved = JSON.parse(snap).audioClips;
+    check('the clip arrangement is part of snapshot() (so it saves into a .mmvp)',
+      Array.isArray(saved) && saved.length === 3 && saved[1].name === 'b.wav' && saved[1].startTick > 0, saved);
+
+    await page.evaluate(() => {
+      const mid = window._TEST_audioClips()[1];
+      window._TEST_setAudioSel(mid.id);
+      window._TEST_state.focus = 'audio';
+    });
+    await page.keyboard.press('Delete');
+    await page.waitForTimeout(80);
+    const left = await page.evaluate(() => window._TEST_audioClips());
+    check('Delete removes only the selected clip once the audio row has focus',
+      left.length === 2 && left.map(c => c.name).join(',') === 'a.wav,c.wav', left.map(c => c.name));
+
+    await page.evaluate((s) => window._TEST_applyState(s), snap);
+    await page.waitForTimeout(80);
+    const restored = await page.evaluate(() => window._TEST_audioClips());
+    check('applyState restores the whole arrangement — and the audio stays attached without reloading',
+      restored.length === 3 && restored.every(c => c.loaded) && restored[1].name === 'b.wav',
+      restored.map(c => ({ n: c.name, loaded: c.loaded })));
+
+    // Clearing several at once asks first — losing a whole show's worth of
+    // loaded audio to a stray click is not a recoverable afternoon.
+    let confirmed = false;
+    page.once('dialog', d => { confirmed = /3 audio clips/.test(d.message()); d.accept(); });
+    await page.click('#audioClearBtn');
+    await page.waitForTimeout(120);
+    const cleared = await page.evaluate(() => window._TEST_audioClips());
+    check('the × button asks before clearing several clips, then clears them all',
+      confirmed && cleared.length === 0, { confirmed, cleared });
+  });
+
+  await withPage(browser, async (page) => {
+    // Playback schedules each clip separately, at its own moment — the thing
+    // a single native-looping BufferSource could never do.
+    await page.evaluate(() => {
+      window.__startCalls = [];
+      const origStart = AudioBufferSourceNode.prototype.start;
+      AudioBufferSourceNode.prototype.start = function (when, offset, duration) {
+        window.__startCalls.push({ when, offset, duration, currentTime: this.context.currentTime });
+        return origStart.call(this, when, offset, duration);
+      };
+    });
+    const bytes = makeWavBytes(1);
+    await page.evaluate((b) => {
+      const mk = (n) => new File([new Uint8Array(b)], n, { type: 'audio/wav' });
+      return window._TEST_loadAudioFiles([mk('a.wav'), mk('b.wav')]);
+    }, bytes);
+    await page.waitForTimeout(400);
+
+    await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.playhead = 0; window.__startCalls.length = 0; });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(120);
+    await page.evaluate(() => window._TEST_stop());
+    const calls = await page.evaluate(() => window.__startCalls);
+    check('play() schedules a source per clip, not one for the whole row', calls.length >= 2, calls.length);
+    check('...each starting from the top of its own file', calls.every(c => c.offset < 0.01), calls.map(c => c.offset));
+    check('...the second one a clip-length later than the first',
+      calls.length >= 2 && Math.abs((calls[1].when - calls[0].when) - 1) < 0.05,
+      calls.slice(0, 2).map(c => c.when));
+    check('...and each bounded to its own length so it cannot bleed into the next',
+      calls.every(c => c.duration != null && c.duration < 1.2), calls.map(c => c.duration));
   });
 
   // ---------------- CC lane Mute/Solo ----------------
@@ -4492,8 +4705,12 @@ async function run() {
       };
     });
 
+    // Read the FIRST source scheduled, not the last: since v0.9.52 playback
+    // queues the next loop pass as well as the current one, and that later
+    // pass starts from the top of the loop range rather than the playhead.
     const runAt = async (latencyMs) => {
       await page.evaluate((ms) => {
+        window.__startCalls = [];
         window._TEST_state.audioOffset = 0;
         window._TEST_state.audioLatencyMs = ms;
         window._TEST_state.playhead = window._TEST_state.ppq * 2;
@@ -4501,7 +4718,7 @@ async function run() {
       await page.evaluate(() => window._TEST_play());
       await page.waitForTimeout(80);
       await page.evaluate(() => window._TEST_stop());
-      return page.evaluate(() => window.__startCalls[window.__startCalls.length - 1].offset);
+      return page.evaluate(() => window.__startCalls[0].offset);
     };
 
     const baseline = await runAt(0);

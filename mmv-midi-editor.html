@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.51
+  MMV MIDI & CC Curve Editor v0.9.52
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1361,6 +1361,47 @@
   off-screen one by its numbered chip, which is how the UI intends it and
   exercises the chip and the flag together.
 
+  v0.9.52 — Several audio clips in one row.
+
+  The audio track used to hold exactly one file, which meant a show had to be
+  bounced to a single master before MME could see it — and changing one song
+  meant re-rendering that master and re-copying it into every project. The row
+  now holds a LIST of clips, each an independently positioned file.
+
+  Add takes several files at once and lays them end-to-end in filename order,
+  numeric-aware, so 01…19 assemble in running order rather than 01, 10, 11, 2.
+  Drag a clip to move it (Shift for a free drag, as everywhere else); it snaps
+  to the Snap grid and also magnets to a neighbouring clip's edge within a few
+  pixels, since songs are never a whole number of bars. Double-click butts a
+  clip up against the end of the one before it — for the first clip that is
+  the old "back to the start". Arrow keys nudge the clip you last clicked,
+  Shift for a whole snap step; Delete removes it. ⟳ swaps the selected clip's
+  file for another and keeps its position, which is the point of the whole
+  exercise; ⇥⇥ closes up any gaps afterwards. × clears the lot, asking first
+  once there is more than one.
+
+  The arrangement is project data: which files, in what order, starting where.
+  It rides in the snapshot, so it saves into a .mmvp, undoes, and survives a
+  reload — and opening a project re-reads every clip's file from the Projects
+  Folder instead of making you rebuild the running order by hand. A clip whose
+  file cannot be found keeps its slot at its saved length, marked ⚠, so
+  everything after it stays where it belongs.
+
+  Under the hood the audio scheduler was rewritten. It used to lean on the Web
+  Audio node's own loop, which can only hold one buffer, so each clip is now
+  scheduled individually against the very same pass timeline the MIDI
+  scheduler uses. That also fixes a bug documented in the old code: with a
+  nonzero offset, repeat loop passes resumed immediately instead of waiting
+  out the silent gap again, so the audio drifted away from the MIDI. Each
+  scheduled clip carries its own short fade in and out, which replaces the
+  old loop-wrap anti-click automation — the click at a wrap is gone because
+  the wrap now really is two separate sources rather than one buffer jumping.
+
+  state.audioOffset survives as a GLOBAL shift over every clip: it is what
+  Move All nudges, what the offset badge shows, and what a pre-v0.9.52 project
+  saved as its single file's position — so an old project opens with its audio
+  exactly where it was, as one clip at tick 0 riding on that same offset.
+
 -->
 
 
@@ -2478,8 +2519,10 @@
         <div class="audio-name" id="audioFileName">No audio</div>
         <div style="display:flex;gap:4px;align-items:center;">
           <button id="audioMuteBtn" style="font-size:10px;padding:2px 6px;" title="Mute / unmute audio track">M</button>
-          <button id="audioLoadBtn" style="font-size:10px;padding:2px 7px;" title="Load an audio file (MP3, WAV, OGG…)">Load</button>
-          <button id="audioClearBtn" style="font-size:10px;padding:2px 6px;" title="Remove the loaded audio file">×</button>
+          <button id="audioLoadBtn" style="font-size:10px;padding:2px 7px;" title="Add audio clips (MP3, WAV, OGG…) — pick several at once and they are laid end-to-end in filename order">Add</button>
+          <button id="audioReplaceBtn" style="font-size:10px;padding:2px 6px;" title="Swap the selected clip's file for another, keeping its position">&#x27F3;</button>
+          <button id="audioPackBtn" style="font-size:10px;padding:2px 6px;" title="Close the gaps — lay every clip end-to-end starting from the first">&#x21E5;&#x21E5;</button>
+          <button id="audioClearBtn" style="font-size:10px;padding:2px 6px;" title="Remove all audio clips">×</button>
         </div>
         <div style="display:flex;gap:4px;align-items:center;width:100%;">
           <span id="audioVolIcon" title="Volume: 100%" style="flex-shrink:0;display:inline-flex;color:var(--txt2);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 9 8 9 13 4 13 20 8 15 3 15 3 9"/><path d="M16 8.5a5 5 0 0 1 0 7"/><path d="M19 6a9 9 0 0 1 0 12"/></svg></span>
@@ -2487,7 +2530,8 @@
           <button id="audioSetLoopBtn" style="font-size:9px;padding:1px 5px;flex-shrink:0;" title="Set the A/B loop markers to exactly match the loaded audio's start/end">⇥⟺</button>
         </div>
         <button id="audioOffsetBadge" style="display:none;font-size:9px;padding:1px 6px;color:var(--accent2);background:var(--panel2);" title="Audio start offset — click to reset to 0">Off +0</button>
-        <input type="file" id="audioFileInput" accept="audio/*" style="display:none">
+        <input type="file" id="audioFileInput" accept="audio/*" multiple style="display:none">
+        <input type="file" id="audioReplaceInput" accept="audio/*" style="display:none">
       </div>
       <div class="scroll hx" id="audioScroll"><canvas id="audioCanvas"></canvas></div>
     </div>
@@ -2783,6 +2827,16 @@
     // through.
     loopOn:true,
     audioOffset:0, audioLatencyMs:0,
+    // The audio row holds a LIST of clips, each an independently positioned
+    // audio file: {id, name, startTick, durSec}. Only the arrangement lives
+    // here — the decoded AudioBuffers are far too large to serialize and are
+    // held separately in audioBufs, keyed by clip id, for the life of the
+    // page. A project therefore saves "which files, in what order, starting
+    // where", and reopening it re-reads those files from the Projects Folder.
+    // state.audioOffset survives alongside this as a GLOBAL shift applied to
+    // every clip — it is what Move All nudges, and what a pre-v0.9.52
+    // single-file project saved as its audio position.
+    audioClips:[],
     // CC macros: captured multi-lane automation gestures, each attachable to a
     // note (see the "CC Macros" section further down). Project data, so it
     // rides in snapshot()/applyState() and therefore in save/load too.
@@ -3034,9 +3088,30 @@
   const prScroll=$('prScroll'), prCanvas=$('prCanvas'), pctx=prCanvas.getContext('2d');
   const velScroll=$('velScroll'), velCanvas=$('velCanvas'), vctx=velCanvas.getContext('2d');
   const audioRow=$('audioRow'), audioScroll=$('audioScroll'), audioCanvas=$('audioCanvas'), actx=audioCanvas.getContext('2d');
-  let audioCtx=null, audioSrc=null, audioGain=null, audioBuf=null, audioMuted=false, audioVolume=1;
+  let audioCtx=null, audioGain=null, audioMuted=false, audioVolume=1;
   const markerScroll=$('markerScroll'), markerCanvas=$('markerCanvas'), mctx=markerCanvas.getContext('2d');
   const phEl=$('playheadEl');
+
+  // ---------- Audio clips ----------
+  // Decoded buffers, keyed by clip id. Deliberately NOT hung off the clip
+  // objects themselves: those go through JSON.stringify on every snapshot()
+  // (i.e. every undo step and every autosave), and a 100-minute AudioBuffer
+  // has no business anywhere near that. Keying by id also means undo/redo,
+  // which replaces state.audioClips wholesale with rehydrated objects, keeps
+  // every clip's audio attached without reloading a thing.
+  const audioBufs=new Map();
+  let audioSel=null; // id of the clip last clicked — the one Replace/Delete/arrows act on
+  function audioClips(){ return state.audioClips||(state.audioClips=[]); }
+  function audioBufOf(c){ return c?(audioBufs.get(c.id)||null):null; }
+  function anyAudio(){ return audioClips().some(c=>audioBufs.has(c.id)); }
+  function selectedClip(){ return audioSel==null?null:(audioClips().find(c=>c.id===audioSel)||null); }
+  // A clip's end has to be derived through seconds rather than by adding a
+  // fixed tick length: under a tempo map the same file occupies a different
+  // number of ticks depending on where it starts.
+  function clipEndTick(c){ return secondsToTicks(tickToSeconds(c.startTick)+(c.durSec||0)); }
+  function audioEndTick(){ let m=0; audioClips().forEach(c=>{ m=Math.max(m,clipEndTick(c)); }); return m; }
+  function audioStartTick(){ let m=Infinity; audioClips().forEach(c=>{ if(c.startTick<m) m=c.startTick; }); return m===Infinity?0:m; }
+  function sortAudioClips(){ audioClips().sort((a,b)=>(a.startTick-b.startTick)||(a.id-b.id)); }
 
   function ensureSpacer(scrollEl){ let sp=scrollEl.querySelector(':scope > .spacer'); if(!sp){ sp=document.createElement('div'); sp.className='spacer'; scrollEl.insertBefore(sp, scrollEl.firstChild); } return sp; }
   function setSpacer(scrollEl, w, h){ ensureSpacer(scrollEl).style.cssText='position:absolute;top:0;left:0;width:'+w+'px;height:'+h+'px;'; }
@@ -3166,7 +3241,8 @@
     sweepOn:state.sweepOn,sweepFreqStart:state.sweepFreqStart,sweepFreqEnd:state.sweepFreqEnd,
     sweepAmpLoStart:state.sweepAmpLoStart,sweepAmpLoEnd:state.sweepAmpLoEnd,
     sweepAmpHiStart:state.sweepAmpHiStart,sweepAmpHiEnd:state.sweepAmpHiEnd,
-    audioOffset:state.audioOffset||0, audioLatencyMs:state.audioLatencyMs||0 }); }
+    audioOffset:state.audioOffset||0, audioLatencyMs:state.audioLatencyMs||0,
+    audioClips:audioClips() }); }
   function pushUndo(){ undoStack.push(snapshot()); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); }
   function armUndo(){ pending=snapshot(); }
   function commitUndo(){ if(pending){ if(snapshot()!==pending){ undoStack.push(pending); if(undoStack.length>60) undoStack.shift(); redoStack.length=0; updateUndoBtns(); } pending=null; } }
@@ -3206,6 +3282,13 @@
     if(o.sweepFreqEnd){ state.sweepFreqEnd=o.sweepFreqEnd; if($('advFreqEnd')) $('advFreqEnd').value=o.sweepFreqEnd; }
     ['sweepAmpLoStart','sweepAmpLoEnd','sweepAmpHiStart','sweepAmpHiEnd'].forEach(k=>{ if(o[k]!=null){ state[k]=o[k]; const el=$('adv'+k.charAt(0).toUpperCase()+k.slice(1)); if(el) el.value=o[k]; } });
     state.audioOffset=o.audioOffset||0; updateAudioOffsetBadge();
+    // Pre-v0.9.52 projects have no audioClips key. An empty list is the right
+    // reading — their single audio file is re-attached by the auto-load below
+    // as one clip at tick 0, positioned by the audioOffset just restored,
+    // which lands it exactly where it used to sit.
+    state.audioClips=Array.isArray(o.audioClips)?o.audioClips:[];
+    if(!selectedClip()) audioSel=state.audioClips.length?state.audioClips[0].id:null;
+    updateAudioUI();
     state.audioLatencyMs=o.audioLatencyMs||0; if($('audioLatencyMs')) $('audioLatencyMs').value=state.audioLatencyMs;
     populateViewCh();
     // Rebuild channel name inputs if they exist
@@ -3596,43 +3679,89 @@
     ctx.fillStyle=getCss('--panel3'); ctx.fillRect(sx,0,w,h);
     ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
     gridLinesX(ctx,0,h,w); drawLocators(ctx,h);
-    if(!(audioDrag&&audioDrag.moved)) audioCanvas.style.cursor=audioBuf?'grab':'default';
-    if(!audioBuf){
+    const clips=audioClips();
+    if(!(audioDrag&&audioDrag.moved)) audioCanvas.style.cursor=clips.length?'grab':'default';
+    if(!clips.length){
       ctx.fillStyle=getCss('--txt2'); ctx.font='11px system-ui'; ctx.textAlign='left'; ctx.textBaseline='middle';
       ctx.fillText('Load an audio file — use the Load button or drop a file here',sx+12,h/2);
       drawTempoDragGhost(ctx,h);
       return;
     }
-    const ch=audioBuf.getChannelData(0), sr=audioBuf.sampleRate;
-    const mid=h/2, pad=2;
-    // audioOffset shifts the buffer's sample-0 to that timeline tick — a
-    // positive offset delays audio (silent gap at the start), negative
-    // trims/pulls it earlier (content before tick 0 is simply never shown).
-    // Sample position is derived via tickToSeconds (tempo-map-aware, piecewise)
-    // rather than a flat samples-per-tick constant, so the waveform stays in
-    // sync with wherever the tempo map says each tick actually falls in time.
+    // audioOffset shifts every clip's position on the timeline — a positive
+    // offset delays the audio (silent gap at the start), negative trims/pulls
+    // it earlier (content before tick 0 is simply never shown). Each clip then
+    // adds its own startTick on top.
     const off=state.audioOffset||0;
-    const offSec=tickToSeconds(off);
-    const linePath=new Path2D(), fillPath=new Path2D();
-    for(let px=0;px<w;px++){
-      const cx=sx+px;
-      const t0px=tickToSeconds(cx/state.pxPerTick)-offSec, t1px=tickToSeconds((cx+1)/state.pxPerTick)-offSec;
-      if(t1px<0) continue; // still within the pre-audio silent gap — keep scanning right
-      const i0=Math.max(0,Math.floor(t0px*sr));
-      const i1=Math.min(ch.length,Math.ceil(t1px*sr)+1);
-      if(i0>=ch.length) break;
-      let mn=0,mx=0; const skip=Math.max(1,Math.floor((i1-i0)/256));
-      for(let i=i0;i<i1;i+=skip){const s=ch[i]; if(s<mn)mn=s; if(s>mx)mx=s;}
-      const yT=mid-mx*(mid-pad), yB=mid-mn*(mid-pad);
-      linePath.moveTo(cx+0.5,yT); linePath.lineTo(cx+0.5,yB);
-      fillPath.rect(cx,yT,1,Math.max(1,yB-yT));
-    }
-    ctx.fillStyle=getCss('--accent')+'28'; ctx.fill(fillPath);
-    ctx.strokeStyle=getCss('--accent'); ctx.lineWidth=1; ctx.stroke(linePath);
-    // zero line
+    clips.forEach(c=>drawAudioClip(ctx,c,sx,w,h,off));
+    // zero line, drawn once across the whole row rather than per clip so the
+    // gaps between clips still read as a continuous track
     ctx.strokeStyle=getCss('--line'); ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(sx,mid+0.5); ctx.lineTo(sx+w,mid+0.5); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx,h/2+0.5); ctx.lineTo(sx+w,h/2+0.5); ctx.stroke();
     drawTempoDragGhost(ctx,h);
+  }
+  const AUDIO_LABEL_H=13;
+  // One clip's slot in the audio row. Everything is clipped to the clip's own
+  // pixel span, so the per-pixel waveform scan below can never cost more than
+  // the visible width no matter how many clips the project holds.
+  function drawAudioClip(ctx,c,sx,w,h,off){
+    const cs=c.startTick+off;
+    const csSec=tickToSeconds(cs);
+    const x0f=tickToX(cs), x1f=tickToX(secondsToTicks(csSec+(c.durSec||0)));
+    const x0=Math.max(sx,Math.floor(x0f)), x1=Math.min(sx+w,Math.ceil(x1f));
+    if(x1<=x0) return; // scrolled out of view
+    const sel=(c.id===audioSel), buf=audioBufOf(c);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0,0,x1-x0,h); ctx.clip();
+    ctx.fillStyle=sel?getCss('--accent2')+'1c':'#ffffff08';
+    ctx.fillRect(x0,0,x1-x0,h);
+    if(buf){
+      const ch=buf.getChannelData(0), sr=buf.sampleRate;
+      const mid=h/2, pad=2;
+      const linePath=new Path2D(), fillPath=new Path2D();
+      for(let cx=x0;cx<x1;cx++){
+        // Sample position is derived via tickToSeconds (tempo-map-aware,
+        // piecewise) rather than a flat samples-per-tick constant, so the
+        // waveform stays in sync with wherever the tempo map says each tick
+        // actually falls in time.
+        const t0px=tickToSeconds(cx/state.pxPerTick)-csSec, t1px=tickToSeconds((cx+1)/state.pxPerTick)-csSec;
+        if(t1px<0) continue; // still ahead of this clip's start — keep scanning right
+        const i0=Math.max(0,Math.floor(t0px*sr));
+        const i1=Math.min(ch.length,Math.ceil(t1px*sr)+1);
+        if(i0>=ch.length) break;
+        let mn=0,mx=0; const skip=Math.max(1,Math.floor((i1-i0)/256));
+        for(let i=i0;i<i1;i+=skip){const s=ch[i]; if(s<mn)mn=s; if(s>mx)mx=s;}
+        const yT=mid-mx*(mid-pad), yB=mid-mn*(mid-pad);
+        linePath.moveTo(cx+0.5,yT); linePath.lineTo(cx+0.5,yB);
+        fillPath.rect(cx,yT,1,Math.max(1,yB-yT));
+      }
+      ctx.fillStyle=getCss('--accent')+'28'; ctx.fill(fillPath);
+      ctx.strokeStyle=getCss('--accent'); ctx.lineWidth=1; ctx.stroke(linePath);
+    } else {
+      // The project remembered this clip but its file wasn't found. Keep the
+      // slot visible at its saved length so everything after it stays where
+      // it belongs and it's obvious which one needs re-pointing.
+      ctx.fillStyle=getCss('--txt2')+'22'; ctx.fillRect(x0,AUDIO_LABEL_H,x1-x0,h-AUDIO_LABEL_H);
+      ctx.strokeStyle=getCss('--txt2')+'55'; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(x0,h/2+0.5); ctx.lineTo(x1,h/2+0.5); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // Name plate — pinned to the left edge of the VISIBLE part of the clip so
+    // a long clip you've scrolled into the middle of still says what it is.
+    if(x1-x0>28 && h>AUDIO_LABEL_H+4){
+      ctx.fillStyle=sel?getCss('--accent2'):getCss('--panel2');
+      ctx.fillRect(x0,0,x1-x0,AUDIO_LABEL_H);
+      ctx.fillStyle=sel?'#0b0d12':getCss('--txt2');
+      ctx.font='10px system-ui'; ctx.textAlign='left'; ctx.textBaseline='middle';
+      ctx.fillText((buf?'':'⚠ ')+c.name,x0+4,AUDIO_LABEL_H/2+0.5);
+    }
+    ctx.restore();
+    // Edges last and unclipped, so abutting clips still show a seam
+    ctx.strokeStyle=sel?getCss('--accent2'):getCss('--line');
+    ctx.lineWidth=sel?2:1;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(x0)+0.5,0); ctx.lineTo(Math.round(x0)+0.5,h);
+    ctx.moveTo(Math.round(x1)-0.5,0); ctx.lineTo(Math.round(x1)-0.5,h);
+    ctx.stroke();
   }
   function drawKeys(){ const w=keysCanvas.width,h=keysCanvas.height,nh=state.noteHeight;
     kctx.setTransform(1,0,0,1,0,0); kctx.clearRect(0,0,w,h);
@@ -6781,32 +6910,52 @@
   // Returns true/false so callers (notably autoLoadProjectAudio below) can
   // fall back to a different name to try, or skip the "reload it yourself"
   // flash once this already succeeded.
-  async function tryAutoLoadAudio(baseName){
-    if(!projDirHandle) return false;
-    if(!await verifyDirPermission(projDirHandle,false)) return false;
-    for(const ext of AUDIO_EXTS){
-      try{
-        const fh=await projDirHandle.getFileHandle(baseName+'.'+ext);
-        const file=await fh.getFile();
-        await loadAudio(file);
-        flash('Auto-loaded audio: '+file.name);
-        return true;
-      }catch(e){ /* not found with this extension — try the next one */ }
-    }
+  // The search itself, without the loading — shared by the single-file
+  // fallback below and by the per-clip reload a multi-clip project needs.
+  // `exts` lets a caller that already knows the full filename (a saved clip)
+  // ask for that exact name instead of probing every audio extension.
+  async function findProjectAudio(baseName,exts){
+    if(!projDirHandle) return null;
+    if(!await verifyDirPermission(projDirHandle,false)) return null;
+    const dirs=[{h:projDirHandle,label:''}];
     for(const sub of AUDIO_SUBDIRS){
-      let subDir;
-      try{ subDir=await projDirHandle.getDirectoryHandle(sub); }catch(e){ continue; } // no such subfolder — fine
-      for(const ext of AUDIO_EXTS){
+      try{ dirs.push({h:await projDirHandle.getDirectoryHandle(sub),label:sub+'/'}); }
+      catch(e){ /* no such subfolder — fine */ }
+    }
+    for(const d of dirs){
+      for(const ext of (exts||AUDIO_EXTS)){
+        const name=ext?baseName+'.'+ext:baseName;
         try{
-          const fh=await subDir.getFileHandle(baseName+'.'+ext);
-          const file=await fh.getFile();
-          await loadAudio(file);
-          flash('Auto-loaded audio: '+sub+'/'+file.name);
-          return true;
-        }catch(e){ /* not found with this extension — try the next one */ }
+          const fh=await d.h.getFileHandle(name);
+          return {file:await fh.getFile(), label:d.label+name};
+        }catch(e){ /* not found here — try the next one */ }
       }
     }
-    return false;
+    return null;
+  }
+  async function tryAutoLoadAudio(baseName){
+    const hit=await findProjectAudio(baseName);
+    if(!hit) return false;
+    await loadAudio(hit.file);
+    flash('Auto-loaded audio: '+hit.label);
+    return true;
+  }
+  // A multi-clip project saved the whole arrangement — which files, in what
+  // order, starting where. Put each clip's own file back into its own slot
+  // (loadAudio's replaceId keeps the saved startTick) rather than appending,
+  // so reopening restores the running order instead of making you rebuild it.
+  async function reloadProjectAudioClips(){
+    const cs=audioClips();
+    if(!cs.length||!projDirHandle) return 0;
+    let loaded=0;
+    for(const c of cs.slice()){
+      // Exact saved filename first; a re-render that changed format (a .wav
+      // swapped for the .mp3 it was bounced to) still resolves by basename.
+      const hit=await findProjectAudio(c.name,[''])
+        || await findProjectAudio((c.name||'').replace(/\.[^./\\]+$/,''));
+      if(hit && await loadAudio(hit.file,{replaceId:c.id,quiet:true})) loaded++;
+    }
+    return loaded;
   }
   // Called whenever a project finishes loading (see loadProject below) — the
   // single place that decides whether a sibling audio file can be found and
@@ -6822,6 +6971,15 @@
   // project's own basename across the usual audio extensions.
   async function autoLoadProjectAudio(data,baseName){
     if(!projDirHandle) return false;
+    // A project that saved a clip arrangement restores that arrangement —
+    // the single-file paths below are only for projects that never had one.
+    if(audioClips().length){
+      const n=await reloadProjectAudioClips();
+      const total=audioClips().length;
+      if(n) flash(n===total ? 'Auto-loaded '+n+' audio clip'+(n===1?'':'s')
+                            : 'Auto-loaded '+n+' of '+total+' audio clips — the rest are marked ⚠ on the audio track.');
+      return n>0;
+    }
     if(data&&data.audioFile){
       const savedBase=data.audioFile.replace(/\.[^./\\]+$/,'');
       if(savedBase && await tryAutoLoadAudio(savedBase)) return true;
@@ -6867,7 +7025,11 @@
     }
   }
   async function saveProject(){
-    const data={version:1,projectName:state.projectName,audioFile:$('audioFileName').textContent!=='No audio'?$('audioFileName').textContent:'',snapshot:JSON.parse(snapshot())};
+    // The clip arrangement rides in the snapshot (state.audioClips). audioFile
+    // is kept alongside it, naming the first clip, so a project saved here
+    // still opens its audio in a pre-v0.9.52 build of MME.
+    const cs=audioClips();
+    const data={version:1,projectName:state.projectName,audioFile:cs.length?cs[0].name:'',snapshot:JSON.parse(snapshot())};
     const json=JSON.stringify(data,null,2);
     if(projDirHandle && await verifyDirPermission(projDirHandle,true)){
       try{
@@ -6902,7 +7064,9 @@
         const baseName=(file.name||'').replace(/\.mmvp$/i,'');
         const audioLoaded=await autoLoadProjectAudio(data,baseName);
         if(!audioLoaded){
-          if(data.audioFile) flash('Project loaded. Reload audio file: '+data.audioFile);
+          const n=audioClips().length;
+          if(n>1) flash('Project loaded. '+n+' audio clips could not be found — use Add to point at the files again.');
+          else if(data.audioFile) flash('Project loaded. Reload audio file: '+data.audioFile);
           else flash('Project loaded');
         }
       }catch(e){ alert('Could not load project: '+e.message); }
@@ -7912,7 +8076,7 @@
     // getLoop() returns the whole-track span, so Loop on and nothing selected
     // repeats the whole project — and Loop off plays one pass and stops at the
     // end, whether a range is selected or not. See the `!s.loops` branch in
-    // schedulerTick() and the audioSrc.loop assignment below.
+    // schedulerTick() and the pass loop in scheduleAudioPasses() below.
     const loops=state.loopOn!==false;
     let startTick=state.playhead; if(startTick<a||startTick>=b) startTick=a;
     state.lastPlayStart=startTick;
@@ -7939,80 +8103,101 @@
     }
     startClock(); schedulerTick(); rafVisual=requestAnimationFrame(visualFrame);
     // Audio playback — start at the same wall-clock instant as MIDI (t0)
-    if(audioBuf && audioCtx){
+    if(anyAudio() && audioCtx){
       if(audioCtx.state==='suspended') audioCtx.resume();
-      if(audioSrc){ try{audioSrc.stop();}catch(e){} audioSrc=null; }
-      // audioOffset shifts the buffer's sample-0 to that timeline tick (drag
-      // the Audio track to set it) — positive delays audio (silent lead-in),
-      // negative trims/pulls it earlier. NOTE: the native loop can't
-      // reproduce a recurring silent gap, so this is correct for the pass
-      // that's about to play; if playback loops back around to the start of
-      // the loop region more than once with a nonzero offset, the audio
-      // resumes immediately on repeat passes instead of waiting out the gap
-      // again and will drift out of sync with the MIDI/CC transport. Not an
-      // issue for normal edit/playback/reseek use — only for letting a
-      // song with an offset loop unattended past its natural end.
-      const off=effectiveAudioOffsetTicks();
-      const loopStartSec=Math.max(0,tickToSeconds(a-off));
-      const loopEndSec=Math.max(loopStartSec+0.001,Math.min(tickToSeconds(b-off),audioBuf.duration));
-      const bufTickAtStart=startTick-off;
-      const offset=bufTickAtStart>=0?tickToSeconds(bufTickAtStart):0;
-      const startDelaySec=bufTickAtStart>=0?0:tickToSeconds(off-startTick);
-      if(bufTickAtStart>=0?offset<audioBuf.duration:off<b){
-        audioSrc=audioCtx.createBufferSource();
-        audioSrc.buffer=audioBuf;
-        audioSrc.loop=loops;
-        audioSrc.loopStart=loopStartSec;
-        audioSrc.loopEnd=loopEndSec;
-        audioGain=audioCtx.createGain();
-        const startAt=audioCtx.currentTime+START_DELAY/1000+startDelaySec;
-        audioGain.gain.setValueAtTime(0,startAt);
-        audioGain.gain.linearRampToValueAtTime(audioMuted?0:audioVolume,startAt+AUDIO_FADE);
-        audioSrc.connect(audioGain); audioGain.connect(audioCtx.destination);
-        audioSrc.start(startAt, offset);
-        // Wrap-dip anti-click automation only makes sense for an actual loop
-        // wrap; with no explicit range selected, audio just plays through and
-        // stops with everything else at the end (see finishPlaybackAtEnd()).
-        if(loops){ audioLoopSched={loopStartSec,loopEndSec,startAt,offset}; scheduleAudioWrapDips(); }
-      }
+      stopAudioSources();
+      // One master gain for the whole row (volume/mute); each scheduled clip
+      // gets its own short-fade gain underneath it (see scheduleAudioPass).
+      audioEpoch={perfMs:performance.now(), acTime:audioCtx.currentTime};
+      audioGain=audioCtx.createGain();
+      const startAt=acAt(t0);
+      audioGain.gain.setValueAtTime(0,Math.max(audioCtx.currentTime,startAt-AUDIO_FADE));
+      audioGain.gain.linearRampToValueAtTime(audioMuted?0:audioVolume,startAt+AUDIO_FADE);
+      audioGain.connect(audioCtx.destination);
+      audioPassScheduled=-1;
+      scheduleAudioPasses();
     }
   }
-  // Anti-click dips at each loop-wrap point (buffer jumps from loopEnd back
-  // to loopStart) — pre-scheduled up front since Web Audio automation just
-  // needs future timestamps, not incremental lookahead. Bounded to 500
-  // wraps (~hours of continuous unattended looping) so this can't grow
-  // unbounded. Re-callable any time the target gain changes mid-playback
-  // (mute/volume) since those cancel and replace all scheduled automation.
-  let audioLoopSched=null;
-  function scheduleAudioWrapDips(){
-    if(!audioGain||!audioLoopSched||!audioCtx) return;
-    const {loopStartSec,loopEndSec,startAt,offset}=audioLoopSched;
-    const period=loopEndSec-loopStartSec;
-    if(period<=AUDIO_FADE*4) return;
-    const target=audioMuted?0:audioVolume, now=audioCtx.currentTime;
-    const firstWrapAt=startAt+(loopEndSec-offset);
-    for(let i=0;i<500;i++){
-      const wrapAt=firstWrapAt+i*period;
-      if(wrapAt<=now) continue;
-      audioGain.gain.setValueAtTime(target,wrapAt-AUDIO_FADE);
-      audioGain.gain.linearRampToValueAtTime(0,wrapAt-AUDIO_WRAP_DIP/2);
-      audioGain.gain.setValueAtTime(0,wrapAt+AUDIO_WRAP_DIP/2);
-      audioGain.gain.linearRampToValueAtTime(target,wrapAt+AUDIO_WRAP_DIP/2+AUDIO_FADE);
-    }
+  // ---- Audio scheduling ----
+  // Every clip is scheduled individually, per loop pass, against the very same
+  // pass timeline the MIDI scheduler uses (schedElapsedMs) — so audio and MIDI
+  // stay locked across loop wraps and tempo changes alike. This replaced a
+  // single BufferSource relying on the Web Audio node's native loop, which
+  // could not express more than one file and could not reproduce a recurring
+  // silent gap either: with a nonzero offset, repeat passes used to resume
+  // immediately instead of waiting the gap out, drifting away from the MIDI.
+  let audioEpoch=null;   // maps performance.now() ms onto the AudioContext clock
+  let audioSrcs=[];      // live scheduled sources, pruned as they finish
+  let audioPassScheduled=-1;
+  const AUDIO_PASS_AHEAD=1; // passes queued beyond the current one
+  function acAt(perfMs){ return audioEpoch.acTime+(perfMs-audioEpoch.perfMs)/1000; }
+  function stopAudioSources(){
+    audioSrcs.forEach(o=>{ try{o.src.stop();}catch(e){} try{o.src.disconnect();}catch(e){} });
+    audioSrcs=[];
+    audioEpoch=null; audioPassScheduled=-1;
+  }
+  // Called from beginPlayback and then topped up on every scheduler tick, so a
+  // loop that runs for hours only ever holds a couple of passes' worth of
+  // scheduled sources rather than pre-scheduling to infinity.
+  function scheduleAudioPasses(){
+    if(!sched||!audioEpoch||!audioGain||!audioCtx) return;
+    const s=sched;
+    const curPass=s.loops?schedPassIndexAt(s,Math.max(0,performance.now()-s.t0)):0;
+    const last=s.loops?curPass+AUDIO_PASS_AHEAD:0;
+    for(let p=Math.max(audioPassScheduled+1,curPass);p<=last;p++) scheduleAudioPass(p);
+    if(last>audioPassScheduled) audioPassScheduled=last;
+    const cutoff=audioCtx.currentTime-0.5;
+    if(audioSrcs.some(o=>o.endAc<=cutoff)) audioSrcs=audioSrcs.filter(o=>o.endAc>cutoff);
+  }
+  function scheduleAudioPass(p){
+    const s=sched;
+    // Pass 0 is the (possibly partial) first pass from wherever play started;
+    // every repeat after it runs the full loop range.
+    const from=p<=0?s.startTick:s.a, to=s.b;
+    const off=effectiveAudioOffsetTicks();
+    const nowAc=audioCtx.currentTime;
+    audioClips().forEach(c=>{
+      const buf=audioBufOf(c); if(!buf) return;
+      const cs=c.startTick+off, csSec=tickToSeconds(cs);
+      const ce=secondsToTicks(csSec+buf.duration);
+      const a0=Math.max(cs,from), a1=Math.min(ce,to);
+      if(a1<=a0) return; // this clip isn't audible anywhere in this pass
+      const whenAc=acAt(s.t0+schedElapsedMs(s,p,a0));
+      if(whenAc<nowAc-0.05) return; // already gone past — nothing to schedule
+      // Buffer position is the difference of two absolute tickToSeconds
+      // readings, never tickToSeconds of a tick difference: under a tempo map
+      // the two are not the same, and only the former tracks the waveform
+      // drawn on screen.
+      const bufOff=Math.max(0,tickToSeconds(a0)-csSec);
+      const dur=tickToSeconds(a1)-tickToSeconds(a0);
+      if(dur<=0.001) return;
+      const src=audioCtx.createBufferSource(); src.buffer=buf;
+      const g=audioCtx.createGain();
+      const st=Math.max(whenAc,nowAc), en=st+dur;
+      // Anti-click ramps at both ends of every clip — this is what the old
+      // loop-wrap "dip" automation used to do, now falling out naturally
+      // because each pass gets its own source.
+      g.gain.setValueAtTime(0,st);
+      g.gain.linearRampToValueAtTime(1,st+AUDIO_FADE);
+      g.gain.setValueAtTime(1,Math.max(st+AUDIO_FADE,en-AUDIO_WRAP_DIP));
+      g.gain.linearRampToValueAtTime(0,en);
+      src.connect(g); g.connect(audioGain);
+      src.start(st,bufOff,dur+AUDIO_FADE);
+      audioSrcs.push({src,g,endAc:en});
+    });
   }
   // Smoothly ramps to the current mute/volume target — used for live
   // mute-toggle/volume-slider changes during playback, not just the initial
-  // start. Cancels (and reschedules) the wrap dips since they're on the
-  // same automation timeline.
+  // start.
   function setAudioGainLive(){
     if(!audioGain||!audioCtx) return;
     const target=audioMuted?0:audioVolume, now=audioCtx.currentTime;
     audioGain.gain.cancelScheduledValues(now);
     audioGain.gain.setValueAtTime(audioGain.gain.value,now);
     audioGain.gain.linearRampToValueAtTime(target,now+AUDIO_FADE);
-    scheduleAudioWrapDips();
   }
   function schedulerTick(){ if(!state.playing||!sched) return; const s=sched, now=performance.now(); let guard=0;
+    scheduleAudioPasses();
     // MIDI Clock: only when we are the master (not following MMV)
     if(state.midiOut && s.msPerClock && !state.syncFollow){
       let cg=0;
@@ -8072,17 +8257,20 @@
   function stopTransport(){ if(rafVisual){ cancelAnimationFrame(rafVisual); rafVisual=null; } stopClock();
     clearSyncHeartbeat();
     if(state.midiOut){ if(!state.syncFollow) mSend([0xFC]); try{ state.midiOut.clear && state.midiOut.clear(); }catch(e){} } allNotesOff(); sched=null;
-    if(audioSrc){
+    // Ramp the master down first, then let every live source run into that
+    // fade before stopping — an instant cut on any one of them would click.
+    if(audioGain&&audioCtx){
+      const g=audioGain, now=audioCtx.currentTime;
       try{
-        const now=audioCtx.currentTime;
-        audioGain.gain.cancelScheduledValues(now);
-        audioGain.gain.setValueAtTime(audioGain.gain.value,now);
-        audioGain.gain.linearRampToValueAtTime(0,now+AUDIO_FADE);
-        audioSrc.stop(now+AUDIO_FADE);
-      }catch(e){ try{audioSrc.stop();}catch(e2){} }
-      audioSrc=null;
-    }
-    audioGain=null; audioLoopSched=null; }
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(g.gain.value,now);
+        g.gain.linearRampToValueAtTime(0,now+AUDIO_FADE);
+      }catch(e){}
+      audioSrcs.forEach(o=>{ try{ o.src.stop(now+AUDIO_FADE); }catch(e){ try{o.src.stop();}catch(e2){} } });
+      audioSrcs=[]; audioEpoch=null; audioPassScheduled=-1;
+      setTimeout(()=>{ try{ g.disconnect(); }catch(e){} }, 250);
+    } else stopAudioSources();
+    audioGain=null; }
   function pause(){ if(!state.playing) return; if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); updateTransportBtns(); }
   function stop(){ if(state.recording||state.recArmed) endRecordingSession(); state.playing=false; stopTransport(); state.playhead=getLoop().a; updatePlayPos(); updatePlayheadEl(); updateTransportBtns(); }
   // Reached the end of a non-looping (no explicit loop range) pass — stop in
@@ -8571,7 +8759,7 @@
     const hasMidi=minT!==Infinity;
     if(delta<0 && hasMidi) delta=Math.max(delta,-minT); // don't push MIDI below bar 1
     if(!delta) return;
-    if(!hasMidi && !audioBuf) return; // nothing to move
+    if(!hasMidi && !audioClips().length) return; // nothing to move
     pushUndo();
     // Notes and lane points move in lockstep here, so a macro note's baked
     // points are already where they should be — carry macroAt along with the
@@ -8579,7 +8767,9 @@
     // (which would be a no-op with a needless new instance id).
     state.notes.forEach(n=>{ n.start=Math.max(0,n.start+delta); if(n.macroAt!=null) n.macroAt=n.start; });
     state.ccLanes.forEach(l=>{ l.points.forEach(p=>{ p.t=Math.max(0,Math.round(p.t+delta)); }); l.points.sort((a,b)=>a.t-b.t); });
-    if(audioBuf){ state.audioOffset=(state.audioOffset||0)+delta; updateAudioOffsetBadge(); }
+    // Every clip rides on the global offset, so one number moves the whole
+    // audio row in lockstep with the MIDI without touching the arrangement.
+    if(audioClips().length){ state.audioOffset=(state.audioOffset||0)+delta; updateAudioOffsetBadge(); updateAudioUI(); }
     let maxT=0; state.notes.forEach(n=>maxT=Math.max(maxT,n.start+Math.max(1,n.length)));
     state.ccLanes.forEach(l=>l.points.forEach(p=>maxT=Math.max(maxT,p.t)));
     state.bars=Math.max(state.bars,Math.ceil(maxT/ticksPerBar())+1);
@@ -9227,25 +9417,114 @@
   $('markerListBtn').addEventListener('click',showMarkerListDialog);
 
   // ---------- Audio track ----------
-  async function loadAudio(file){
+  // Decodes `file` and either drops it in as a new clip or swaps it into an
+  // existing one (opts.replaceId), keeping that clip's position. A new clip
+  // lands at opts.startTick if given, otherwise butted up against the end of
+  // whatever is already there — which is what makes "select all 37 songs"
+  // lay itself out in order without a single drag.
+  async function loadAudio(file,opts){
+    opts=opts||{};
     if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
     if(audioCtx.state==='suspended') await audioCtx.resume();
+    let buf;
     try{
       const ab=await file.arrayBuffer();
-      audioBuf=await audioCtx.decodeAudioData(ab);
-      $('audioFileName').textContent=file.name;
-    }catch(e){ alert('Could not decode audio: '+e.message); return; }
-    requestDraw();
+      buf=await audioCtx.decodeAudioData(ab);
+    }catch(e){
+      if(opts.quiet) return null;
+      alert('Could not decode audio: '+e.message); return null;
+    }
+    const clips=audioClips();
+    let clip=opts.replaceId!=null?clips.find(c=>c.id===opts.replaceId):null;
+    if(!clip){
+      const startTick=opts.startTick!=null?Math.round(opts.startTick):(clips.length?audioEndTick():0);
+      clip={id:state.nextId++,name:file.name,startTick,durSec:buf.duration};
+      clips.push(clip);
+    }
+    clip.name=file.name; clip.durSec=buf.duration;
+    audioBufs.set(clip.id,buf);
+    audioSel=clip.id;
+    sortAudioClips(); updateAudioUI(); requestDraw();
+    return clip;
   }
-  // Removes the currently loaded audio (stopping playback if it's live) and
-  // resets its offset — called both by the manual × button and at the start
-  // of loadProject(), since audio isn't part of a .mmvp's own data and would
-  // otherwise silently carry over from whatever project was open before.
+  const AUDIO_NAME_RE=/\.(wav|mp3|ogg|flac|m4a|aac|aif|aiff)$/i;
+  // Several files at once, laid end-to-end in filename order. Numeric-aware
+  // sorting matters here: a show numbered 01…19 must not put "10" before "2".
+  async function loadAudioFiles(files){
+    const list=Array.from(files||[]).filter(f=>/^audio\//.test(f.type||'')||AUDIO_NAME_RE.test(f.name||''));
+    if(!list.length) return 0;
+    list.sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}));
+    // The arrangement is project data now, so adding to it is undoable —
+    // one step for the whole batch, including any timeline growth below.
+    pushUndo();
+    let n=0;
+    for(const f of list){ if(await loadAudio(f)) n++; }
+    if(n) growToFitAudio();
+    if(n>1) flash('Added '+n+' clips end-to-end in filename order.');
+    return n;
+  }
+  // A dropped-in show is routinely longer than the timeline it lands on, and
+  // silently truncating it is never the answer anyone wanted (same reasoning
+  // as Set Loop to Audio).
+  function growToFitAudio(){
+    const endTick=audioEndTick()+(state.audioOffset||0);
+    if(endTick<=totalTicks()) return 0;
+    const need=Math.min(MAX_BARS,Math.ceil(endTick/ticksPerBar())+1);
+    if(need<=state.bars) return 0;
+    const grew=need-state.bars; state.bars=need;
+    syncInputs(); updateDuration(); resizeCanvases();
+    return grew;
+  }
+  // Lays every clip end-to-end from wherever the first one sits, closing any
+  // gaps (or overlaps) left by dragging or by swapping in a file of a
+  // different length.
+  function packAudioClips(){
+    const cs=audioClips();
+    if(cs.length<2) return;
+    pushUndo(); sortAudioClips();
+    let t=cs[0].startTick;
+    cs.forEach(c=>{ c.startTick=Math.round(t); t=clipEndTick(c); });
+    growToFitAudio(); updateAudioUI(); requestDraw();
+    flash('Closed the gaps — '+cs.length+' clips laid end-to-end.');
+  }
+  function removeAudioClip(c){
+    if(!c) return;
+    const cs=audioClips(), i=cs.indexOf(c);
+    if(i<0) return;
+    pushUndo();
+    // The decoded buffer deliberately stays in audioBufs: undo puts the clip
+    // back, and it has to come back with its audio rather than as a silent
+    // ⚠ placeholder. Orphans are released wholesale by clearAudio(), which
+    // runs on the × button and at the start of every project load.
+    cs.splice(i,1);
+    if(audioSel===c.id) audioSel=cs.length?cs[Math.min(i,cs.length-1)].id:null;
+    updateAudioUI(); requestDraw();
+    flash('Removed clip: '+c.name);
+  }
+  // Keeps the left column in step with the clip list: which clip is selected,
+  // how many there are, and which of the per-clip buttons can do anything.
+  function updateAudioUI(){
+    const cs=audioClips(), sel=selectedClip(), el=$('audioFileName');
+    if(el){
+      el.textContent=!cs.length?'No audio':(cs.length===1?cs[0].name:(sel?sel.name:cs.length+' clips')+'  ('+cs.length+')');
+      el.title=cs.length?cs.map((c,i)=>(i+1)+'. '+c.name+'  @ '+fmtClock(tickToSeconds(c.startTick+(state.audioOffset||0)))
+        +(audioBufs.has(c.id)?'':'  (file not found)')).join('\n'):'';
+    }
+    const rp=$('audioReplaceBtn'); if(rp) rp.disabled=!sel;
+    const pk=$('audioPackBtn'); if(pk) pk.disabled=cs.length<2;
+  }
+  // Removes every clip (stopping playback if it's live) and resets the global
+  // offset — called both by the manual × button and at the start of
+  // loadProject(), since the decoded audio isn't part of a .mmvp's own data
+  // and would otherwise silently carry over from whatever project was open
+  // before.
   function clearAudio(){
-    if(audioSrc){ try{audioSrc.stop();}catch(e){} audioSrc=null; }
-    audioGain=null; audioLoopSched=null; audioBuf=null;
-    $('audioFileName').textContent='No audio';
+    stopAudioSources();
+    audioGain=null;
+    audioBufs.clear();
+    state.audioClips=[]; audioSel=null;
     state.audioOffset=0; updateAudioOffsetBadge();
+    updateAudioUI();
     requestDraw();
   }
   function updateAudioOffsetBadge(){
@@ -9271,28 +9550,53 @@
     $('audioVolIcon').title='Volume: '+pct+'%';
   });
   $('audioSetLoopBtn').addEventListener('click',()=>{
-    if(!audioBuf) return;
+    if(!audioClips().length) return;
     const off=state.audioOffset||0;
     armUndo();
-    // The button's promise is "the loop matches the audio". When the audio
-    // runs past the end of the timeline this used to clamp to totalTicks()
-    // and quietly set a loop that stopped short — the same silent truncation
-    // that made a 100-minute file look like MME could only see half of it.
-    // Grow the song to fit instead, which is what the promise has to mean.
-    const endTick=Math.round(off+secondsToTicks(audioBuf.duration));
+    // The button's promise is "the loop matches the audio" — now spanning
+    // every clip, first start to last end. When the audio runs past the end
+    // of the timeline this used to clamp to totalTicks() and quietly set a
+    // loop that stopped short — the same silent truncation that made a
+    // 100-minute file look like MME could only see half of it. Grow the song
+    // to fit instead, which is what the promise has to mean.
+    const startTick=Math.round(off+audioStartTick());
+    const endTick=Math.round(off+audioEndTick());
     let grew=0;
     if(endTick>totalTicks()){
       const need=Math.min(MAX_BARS,Math.ceil(endTick/ticksPerBar())+1);
       if(need>state.bars){ grew=need-state.bars; state.bars=need; syncInputs(); updateDuration(); resizeCanvases(); }
     }
-    state.locStart=clamp(Math.round(off),0,totalTicks());
+    state.locStart=clamp(startTick,0,totalTicks());
     state.locEnd=clamp(endTick,0,totalTicks());
     commitUndo(); updateLoopStatus(); requestDraw();
     if(grew) flash('Timeline extended by '+grew+' bar'+(grew===1?'':'s')+' to fit the audio.');
     else if(endTick>totalTicks()) flash('Audio runs past the '+MAX_BARS+'-bar maximum — loop set to the end of the timeline.');
   });
   $('audioLoadBtn').onclick=()=>$('audioFileInput').click();
-  $('audioClearBtn').addEventListener('click',()=>{ if(!audioBuf) return; clearAudio(); flash('Audio removed'); });
+  $('audioPackBtn').addEventListener('click',packAudioClips);
+  // Swapping one song's file for a re-rendered version is the whole point of
+  // splitting a show into clips, so it gets its own button rather than
+  // "remove, re-add, drag it back". The clip keeps its start; if the new file
+  // is a different length the clips after it stay put (Pack closes the gap).
+  $('audioReplaceBtn').addEventListener('click',()=>{ if(selectedClip()) $('audioReplaceInput').click(); });
+  $('audioReplaceInput').addEventListener('change',async e=>{
+    const f=e.target.files[0]; e.target.value='';
+    const c=selectedClip(); if(!f||!c) return;
+    const wasEnd=clipEndTick(c);
+    pushUndo();
+    const done=await loadAudio(f,{replaceId:c.id});
+    if(!done) return;
+    growToFitAudio();
+    const delta=clipEndTick(done)-wasEnd;
+    flash(delta ? 'Replaced — the new file is '+fmtClockHundredths(Math.abs(tickToSeconds(clipEndTick(done))-tickToSeconds(wasEnd)))
+        +(delta>0?' longer':' shorter')+'. Use ⇥⇥ to close up the clips after it.'
+      : 'Replaced clip audio.');
+  });
+  $('audioClearBtn').addEventListener('click',()=>{
+    const n=audioClips().length; if(!n) return;
+    if(n>1 && !confirm('Remove all '+n+' audio clips?')) return;
+    clearAudio(); flash(n>1?'All '+n+' audio clips removed':'Audio removed');
+  });
   // Deliberately does NOT reset state.audioOffset here. The most common
   // reason to manually (re)load audio is reopening a project whose auto-load
   // (see autoLoadProjectAudio) couldn't find the file — clearAudio() at the
@@ -9302,32 +9606,84 @@
   // user needs it most, forcing them to re-find the sync by ear. If someone
   // genuinely swaps in an unrelated audio file, the existing offset badge
   // (click to reset to 0) and drag-to-adjust are both one action away.
-  $('audioFileInput').addEventListener('change',e=>{ const f=e.target.files[0]; if(!f)return;
-    loadAudio(f); e.target.value=''; });
-  // Drag-and-drop onto the audio canvas
+  $('audioFileInput').addEventListener('change',e=>{ const fs=e.target.files; if(!fs||!fs.length) return;
+    loadAudioFiles(fs); e.target.value=''; });
+  // Drag-and-drop onto the audio canvas — all dropped files, not just the
+  // first, so the show can be assembled in one gesture.
   audioScroll.addEventListener('dragover',e=>e.preventDefault());
-  audioScroll.addEventListener('drop',e=>{ e.preventDefault(); const f=e.dataTransfer.files[0];
-    if(f&&f.type.startsWith('audio/')) loadAudio(f); });
-  // Drag the waveform to move the audio track's start time — snaps to the
-  // global Snap grid by default, hold Shift for a free (unsnapped) drag,
-  // matching the same convention used for notes/CC points elsewhere.
-  // Double-click resets the offset back to 0.
+  audioScroll.addEventListener('drop',e=>{ e.preventDefault(); loadAudioFiles(e.dataTransfer.files); });
+
+  // ---------- Clip selection and dragging ----------
+  function audioLocalX(e){
+    const r=audioScroll.getBoundingClientRect();
+    return e.clientX-r.left+state.scrollLeft-GUTTER;
+  }
+  // Topmost clip whose span contains `lx` (tickToX space). Searched back to
+  // front so the last-drawn clip wins where two overlap, matching what the
+  // eye sees.
+  function audioClipAtX(lx){
+    const off=state.audioOffset||0, cs=audioClips();
+    for(let i=cs.length-1;i>=0;i--){
+      const c=cs[i];
+      if(lx>=tickToX(c.startTick+off) && lx<=tickToX(clipEndTick(c)+off)) return c;
+    }
+    return null;
+  }
+  // Magnetic pull toward a neighbouring clip's edge, so butting two songs up
+  // against each other doesn't depend on the Snap grid landing exactly on a
+  // clip boundary (it almost never does — songs aren't whole numbers of bars).
+  const AUDIO_MAGNET_PX=7;
+  function magnetAudioStart(c,raw){
+    let best=null, bestDist=Infinity;
+    audioClips().forEach(o=>{
+      if(o===c) return;
+      [o.startTick,clipEndTick(o)].forEach(edge=>{
+        // Line this clip's own start OR its end up with the neighbour's edge
+        [edge,secondsToTicks(tickToSeconds(edge)-(c.durSec||0))].forEach(cand=>{
+          const d=Math.abs(tickToX(cand)-tickToX(raw));
+          if(d<bestDist){ bestDist=d; best=cand; }
+        });
+      });
+    });
+    return (best!=null&&bestDist<=AUDIO_MAGNET_PX)?best:null;
+  }
+  // Drag a clip to move it — snaps to the global Snap grid by default, hold
+  // Shift for a free (unsnapped) drag, matching the convention used for
+  // notes/CC points elsewhere. Double-click butts the clip up against the end
+  // of the one before it (or back to the start of the timeline, if it is the
+  // first), which is also exactly what "reset to 0" used to mean back when
+  // there could only ever be one file.
   let audioDrag=null;
-  audioCanvas.addEventListener('mousedown',e=>{ state.focus='audio'; if(!audioBuf) return; armUndo();
-    audioDrag={startX:e.clientX, startOffset:state.audioOffset||0, moved:false};
+  audioCanvas.addEventListener('mousedown',e=>{ state.focus='audio';
+    const c=audioClipAtX(audioLocalX(e));
+    if(c&&c.id!==audioSel){ audioSel=c.id; updateAudioUI(); requestDraw(); }
+    if(!c) return;
+    armUndo();
+    audioDrag={id:c.id, startX:e.clientX, startTick:c.startTick, moved:false};
     audioCanvas.style.cursor='grabbing'; });
   window.addEventListener('mousemove',e=>{ if(!audioDrag) return;
     if(Math.abs(e.clientX-audioDrag.startX)>2) audioDrag.moved=true;
     if(!audioDrag.moved) return;
+    const c=audioClips().find(x=>x.id===audioDrag.id); if(!c) return;
     const deltaTicks=(e.clientX-audioDrag.startX)/state.pxPerTick;
-    const raw=audioDrag.startOffset+deltaTicks;
-    state.audioOffset=Math.round(e.shiftKey?raw:snapT(raw));
-    updateAudioOffsetBadge(); requestDraw();
+    const raw=audioDrag.startTick+deltaTicks;
+    const mag=e.shiftKey?null:magnetAudioStart(c,raw);
+    c.startTick=Math.round(mag!=null?mag:(e.shiftKey?raw:snapT(raw)));
+    sortAudioClips(); updateAudioUI(); requestDraw();
   });
-  window.addEventListener('mouseup',()=>{ if(!audioDrag) return; audioDrag=null; commitUndo();
-    audioCanvas.style.cursor=audioBuf?'grab':'default'; });
-  audioCanvas.addEventListener('dblclick',()=>{ if(!audioBuf||!state.audioOffset) return;
-    armUndo(); state.audioOffset=0; commitUndo(); updateAudioOffsetBadge(); requestDraw(); });
+  window.addEventListener('mouseup',()=>{ if(!audioDrag) return;
+    const moved=audioDrag.moved; audioDrag=null;
+    if(moved) growToFitAudio();
+    commitUndo();
+    audioCanvas.style.cursor=audioClips().length?'grab':'default'; });
+  audioCanvas.addEventListener('dblclick',e=>{
+    const c=audioClipAtX(audioLocalX(e)); if(!c) return;
+    sortAudioClips();
+    const cs=audioClips(), i=cs.indexOf(c);
+    const target=i>0?Math.round(clipEndTick(cs[i-1])):0;
+    if(c.startTick===target) return;
+    armUndo(); c.startTick=target; sortAudioClips(); commitUndo();
+    updateAudioUI(); requestDraw(); });
   // Audio lane grip resize
   { const grip=$('audioGrip');
     grip.addEventListener('mousedown',e=>{ e.preventDefault();
@@ -9423,11 +9779,18 @@
         }
         return;
       }
-      if(state.focus==='audio'&&audioBuf){
+      if(state.focus==='audio'&&audioClips().length){
         e.preventDefault();
         const step=e.shiftKey?Math.max(1,snapTicks()):1;
-        armUndo(); state.audioOffset=(state.audioOffset||0)+dir*step; commitUndo();
-        updateAudioOffsetBadge(); requestDraw();
+        const c=selectedClip();
+        armUndo();
+        // Nudge the clip you last clicked; with none selected fall back to
+        // shifting the whole audio row, which is what this did when there
+        // could only ever be one file.
+        if(c){ c.startTick+=dir*step; sortAudioClips(); updateAudioUI(); }
+        else { state.audioOffset=(state.audioOffset||0)+dir*step; updateAudioOffsetBadge(); }
+        commitUndo();
+        requestDraw();
         return;
       }
     }
@@ -9447,7 +9810,11 @@
       }
       return;
     }
-    if(e.key==='Delete'||e.key==='Backspace'){ e.preventDefault(); pushUndo();
+    if(e.key==='Delete'||e.key==='Backspace'){
+      // Audio row focused: remove the selected clip. Returns before the
+      // generic push below because removeAudioClip does its own undo push.
+      if(state.focus==='audio'&&selectedClip()){ e.preventDefault(); removeAudioClip(selectedClip()); return; }
+      e.preventDefault(); pushUndo();
       if(ccSel.size&&state.focus==='cc'){ const lane=activeLane(); if(lane){ lane.points=lane.points.filter(p=>!ccSel.has(p)); ccSel.clear(); } }
       else if(state.selection.size){ state.notes=state.notes.filter(n=>!state.selection.has(n.id)); state.selection.clear(); resyncMacros(); }
       requestDraw(); }
