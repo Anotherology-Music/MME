@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.52
+  MMV MIDI & CC Curve Editor v0.9.53
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1401,6 +1401,36 @@
   Move All nudges, what the offset badge shows, and what a pre-v0.9.52 project
   saved as its single file's position — so an old project opens with its audio
   exactly where it was, as one clip at tick 0 riding on that same offset.
+
+  v0.9.53 — Fixed: the metronome could go silent for the rest of a session.
+
+  Reported as "the metronome isn't working any more", and cured by reloading
+  the page — which is the clue to what it was. The click has its own
+  AudioContext, so scheduling one means crossing from the transport's clock
+  (performance.now()) into the audio clock (ctx.currentTime). The offset
+  between those two clocks was measured ONCE, when the context was first
+  created, and trusted for the rest of the session.
+
+  They are not the same clock. A suspended AudioContext's currentTime stops
+  advancing altogether while wall time keeps running — which is exactly what a
+  backgrounded tab, or a laptop that went to sleep, does routinely. After such
+  a pause the stored offset was stale by however long the pause lasted, and
+  every click was then scheduled that far into the FUTURE: a two-minute pause
+  put the next click two minutes away. Silence, permanently, until reload.
+  Measured on the shipped v0.9.52 build: a simulated 90-second suspend pushed
+  the next click 90.086 seconds ahead of the audio clock.
+
+  The offset is now re-anchored whenever it has drifted past 20ms, and again
+  whenever the context reports it has resumed. Deliberately not on every
+  click: currentTime only advances one render quantum at a time (~3ms at
+  44.1kHz), so re-measuring constantly would feed that quantisation straight
+  into the spacing between consecutive clicks. Genuine clock drift is
+  milliseconds per hour, so the threshold only ever trips on a real suspend.
+
+  The record count-in schedules through the same function and had the same
+  exposure — a count-in could silently do nothing after a long session — so it
+  is fixed by the same change. MIDI output and the playhead were never
+  affected either way, since they never leave performance.now().
 
 -->
 
@@ -7849,10 +7879,40 @@
   }
 
   // ---------- Metronome click (shared by count-in and playback) ----------
+  // The click lives on its own AudioContext, so scheduling one means crossing
+  // from the transport's clock (performance.now()) into the audio clock
+  // (ctx.currentTime). Those are two different clocks, and the offset between
+  // them is NOT constant: a suspended context's currentTime stops advancing
+  // altogether while wall time keeps running, which a backgrounded tab or a
+  // sleeping laptop does routinely. Measuring the offset once at context
+  // creation — as this did until v0.9.53 — meant that after any such pause the
+  // offset was stale by however long the pause lasted, and every click was
+  // scheduled that far into the future. The metronome (and the record count-in,
+  // which schedules through the same function) went silent for the rest of the
+  // session, curable only by reloading the page. MIDI and the playhead were
+  // unaffected throughout, since they never leave performance.now().
+  //
+  // So the offset is re-anchored whenever it has drifted past a tolerance.
+  // Not on every click: currentTime only advances a render quantum at a time
+  // (~3ms at 44.1kHz), so re-measuring constantly would feed that quantisation
+  // straight into the spacing between consecutive clicks. 20ms sits well above
+  // that noise floor and well below the point where a click reads as off the
+  // beat — and real clock drift is milliseconds per hour, so this only ever
+  // fires on an actual suspend, which jumps by hundreds of ms or more.
+  const CLICK_DRIFT_TOL=0.02; // seconds
   let clickCtx=null, clickTimeOffset=0;
+  function anchorClickClock(){ clickTimeOffset=clickCtx.currentTime-performance.now()/1000; }
   function ensureClickCtx(){
-    if(!clickCtx){ clickCtx=new (window.AudioContext||window.webkitAudioContext)(); clickTimeOffset=clickCtx.currentTime-performance.now()/1000; }
+    if(!clickCtx){
+      clickCtx=new (window.AudioContext||window.webkitAudioContext)();
+      anchorClickClock();
+      // Resuming from suspended is exactly when the two clocks have just come
+      // apart, so re-anchor there too rather than waiting for the drift check
+      // below to notice on the next click.
+      clickCtx.addEventListener('statechange',()=>{ if(clickCtx&&clickCtx.state==='running') anchorClickClock(); });
+    }
     if(clickCtx.state==='suspended') clickCtx.resume();
+    if(Math.abs((clickCtx.currentTime-performance.now()/1000)-clickTimeOffset)>CLICK_DRIFT_TOL) anchorClickClock();
     return clickCtx;
   }
   function playClickTone(ctx,when,accent){

@@ -163,6 +163,11 @@ function buildTestHtml() {
       '  window._TEST_packAudioClips = () => packAudioClips();',
       '  window._TEST_audioEndTick = () => audioEndTick();',
       '  window._TEST_updateAudioOffsetBadge = () => updateAudioOffsetBadge();',
+      // v0.9.53 metronome clock re-anchoring. clickTimeOffset is the bridge
+      // between the transport clock and the click AudioContext's own clock.
+      '  window._TEST_scheduleClickAt = (wallMs, accent) => scheduleClickAt(wallMs, accent);',
+      '  window._TEST_clickClock = () => ({ offset: clickTimeOffset, ctxTime: clickCtx ? clickCtx.currentTime : null, state: clickCtx ? clickCtx.state : null });',
+      '  window._TEST_setClickOffset = (v) => { clickTimeOffset = v; };',
       // v0.9.45 section markers. All top-level, alongside state.
       '  window._TEST_markers = () => JSON.parse(JSON.stringify(state.markers || []));',
       '  window._TEST_addMarker = (tick, name) => { addMarker(tick, name); renderMarkerBar(); requestDraw(); };',
@@ -850,6 +855,62 @@ async function run() {
     const bar2ok = [1920, 2400, 2880].every((t, i) => clicks.some(c => c.tick === t && c.accent === (i === 0)));
     const bar3DownbeatAccented = clicks.some(c => c.tick === 3360 && c.accent === true); // next 3/4 bar's downbeat
     check('metronome follows a meter change (4/4 -> 3/4) with correct accents', bar1ok && bar2ok && bar3DownbeatAccented, clicks.slice(0, 8));
+  });
+
+  await withPage(browser, async (page) => {
+    // v0.9.53: the click crosses from the transport clock (performance.now())
+    // into its own AudioContext's clock, and the offset between them used to be
+    // measured once at context creation and trusted forever. A suspended
+    // context's currentTime stops advancing while wall time keeps going — a
+    // backgrounded tab or a sleeping machine — so the offset went stale by the
+    // length of the pause and every click was scheduled that far into the
+    // FUTURE. Silence for the rest of the session, curable only by reloading.
+    const oscSpy = () => page.evaluate(() => {
+      window.__osc = [];
+      if (!window.__oscPatched) {
+        window.__oscPatched = true;
+        const orig = OscillatorNode.prototype.start;
+        OscillatorNode.prototype.start = function (when) {
+          window.__osc.push({ when, now: this.context.currentTime });
+          return orig.call(this, when);
+        };
+      }
+    });
+    await oscSpy();
+
+    // Prime the context, then confirm a click normally lands just ahead of now.
+    await page.evaluate(() => window._TEST_scheduleClickAt(performance.now() + 100, true));
+    await page.waitForTimeout(60);
+    const healthy = await page.evaluate(() => window.__osc[window.__osc.length - 1]);
+    check('a click is scheduled a little way ahead of the audio clock, not at some far-off time',
+      healthy && (healthy.when - healthy.now) > 0 && (healthy.when - healthy.now) < 1, healthy);
+
+    // Simulate what a suspend does: wall time ran on while the audio clock
+    // stood still, leaving the stored offset 90 seconds stale.
+    await page.evaluate(() => { window._TEST_setClickOffset(window._TEST_clickClock().offset + 90); });
+    const staleBefore = await page.evaluate(() => window._TEST_clickClock().offset);
+
+    await page.evaluate(() => { window.__osc.length = 0; return window._TEST_scheduleClickAt(performance.now() + 100, false); });
+    await page.waitForTimeout(60);
+    const afterDrift = await page.evaluate(() => window.__osc[window.__osc.length - 1]);
+    check('a stale clock offset is re-anchored instead of scheduling the click minutes into the future',
+      afterDrift && (afterDrift.when - afterDrift.now) > 0 && (afterDrift.when - afterDrift.now) < 1,
+      { lead: afterDrift && afterDrift.when - afterDrift.now, staleBefore });
+
+    const reanchored = await page.evaluate(() => window._TEST_clickClock().offset);
+    check('...and the correction is stored, so the next click is right too',
+      Math.abs(reanchored - staleBefore) > 89, { staleBefore, reanchored });
+
+    // Ordinary sub-tolerance jitter must NOT re-anchor: currentTime only moves
+    // a render quantum at a time, and re-measuring every click would feed that
+    // straight into the spacing between consecutive clicks.
+    const settled = await page.evaluate(() => window._TEST_clickClock().offset);
+    await page.evaluate(() => { window._TEST_setClickOffset(window._TEST_clickClock().offset + 0.005); });
+    await page.evaluate(() => window._TEST_scheduleClickAt(performance.now() + 100, false));
+    await page.waitForTimeout(40);
+    const afterSmall = await page.evaluate(() => window._TEST_clickClock().offset);
+    check('a small offset difference is left alone (no jitter fed into click spacing)',
+      Math.abs(afterSmall - (settled + 0.005)) < 1e-6, { settled, afterSmall });
   });
 
   await withPage(browser, async (page) => {
