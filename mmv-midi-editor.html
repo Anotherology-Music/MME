@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.53
+  MMV MIDI & CC Curve Editor v0.9.54
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1432,6 +1432,28 @@
   is fixed by the same change. MIDI output and the playhead were never
   affected either way, since they never leave performance.now().
 
+  v0.9.54 — Fixed: the Position readouts jittered on a long project.
+
+  The toolbar's Position group reserved 80px for bar.beat.sub.tick and 78px
+  for the clock, which fits "1.1.1.0" and "0:00.00" and not much more. A
+  feature-length show reaches "3000.4.4.119" and crosses from "59:59.99" to
+  "1:00:00.00", both wider than their boxes — so the box grew to take the
+  extra digits and shoved the "Go to" field and everything after it sideways
+  on every playhead update. Measured before the fix: the group swung between
+  343.8px and 358px, moving "Go to" by 14px several times a second.
+
+  Both are now reserved in ch units against their own monospace font, sized
+  off the measured worst case each can reach at the 9999-bar maximum —
+  "9999.16.4.119" (101.8px) and, at a very slow tempo, "22:13:12.00" (86.1px)
+  — plus a character of headroom, because an exact fit is one unforeseen digit
+  away from jittering again. They stay min-width rather than a fixed width, so
+  anything wider still would grow rather than silently clip.
+
+  The status bar's Cursor readout had the same defect for the same reason, and
+  worse in one respect: it tracks the mouse, so it was reflowing the field to
+  its right continuously rather than only during playback. Given the same
+  reserved widths, in the inline min-width style its neighbours already use.
+
 -->
 
 
@@ -1484,6 +1506,22 @@
   .position-grp #gotoSec{width:86px;flex-shrink:0;}
   .position-grp b,.position-grp .lbl2{flex-shrink:0;}
   .position-grp .lbl2{white-space:nowrap;}
+  /* Position readouts. Reserved in ch units against their own monospace font,
+     so the box is sized by the WIDEST value each can ever hold rather than by
+     the value it happens to be showing. At 80px/78px they fitted the short
+     early-project values and nothing longer: a feature-length show reaches
+     "3000.4.4.119" and "1:40:00.00", the box grew to take the extra digits,
+     and every playhead update shoved the rest of the group sideways — the
+     readout visibly jittered. Sized off the measured worst case each field can
+     reach at the 9999-bar maximum — "9999.16.4.119" (101.8px) for
+     bar.beat.sub.tick and "22:13:12.00" (86.1px) for the clock at a very slow
+     tempo — plus a character of headroom, since an exact fit is one unforeseen
+     digit away from jittering again. min-width, not width, so anything wider
+     still than that grows rather than silently clipping. */
+  .position-grp #stPlay,.position-grp #stPlaySec{
+    font-family:ui-monospace,Consolas,monospace;display:inline-block;text-align:left;}
+  .position-grp #stPlay{min-width:14ch;}
+  .position-grp #stPlaySec{min-width:12ch;}
   .project-grp .group{display:flex;align-items:center;gap:5px;}
   /* Tempo/Sig "varies across the project" indicator — purple field border +
      a small badge whose title tooltip spells out the actual variation. The
@@ -2203,8 +2241,8 @@
     </div>
     <div class="position-grp">
       <span class="lbl">Position</span>
-      <b id="stPlay" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt);min-width:80px;display:inline-block;">1.1.1.0</b>
-      <b id="stPlaySec" style="font-family:ui-monospace,Consolas,monospace;color:var(--txt2);min-width:78px;display:inline-block;">0:00.00</b>
+      <b id="stPlay" style="color:var(--txt);">1.1.1.0</b>
+      <b id="stPlaySec" style="color:var(--txt2);">0:00.00</b>
       <span class="lbl2" style="color:#888;font-size:10px;">Go to</span>
       <input type="number" id="gotoSec" min="0" step="0.01" placeholder="secs" title="Jump playhead to this position, in seconds — e.g. 12.5. Press Enter.">
       <span class="pill">s</span>
@@ -2815,7 +2853,11 @@
 
   <div class="statusbar">
     <span class="sf">Loop: <b id="stLoop" style="min-width:140px;">whole track</b></span>
-    <span class="sf">Cursor: <b id="stPos">1.1.0</b> <b id="stPosSec" style="color:var(--txt2);">0:00.0</b></span>
+    <!-- Reserved widths for the same reason the toolbar's Position readouts
+         have them: these track the mouse, so without a floor they grew as the
+         bar number gained digits and shunted the field to their right on every
+         mouse move. Matches the min-width idiom stLoop/stCtx already use. -->
+    <span class="sf">Cursor: <b id="stPos" style="min-width:88px;display:inline-block;">1.1.0</b> <b id="stPosSec" style="color:var(--txt2);min-width:74px;display:inline-block;">0:00.0</b></span>
     <span class="sf"><b id="stCtx" style="min-width:120px;">—</b></span>
     <span class="hint" style="margin-left:auto;">Select: click · Shift+click=add · dbl-click=add/del note · Alt=erase · Ctrl+wheel=X zoom · Alt+wheel=Y zoom</span>
   </div>

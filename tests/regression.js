@@ -937,6 +937,62 @@ async function run() {
   });
 
   await withPage(browser, async (page) => {
+    // v0.9.54: the Position readouts must reserve room for the widest value
+    // they can ever show, not merely the one on screen. Undersized, they grew
+    // as the bar number gained digits on a feature-length project and shunted
+    // everything to their right along with them — the group visibly jittered
+    // on every playhead update.
+    await page.evaluate(() => {
+      const el = document.getElementById('bars');
+      el.value = '3000'; el.dispatchEvent(new Event('change'));
+    });
+    await page.waitForTimeout(150);
+
+    const sample = async (tick) => {
+      await page.evaluate((t) => window._TEST_seekPlayhead(t), tick);
+      await page.waitForTimeout(20);
+      return page.evaluate(() => ({
+        text: document.getElementById('stPlay').textContent,
+        gotoX: +document.getElementById('gotoSec').getBoundingClientRect().x.toFixed(1),
+        grpW: +document.querySelector('.position-grp').getBoundingClientRect().width.toFixed(1),
+      }));
+    };
+    // Bar 1 through bar 3000 — 1 digit of bar number up to 4, plus the clock
+    // crossing the hour boundary from "59:59.99" to "1:00:00.00".
+    const seen = [];
+    for (const t of [0, 5000, 100000, 1000000, 3000000, 5750000]) seen.push(await sample(t));
+    const uniqX = [...new Set(seen.map(s => s.gotoX))];
+    const uniqW = [...new Set(seen.map(s => s.grpW))];
+    check('the Position readouts hold their width as the playhead crosses a feature-length project',
+      uniqX.length === 1 && uniqW.length === 1,
+      { texts: seen.map(s => s.text), gotoX: uniqX, groupWidth: uniqW });
+
+    // And the reservation genuinely covers the worst case each field can
+    // reach at the 9999-bar maximum — measured, not assumed, by dropping the
+    // floor and letting the text size the box.
+    const fit = await page.evaluate(() => {
+      const natural = (id, txt) => {
+        const e = document.getElementById(id), oldT = e.textContent, oldW = e.style.minWidth;
+        e.style.minWidth = '0px'; e.textContent = txt;
+        const w = e.getBoundingClientRect().width;
+        e.textContent = oldT; e.style.minWidth = oldW;
+        return w;
+      };
+      const reserved = (id) => document.getElementById(id).getBoundingClientRect().width;
+      return {
+        playNeed: natural('stPlay', '9999.16.4.119'), playHas: reserved('stPlay'),
+        secNeed: natural('stPlaySec', '22:13:12.00'), secHas: reserved('stPlaySec'),
+        posNeed: natural('stPos', '9999.16.119'), posHas: reserved('stPos'),
+        posSecNeed: natural('stPosSec', '22:13:12.0'), posSecHas: reserved('stPosSec'),
+      };
+    });
+    check('...with room for the widest bar.beat.sub.tick and clock the 9999-bar maximum can produce',
+      fit.playHas >= fit.playNeed && fit.secHas >= fit.secNeed, fit);
+    check('...and the status bar\'s Cursor readout reserves its worst case too',
+      fit.posHas >= fit.posNeed && fit.posSecHas >= fit.posSecNeed, fit);
+  });
+
+  await withPage(browser, async (page) => {
     // hovering the ruler (no click/drag) must live-update the Cursor readout
     const r = await page.evaluate(() => {
       const rr = document.getElementById('rulerScroll').getBoundingClientRect();
@@ -4183,7 +4239,12 @@ async function run() {
     });
     await page.evaluate(() => { window._TEST_state.audioOffset = 0; window._TEST_state.playhead = 0; });
     await page.evaluate(() => window._TEST_play());
-    await page.waitForTimeout(120); // past the ~8ms start fade
+    // Past the start ramp, which does not begin until START_DELAY (90ms) after
+    // play() and takes another ~8ms — so 120ms left barely 20ms of margin for
+    // the round-trip and flaked under load, reading the gain node's untouched
+    // default of 1 before any automation had run. This asserts the level the
+    // slider sets, not how punctual the scheduler is, so give it real room.
+    await page.waitForTimeout(350);
     const gainAt40 = await page.evaluate(() => window._TEST_audioGainValue());
     check('the volume slider sets the audio gain to the chosen level', Math.abs(gainAt40 - 0.4) < 0.02, gainAt40);
 
