@@ -168,6 +168,16 @@ function buildTestHtml() {
       '  window._TEST_scheduleClickAt = (wallMs, accent) => scheduleClickAt(wallMs, accent);',
       '  window._TEST_clickClock = () => ({ offset: clickTimeOffset, ctxTime: clickCtx ? clickCtx.currentTime : null, state: clickCtx ? clickCtx.state : null });',
       '  window._TEST_setClickOffset = (v) => { clickTimeOffset = v; };',
+      // v0.9.55 variable-rate MIDI Clock. requestMIDIAccess has no backend in
+      // headless Chrome, but state.midiOut is only ever used as an object with
+      // .send(bytes, timestamp) — so a recorder standing in for it exercises
+      // the real scheduling path.
+      '  window._TEST_fakeMidiOut = () => { window.__midiSent = []; state.midiOut = { state: "connected", send: (b, t) => window.__midiSent.push({ bytes: Array.from(b), t: (t == null ? performance.now() : t) }), clear: () => {} }; };',
+      '  window._TEST_midiSent = () => (window.__midiSent || []).map(m => ({ bytes: m.bytes, t: m.t }));',
+      '  window._TEST_clearMidiSent = () => { window.__midiSent = []; };',
+      '  window._TEST_schedClock = () => ({ clockTicks: sched ? sched.clockTicks : null, clockIdx: sched ? sched.clockIdx : null });',
+      '  window._TEST_schedPosAtElapsedTicks = (e) => sched ? schedPosAtElapsedTicks(sched, e) : null;',
+      '  window._TEST_schedElapsedTicks = (p, tick) => sched ? schedElapsedTicks(sched, p, tick) : null;',
       // v0.9.45 section markers. All top-level, alongside state.
       '  window._TEST_markers = () => JSON.parse(JSON.stringify(state.markers || []));',
       '  window._TEST_addMarker = (tick, name) => { addMarker(tick, name); renderMarkerBar(); requestDraw(); };',
@@ -855,6 +865,117 @@ async function run() {
     const bar2ok = [1920, 2400, 2880].every((t, i) => clicks.some(c => c.tick === t && c.accent === (i === 0)));
     const bar3DownbeatAccented = clicks.some(c => c.tick === 3360 && c.accent === true); // next 3/4 bar's downbeat
     check('metronome follows a meter change (4/4 -> 3/4) with correct accents', bar1ok && bar2ok && bar3DownbeatAccented, clicks.slice(0, 8));
+  });
+
+  // ---------------- MIDI Clock output (v0.9.55) ----------------
+
+  await withPage(browser, async (page) => {
+    // Until v0.9.55 the clock was a fixed ms interval taken from the tempo at
+    // the pass's start tick, so on a project with tempo changes it kept
+    // pulsing at the opening tempo while the notes and playhead followed the
+    // map — anything slaved to MME drifted away from MME. Pulses are now
+    // placed in MUSICAL time and converted through the same tempo-map-aware
+    // helper the notes use.
+    const CLK = 0xF8;
+    await page.evaluate(() => {
+      window._TEST_fakeMidiOut();
+      // 120bpm for the first bar, then double-time. Ticks are unchanged by
+      // this; only how long each one lasts in the real world.
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 240 }];
+      window._TEST_state.bars = 8;
+      window._TEST_state.loopOn = false;
+      window._TEST_state.locStart = null; window._TEST_state.locEnd = null;
+      window._TEST_state.playhead = 0;
+    });
+    await page.waitForTimeout(80);
+
+    const ppq = await page.evaluate(() => window._TEST_state.ppq);
+    const perPulse = await page.evaluate(() => { window._TEST_play(); return window._TEST_schedClock(); });
+    check('a clock pulse is one 24th of a quarter note, in ticks', perPulse.clockTicks === ppq / 24, perPulse);
+
+    // Let the lookahead run far enough to cover both tempo regions.
+    await page.waitForTimeout(2600);
+    await page.evaluate(() => window._TEST_stop());
+    const sent = await page.evaluate(() => window._TEST_midiSent());
+    const clocks = sent.filter(m => m.bytes[0] === CLK).map(m => m.t);
+    check('MIDI Clock is sent during playback', clocks.length > 40, clocks.length);
+
+    // Spacing before the change (120bpm -> 24 pulses per 0.5s = 20.833ms)
+    // and after it (240bpm -> 10.417ms). Compare pulses well inside each
+    // region so the boundary pulse itself isn't under test.
+    const gapAt = (i) => clocks[i + 1] - clocks[i];
+    const slow = [gapAt(10), gapAt(20), gapAt(30)];
+    const fastStart = 96; // pulse 96 = tick 1920 = the tempo change
+    const fast = [gapAt(fastStart + 10), gapAt(fastStart + 20), gapAt(fastStart + 30)];
+    const near = (v, want) => Math.abs(v - want) < 0.6;
+    check('clock pulses are spaced for the tempo in force at 120bpm (20.83ms apart)',
+      slow.every(g => near(g, 60000 / (120 * 24))), slow);
+    check('...and speed up to match a tempo change mid-pass (240bpm, 10.42ms apart)',
+      fast.length === 3 && fast.every(g => near(g, 60000 / (240 * 24))), fast);
+    check('...which is the whole point: the pulse rate really does change',
+      fast[0] < slow[0] * 0.6, { slow: slow[0], fast: fast[0] });
+
+    // Start/Stop bracket the pulse train.
+    check('Start (0xFA) is sent on play and Stop (0xFC) on stop',
+      sent.some(m => m.bytes[0] === 0xFA) && sent.some(m => m.bytes[0] === 0xFC),
+      sent.filter(m => m.bytes[0] === 0xFA || m.bytes[0] === 0xFC).map(m => m.bytes[0].toString(16)));
+  });
+
+  await withPage(browser, async (page) => {
+    // A meter change must NOT alter the clock rate: MIDI Clock counts quarter
+    // notes, and a quarter note is state.ppq ticks whatever the denominator.
+    // (This is why tickToSeconds is built on ppq rather than ticksPerBeat.)
+    await page.evaluate(() => {
+      window._TEST_fakeMidiOut();
+      window._TEST_state.tempoMap = [{ tick: 0, bpm: 120 }];
+      window._TEST_state.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 7, den: 8 }];
+      window._TEST_state.bars = 8;
+      window._TEST_state.loopOn = false;
+      window._TEST_state.locStart = null; window._TEST_state.locEnd = null;
+      window._TEST_state.playhead = 0;
+    });
+    await page.evaluate(() => window._TEST_play());
+    await page.waitForTimeout(2600);
+    await page.evaluate(() => window._TEST_stop());
+    const clocks = await page.evaluate(() => window._TEST_midiSent().filter(m => m.bytes[0] === 0xF8).map(m => m.t));
+    const gaps = [];
+    for (let i = 1; i < clocks.length; i++) gaps.push(clocks[i] - clocks[i - 1]);
+    const want = 60000 / (120 * 24);
+    check('a time-signature change leaves the clock rate alone (it counts quarter notes, not beats)',
+      gaps.length > 40 && gaps.every(g => Math.abs(g - want) < 0.6),
+      { want, min: Math.min(...gaps), max: Math.max(...gaps), n: gaps.length });
+  });
+
+  await withPage(browser, async (page) => {
+    // The tick-domain pass helpers the clock is built on, checked directly:
+    // pass 0 runs from wherever play started to b, every repeat covers a..b.
+    await page.evaluate(() => {
+      window._TEST_fakeMidiOut();
+      window._TEST_state.locStart = 480; window._TEST_state.locEnd = 1440;
+      window._TEST_state.playhead = 960;
+      window._TEST_state.loopOn = true;
+      window._TEST_play();
+    });
+    await page.waitForTimeout(60);
+    const r = await page.evaluate(() => ({
+      // 960 -> 1440 is the partial first pass (480 ticks), then 480 -> 1440 repeats (960 ticks)
+      elapsedAtPass0End: window._TEST_schedElapsedTicks(0, 1440),
+      elapsedAtPass1End: window._TEST_schedElapsedTicks(1, 1440),
+      posAt0: window._TEST_schedPosAtElapsedTicks(0),
+      posMidPass0: window._TEST_schedPosAtElapsedTicks(240),
+      posAtWrap: window._TEST_schedPosAtElapsedTicks(480),
+      posIntoPass1: window._TEST_schedPosAtElapsedTicks(480 + 240),
+      posIntoPass2: window._TEST_schedPosAtElapsedTicks(480 + 960 + 120),
+    }));
+    await page.evaluate(() => window._TEST_stop());
+    check('elapsed musical time counts the partial first pass, then whole loops',
+      r.elapsedAtPass0End === 480 && r.elapsedAtPass1End === 1440, r);
+    check('...and inverts back to the right pass and tick, wrapping at the loop point',
+      r.posAt0.tick === 960 && r.posAt0.passIndex === 0
+      && r.posMidPass0.tick === 1200 && r.posMidPass0.passIndex === 0
+      && r.posAtWrap.tick === 480 && r.posAtWrap.passIndex === 1
+      && r.posIntoPass1.tick === 720 && r.posIntoPass1.passIndex === 1
+      && r.posIntoPass2.tick === 600 && r.posIntoPass2.passIndex === 2, r);
   });
 
   await withPage(browser, async (page) => {

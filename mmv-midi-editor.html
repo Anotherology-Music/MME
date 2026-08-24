@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.54
+  MMV MIDI & CC Curve Editor v0.9.55
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1453,6 +1453,48 @@
   worse in one respect: it tracks the mouse, so it was reflowing the field to
   its right continuously rather than only during playback. Given the same
   reserved widths, in the inline min-width style its neighbours already use.
+
+  v0.9.55 — MIDI Clock now follows the tempo map.
+
+  MME sends MIDI Beat Clock (0xF8, 24 per quarter note) whenever a MIDI output
+  is selected, bracketed by Start (0xFA) and Stop (0xFC), and suppressed while
+  Follow MMV is on since MME is the slave in that mode. The rate, though, was
+  computed once per playback session from the tempo at the pass's start tick
+  and then emitted as a fixed millisecond interval. On a project with tempo
+  changes the notes, playhead and audio all followed the map while the clock
+  did not — so anything slaved to MME drifted away from MME. The faster the
+  change, the faster the drift.
+
+  A clock pulse is a fixed amount of MUSICAL time, not of wall time, so it is
+  now placed on that axis: pulse k sits k * (ppq/24) ticks of elapsed musical
+  time after the start, and where that lands in real time comes from
+  schedElapsedMs() — the tempo-map-aware helper the note scheduler already
+  used. The notes were always right; routing the clock through the same
+  conversion makes it right for the same reason. Measured across a 120->240bpm
+  change: pulses spaced 20.83ms before it and 10.42ms after, where they
+  previously stayed at 20.83ms throughout.
+
+  This needed one new pair of helpers — schedElapsedTicks/schedPosAtElapsedTicks,
+  the tick-domain twins of the existing schedElapsedMs/schedTickAtElapsed — to
+  count elapsed musical time across a partial first pass and any number of loop
+  repeats, and to invert that back to a pass and tick.
+
+  Time-signature changes need no handling at all here and never did: MIDI Clock
+  counts quarter notes, and a quarter note is state.ppq ticks whatever the
+  denominator (tickToSeconds is deliberately built on ppq, not the
+  denominator-dependent ticksPerBeat()). There is now a test pinning that, so a
+  future change to the tick conventions cannot quietly break it.
+
+  Nine new checks covering an area that previously had none: pulse spacing at a
+  fixed tempo, spacing tracking a tempo change mid-pass, a meter change leaving
+  the rate alone, Start/Stop bracketing, and the pass arithmetic underneath.
+
+  Still not sent, and unchanged: Song Position Pointer (0xF2) and Continue
+  (0xFB). Start always means "from the beginning" to a receiver, so playing
+  from the middle of a show leaves a clock slave believing it is at bar 1.
+  SPP is a 14-bit sixteenth-note count — it runs out at bar 1024 in 4/4, about
+  34 minutes at 120bpm, so it cannot address a feature-length project anyway.
+  Locating in a show that long is MIDI Time Code's job, not clock's.
 
 -->
 
@@ -8136,6 +8178,25 @@
     const fullPassMs=Math.max(1e-9,(tickToSeconds(s.b)-tickToSeconds(s.a))*1000);
     return 1+Math.floor((elapsedMs-pass0Ms)/fullPassMs);
   }
+  // Tick-domain twin of schedElapsedMs/schedTickAtElapsed: how much MUSICAL
+  // time (in ticks) has passed, rather than how much wall time. MIDI Clock is
+  // defined in musical time — 24 pulses per quarter note — so its pulses have
+  // to be placed on this axis and only then converted to wall time through
+  // schedElapsedMs, which is what makes them follow the tempo map.
+  function schedElapsedTicks(s,passIndex,tick){
+    if(passIndex<=0) return tick-s.startTick;
+    return (s.b-s.startTick)+(passIndex-1)*(s.b-s.a)+(tick-s.a);
+  }
+  // Inverse: the pass and tick that a given amount of elapsed musical time
+  // lands on, wrapping through a..b the same way schedTickAtElapsed does.
+  function schedPosAtElapsedTicks(s,elapsedTicks){
+    const pass0=s.b-s.startTick;
+    if(elapsedTicks<pass0) return {passIndex:0, tick:s.startTick+elapsedTicks};
+    const full=s.b-s.a;
+    if(full<=0) return {passIndex:0, tick:s.b};
+    const k=Math.floor((elapsedTicks-pass0)/full);
+    return {passIndex:1+k, tick:s.a+(elapsedTicks-pass0-k*full)};
+  }
   function makeWorker(){ try{
     const src="var id=null;self.onmessage=function(e){var d=e.data||{};if(d.cmd==='start'){if(id)clearInterval(id);id=setInterval(function(){self.postMessage(0);},d.ms||20);}else if(d.cmd==='stop'){if(id)clearInterval(id);id=null;}};";
     const w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
@@ -8185,13 +8246,21 @@
     state.playing=true; updateTransportBtns();
     const span=b-a, t0=explicitT0!=null?explicitT0:(performance.now()+START_DELAY);
     const evs=buildPassEvents(a,b); let idx=0; while(idx<evs.length && evs[idx].tick<startTick) idx++;
-    // MIDI Clock (0xF8) is a fixed-interval pulse train with no room for a
-    // tempo change mid-stream — it's generated once per playback session at
-    // whatever tempo governs the pass's start tick (a defensible judgement
-    // call: true variable-rate MIDI clock generation for hardware/MMV sync
-    // is out of scope here, same as most DAWs' basic clock-out).
-    const msPerClock=60000/(tempoSegAt(startTick).bpm*24);
-    sched={a,b,span,t0,startTick,evs,idx,passIndex:0,msPerClock,clockIdx:0,loops};
+    // MIDI Clock (0xF8) is 24 pulses per QUARTER NOTE — so a pulse is a fixed
+    // amount of MUSICAL time, not of wall time. Until v0.9.55 it was emitted as
+    // a fixed millisecond interval taken from the tempo at the pass's start
+    // tick, which meant that on a project with tempo changes the clock kept
+    // running at the opening tempo while the notes, playhead and audio all
+    // followed the map — so anything slaved to MME drifted away from MME.
+    // Storing ticks-per-pulse instead lets schedulerTick place each pulse
+    // through the same tempo-map-aware conversion the notes already use.
+    // The PPQ field is constrained to multiples of 24, so this is always a
+    // whole number of ticks (20 at the default 480).
+    // Note the quarter note is fixed at state.ppq ticks whatever the meter —
+    // tickToSeconds is deliberately built on ppq, not the denominator-dependent
+    // ticksPerBeat() — so time-signature changes need no handling here at all.
+    const clockTicks=state.ppq/24;
+    sched={a,b,span,t0,startTick,evs,idx,passIndex:0,clockTicks,clockIdx:0,loops};
     if(state.midiOut){
       if(!state.syncFollow) mSend([0xFA], t0);
       // Chase: send Note On for any notes already in progress at startTick
@@ -8300,10 +8369,24 @@
   }
   function schedulerTick(){ if(!state.playing||!sched) return; const s=sched, now=performance.now(); let guard=0;
     scheduleAudioPasses();
-    // MIDI Clock: only when we are the master (not following MMV)
-    if(state.midiOut && s.msPerClock && !state.syncFollow){
+    // MIDI Clock: only when we are the master (not following MMV). Each pulse
+    // sits a fixed number of TICKS after the last (24 per quarter note); where
+    // that lands in wall time comes from schedElapsedMs, so the pulse train
+    // speeds up and slows down with the tempo map exactly as the notes do.
+    if(state.midiOut && s.clockTicks && !state.syncFollow){
       let cg=0;
-      while(cg++<2000){ const ct=s.t0+s.clockIdx*s.msPerClock; if(ct>now+LOOKAHEAD) break; state.midiOut.send([0xF8],ct); s.clockIdx++; }
+      while(cg++<2000){
+        const elapsed=s.clockIdx*s.clockTicks;
+        // A non-looping pass stops at s.b rather than wrapping, so the pulse
+        // train has to stop there too instead of running on into a pass that
+        // will never play.
+        if(!s.loops && elapsed>(s.b-s.startTick)) break;
+        const pos=schedPosAtElapsedTicks(s,elapsed);
+        const ct=s.t0+schedElapsedMs(s,pos.passIndex,pos.tick);
+        if(ct>now+LOOKAHEAD) break;
+        state.midiOut.send([0xF8],ct);
+        s.clockIdx++;
+      }
     }
     while(guard++<5000){
       if(s.idx>=s.evs.length){
