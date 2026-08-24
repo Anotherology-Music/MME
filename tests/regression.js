@@ -354,6 +354,11 @@ function buildTestHtml() {
       '    window._TEST_isLaneAutomated=(id)=>isLaneAutomated(state.ccLanes.find(l=>l.id===id));',
       '    window._TEST_computeModifiers=(row)=>computeModifiers(row);',
       '    window._TEST_midiToNative=(row,lane,rawVal)=>midiToNative(row,lane,rawVal);',
+      // v0.9.57 modifier advice wording + Magic project request.
+      '    window._TEST_modifierAdvice=(mods)=>modifierAdvice(mods);',
+      '    window._TEST_buildMigrationNotesText=(entry,defs,refs)=>buildMigrationNotesText(entry,defs,refs);',
+      '    window._TEST_buildMagicRequest=(entry,refs)=>buildMagicRequest(entry,refs);',
+      '    window._TEST_magicShaderPath=(fn)=>magicShaderPath(fn);',
       '    function openMigrateSheet(entry){',
     ].join('\n')
   );
@@ -2925,6 +2930,157 @@ async function run() {
     check('midiToNative reads a Pitch Bend lane\'s -8192..8191 range instead of CC\'s 0..127 (same row, same MIN/MAX, different transport)',
       Math.abs(pbMin - 0.1) < 1e-9 && Math.abs(pbMax - 10) < 1e-6 && Math.abs(pbMid - (0.1 + 10) / 2) < 0.01,
       { pbMin, pbMax, pbMid });
+  });
+
+  await withPage(browser, async (page) => {
+    // The four worked examples from the change request, checked end to end:
+    // the modifiers themselves, and then what a CC of 0 / 64 / 127 actually
+    // lands on once MMV has applied them to its normalised 0.0-1.0 value.
+    const cases = [
+      { row: { name: 'rotation', type: 'float', min: 0, max: 360, minGiven: true, maxGiven: true }, scale: 360, offset: 0, advice: 'Scale=360' },
+      { row: { name: 'moonSize', type: 'float', min: 0.02, max: 0.5, minGiven: true, maxGiven: true }, scale: 0.48, offset: 0.02, advice: 'Scale=0.48, then Offset=0.02' },
+      { row: { name: 'orbitSpeed', type: 'float', min: -10, max: 10, minGiven: true, maxGiven: true }, scale: 20, offset: -10, advice: 'Scale=20, then Offset=-10' },
+      { row: { name: 'mixAmount', type: 'float', min: 0, max: 1, minGiven: true, maxGiven: true }, scale: 1, offset: 0, advice: 'no modifiers needed (already 0.00-1.00)' },
+    ];
+    for (const c of cases) {
+      const m = await page.evaluate((r) => window._TEST_computeModifiers(r), c.row);
+      const advice = await page.evaluate((mm) => window._TEST_modifierAdvice(mm), m);
+      check(`${c.row.name}: Scale=${c.scale}, Offset=${c.offset}`,
+        Math.abs(m.scale - c.scale) < 1e-9 && Math.abs(m.offset - c.offset) < 1e-9, m);
+      check(`...advised as "${c.advice}" (a modifier that does nothing is not printed)`,
+        advice === c.advice, advice);
+      // MMV normalises MIDI to 0.0-1.0 before the shader sees it, so this is
+      // what the parameter actually receives at each end of the CC range.
+      const at = (norm) => norm * m.scale + m.offset;
+      check(`...CC 0 lands on MIN (${c.row.min}) and CC 127 on MAX (${c.row.max})`,
+        Math.abs(at(0) - c.row.min) < 1e-9 && Math.abs(at(1) - c.row.max) < 1e-9,
+        { at0: at(0), at1: at(1) });
+    }
+    // The centre check from the request: orbitSpeed at CC 64 must sit at ~0,
+    // which only holds because Offset carries the negative minimum.
+    const orb = await page.evaluate(() => window._TEST_computeModifiers({ name: 'orbitSpeed', type: 'float', min: -10, max: 10, minGiven: true, maxGiven: true }));
+    const centre = (64 / 127) * orb.scale + orb.offset;
+    check('orbitSpeed at CC 64 sits at the centre of its range (~0), not at its minimum',
+      Math.abs(centre) < 0.1, centre);
+  });
+
+  await withPage(browser, async (page) => {
+    // A range MME had to invent must say so rather than present 0..1 (or a
+    // bare long's 0..10) as though the shader had declared it.
+    const rows = await page.evaluate(() => window._TEST_buildMappingRows([
+      { NAME: 'declared', TYPE: 'float', MIN: 0, MAX: 360 },
+      { NAME: 'bareFloat', TYPE: 'float' },
+      { NAME: 'halfDeclared', TYPE: 'float', MIN: 2 },
+      { NAME: 'bareLong', TYPE: 'long' },
+      { NAME: 'enumLong', TYPE: 'long', VALUES: [0, 1, 2, 3] },
+      { NAME: 'aBool', TYPE: 'bool' },
+    ]));
+    const by = {}; rows.forEach(r => { by[r.name] = r; });
+    check('a declared MIN/MAX is recorded as declared; an omitted one is not',
+      by.declared.minGiven === true && by.declared.maxGiven === true
+      && by.bareFloat.minGiven === false && by.bareFloat.maxGiven === false
+      && by.halfDeclared.minGiven === true && by.halfDeclared.maxGiven === false,
+      { declared: by.declared, bareFloat: by.bareFloat, halfDeclared: by.halfDeclared });
+    check('a bool\'s 0..1 is by definition, and a long\'s VALUES list defines its top — neither counts as guessed',
+      by.aBool.minGiven === true && by.aBool.maxGiven === true && by.enumLong.maxGiven === true,
+      { aBool: by.aBool, enumLong: by.enumLong });
+
+    const mBare = await page.evaluate((r) => window._TEST_computeModifiers(r), rows.find(r => r.name === 'bareFloat'));
+    const mHalf = await page.evaluate((r) => window._TEST_computeModifiers(r), rows.find(r => r.name === 'halfDeclared'));
+    const mDecl = await page.evaluate((r) => window._TEST_computeModifiers(r), rows.find(r => r.name === 'declared'));
+    const mLong = await page.evaluate((r) => window._TEST_computeModifiers(r), rows.find(r => r.name === 'bareLong'));
+    check('an undeclared range is flagged, naming which of MIN/MAX is missing',
+      mBare.guessedRange === true && /no MIN or MAX/.test(mBare.warning)
+      && mHalf.guessedRange === true && /no MAX/.test(mHalf.warning) && !/MIN or MAX/.test(mHalf.warning),
+      { mBare, mHalf });
+    check('...a bare long\'s invented 0..10 is flagged too, rather than read as the real range',
+      mLong.guessedRange === true && mLong.max !== 0 && !!mLong.warning, mLong);
+    check('...and a properly declared range carries no doubt', mDecl.guessedRange === false && mDecl.warning === null, mDecl);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Magic project request the ISF Catalogue turns into a .magic file.
+    // A .magic cannot safely be edited while MMV holds it open — MMV rewrites
+    // the whole project from memory on its next save and discards the edit —
+    // so MME describes the wiring and the catalogue builds a project to import.
+    await page.evaluate(() => {
+      window._TEST_state.projectName = 'Kali Deep Flight';
+      window._TEST_state.midiOut = { state: 'connected', name: 'Out to Visuals', send: () => {} };
+      document.getElementById('isfShaderFolder').value = 'C:\\path\\to\\the\\exported';
+    });
+    const req = await page.evaluate(() => {
+      const entry = { filename: 'shader.fs', label: 'Kali Deep Flight' };
+      const refs = [
+        { row: { name: 'flySpeed', srcName: 'flySpeed' }, lane: { type: 'cc', ch: 1, cc: 20 } },
+        { row: { name: 'hue', srcName: 'hue' }, lane: { type: 'cc', ch: 1, cc: 21 } },
+        { row: { name: 'bendMe', srcName: 'bendMe' }, lane: { type: 'pb', ch: 1 } },
+      ];
+      return JSON.parse(window._TEST_buildMagicRequest(entry, refs));
+    });
+    check('the request names the shader by absolute path, composed from the Shader folder setting',
+      req.shader === 'C:\\path\\to\\the\\exported\\shader.fs', req.shader);
+    check('...carries a project name derived from the MME project',
+      req.project_name === 'Kali Deep Flight - MME', req.project_name);
+    check('...and a source of device + channel, which is what MMV Project Import matches on',
+      req.source.device === 'Out to Visuals' && req.source.channel === 2, req.source);
+    check('assignments use the ISF NAME verbatim, not MMV\'s displayed label',
+      req.assignments.map(a => a.input).join(',') === 'flySpeed,hue,bendMe', req.assignments);
+    check('...with CC carrying its number, and Pitch Bend carrying none',
+      req.assignments[0].type === 'CC' && req.assignments[0].number === 20
+      && req.assignments[1].number === 21
+      && req.assignments[2].type === 'Pitch Bend' && !('number' in req.assignments[2]),
+      req.assignments);
+    check('no Scale or Offset is sent — the catalogue derives the modifier chain from the shader itself',
+      !/scale|offset/i.test(JSON.stringify(req)), JSON.stringify(req).slice(0, 200));
+
+    // With no folder set the browser genuinely cannot know the path, so the
+    // filename alone is the honest answer rather than a fabricated one.
+    const bare = await page.evaluate(() => {
+      document.getElementById('isfShaderFolder').value = '';
+      return window._TEST_magicShaderPath('shader.fs');
+    });
+    check('with no Shader folder set, the shader is named by filename rather than an invented path',
+      bare === 'shader.fs', bare);
+    const fwd = await page.evaluate(() => {
+      document.getElementById('isfShaderFolder').value = '/home/me/isf/';
+      return window._TEST_magicShaderPath('shader.fs');
+    });
+    check('...and a POSIX folder joins with a forward slash, with no doubled separator',
+      fwd === '/home/me/isf/shader.fs', fwd);
+  });
+
+  await withPage(browser, async (page) => {
+    // The DESCRIPTION text MMV shows under right-click > Help. It has to be
+    // readable months later with no MME project open, so it states the real
+    // range beside each parameter and omits modifiers that would do nothing.
+    const notes = await page.evaluate(() => {
+      const entry = { filename: 'sky.fs', label: 'Sky' };
+      const mk = (name, min, max, minGiven, maxGiven, cc) => ({
+        row: { name, srcName: name, type: 'float', min, max, minGiven, maxGiven },
+        lane: { type: 'cc', ch: 0, cc },
+        mods: window._TEST_computeModifiers({ name, type: 'float', min, max, minGiven, maxGiven }),
+      });
+      return window._TEST_buildMigrationNotesText(entry, [], [
+        mk('rotation', 0, 360, true, true, 20),
+        mk('orbitSpeed', -10, 10, true, true, 21),
+        mk('mixAmount', 0, 1, true, true, 22),
+        mk('mystery', 0, 1, false, false, 23),
+      ]);
+    });
+    check('the notes state MIDI arrives as 0.00-1.00, so the reader knows why Scale is needed at all',
+      /0\.00-1\.00/.test(notes), notes.split('\n').find(l => /0\.00-1\.00/.test(l)));
+    check('rotation reads as its real range with a bare Scale (no pointless Offset=0)',
+      /rotation \[range 0 \.\. 360\]: Ch1 CC20, Scale=360$/m.test(notes),
+      notes.split('\n').find(l => l.includes('rotation')));
+    check('orbitSpeed carries the negative Offset that reaches the bottom of its range',
+      /orbitSpeed \[range -10 \.\. 10\]: Ch1 CC21, Scale=20, then Offset=-10$/m.test(notes),
+      notes.split('\n').find(l => l.includes('orbitSpeed')));
+    check('an already-0-1 parameter is told it needs nothing, rather than shown Scale=1, Offset=0',
+      /mixAmount .*no modifiers needed \(already 0\.00-1\.00\)/.test(notes) && !/mixAmount.*Scale=1/.test(notes),
+      notes.split('\n').find(l => l.includes('mixAmount')));
+    check('a range MME had to assume says so, in the range and in a trailing note',
+      /mystery \[range 0 \.\. 1 \(assumed\)\]/.test(notes) && /mystery.*no MIN or MAX/.test(notes),
+      notes.split('\n').find(l => l.includes('mystery')));
   });
 
   await withPage(browser, async (page) => {
@@ -10063,8 +10219,12 @@ async function run() {
       /zoom \[range 0 \.\. 6\.28\]/.test(notes) && /Scale=6\.28/.test(notes), notes);
     check('...including a negative-minimum parameter, where the Offset matters',
       /shift \[range -2 \.\. 2\]/.test(notes) && /Scale=4/.test(notes) && /Offset=-2/.test(notes), notes);
-    check('a parameter already in 0-1 is called out as needing no Scale',
-      /warp \[range 0 \.\. 1\] \(already 0-1, no Scale needed\)/.test(notes), notes);
+    // v0.9.57 reworded this: the parenthetical used to sit beside the range
+    // AND the redundant "Scale=1, Offset=0" was still printed after it. The
+    // advice now replaces those numbers instead of annotating them.
+    check('a parameter already in 0-1 is told it needs nothing, with no no-op numbers printed',
+      /warp \[range 0 \.\. 1\]: Ch1 CC21, no modifiers needed \(already 0\.00-1\.00\)/.test(notes)
+      && !/warp.*Scale=1/.test(notes), notes);
     check('the notes still carry the Scale-above-Offset stacking warning',
       /Scale first, then Offset/.test(notes), notes);
     check('the notes are still delimited so a re-export replaces them in place',

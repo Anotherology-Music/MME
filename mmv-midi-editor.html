@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.56
+  MMV MIDI & CC Curve Editor v0.9.57
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1536,6 +1536,63 @@
   before its folder was known keeps its clip slots, and adding the folder
   afterwards fills the audio back in at the saved positions.
 
+  v0.9.57 — Modifier advice tightened, and "Create Magic project".
+
+  On the modifier maths, one correction to the record: MME already computed
+  Scale = MAX - MIN and Offset = MIN, and has since v0.9.15. It was never
+  Scale = MAX. Checked against the shipped build before changing anything:
+  rotation (0..360) gave Scale 360; moonSize (0.02..0.5) gave Scale 0.48,
+  Offset 0.02; orbitSpeed (-10..10) gave Scale 20, Offset -10, putting CC 0 at
+  -10 and CC 127 at +10. Those are now pinned by tests that assert the mapped
+  values at CC 0, 64 and 127 rather than just the modifier numbers, so the
+  claim is checkable rather than asserted.
+
+  Two things WERE wrong, and are fixed.
+
+  A range MME had to invent was printed as though the shader had declared it.
+  A float with no MIN/MAX silently became 0..1; a long with none became 0..10,
+  a wholly made-up number. Rows now record whether each bound was actually
+  declared, and the advice says "(assumed)" beside the range and names which
+  of MIN/MAX was missing. A bool's 0..1 and a long's VALUES list define a
+  range rather than assume one, so neither is flagged.
+
+  And modifiers that do nothing were printed anyway. "Scale=360, Offset=0"
+  invited the reader to add an Offset of zero; "Scale=1, Offset=0" invited two
+  modifiers where none is needed. The advice now reads "Scale=360" alone when
+  MIN is 0, and "no modifiers needed (already 0.00-1.00)" when the range
+  already is 0..1 — the numbers are replaced rather than annotated.
+
+  NEW: a "Create Magic project" tickbox on the Export ISF sheet. It writes a
+  JSON request beside the exported shader which the ISF Catalogue turns into a
+  .magic project, to be imported into the live MMV project with every wired
+  parameter already connected. This exists because a .magic file cannot safely
+  be edited while MMV has it open: MMV takes no file lock, but it holds the
+  project in memory and reserialises all of it on its next save, so an outside
+  edit is written, verifies clean, and is then silently discarded.
+
+  The request carries the shader path, a project name, a source of device +
+  channel (what MMV's Project Import actually matches on — the source's name
+  is cosmetic and renamed on collision), and one assignment per wired row
+  using the ISF NAME exactly as declared. Deliberately NO Scale/Offset: the
+  catalogue derives the modifier chain from the shader's own MIN/MAX, so that
+  formula lives in one place instead of two that can drift apart. Converting a
+  NAME to MMV's displayed label is left to the catalogue for the same reason —
+  that rule expands a colour into four rows and a point2D into two.
+
+  A browser is never told where on disk a folder is; it is handed permission
+  to read the folder, not its path. So an absolute shader path cannot be
+  derived, and a "Shader folder" setting was added next to the ISF Catalogue
+  address for it. Left empty, the request names the shader by filename alone
+  for the catalogue to resolve beside the request file, rather than inventing
+  a path.
+
+  Pitch Bend is emitted as its own type and never as CC. It is the one bipolar
+  source — 16,384 steps centred on zero rather than 0..127 rising from it — so
+  its modifier maths is not the CC formula, and the catalogue handles it apart.
+
+  Nineteen new checks, including the change request's own worked examples
+  carried through to what a CC of 0, 64 and 127 actually lands on.
+
 -->
 
 
@@ -2475,6 +2532,14 @@
               title="Where your ISF Catalogue lives. A Windows path is accepted and converted to a file:// URL. Saved in this browser.">
           </div>
           <div class="setup-note">Opens your ISF Catalogue in a new tab. A browser cannot launch a <code>.cmd</code> (or any program) &mdash; that is a hard security rule, not an MME limitation &mdash; so point this at the catalogue&rsquo;s <code>.html</code> file. A <code>file://</code> address only works when MME itself was opened from a file; if you are running MME from a web address, the browser will refuse the link, and you should serve the catalogue over <code>http://</code> and paste that address here instead.</div>
+
+          <div class="setup-row setup-sub-row">
+            <span class="lbl">Shader folder</span>
+            <input type="text" id="isfShaderFolder" style="flex:1 1 240px;min-width:160px;"
+              placeholder="C:\Users\YourName\ISF\_shaders"
+              title="Absolute path of the folder your exported shaders end up in. Used only to fill in the shader path in a Create Magic project request. Saved in this browser.">
+          </div>
+          <div class="setup-note">Only needed for <b>Create Magic project</b>. A browser is never told where on disk a folder actually is &mdash; it is handed a permission to read the folder, not its path &mdash; so the generated project request cannot work out the shader&rsquo;s absolute path on its own. Paste the folder here once and MME will compose it. Leave it empty and the request names the shader by filename alone, for the catalogue to resolve next to the request file.</div>
 
           <div class="setup-subtitle">KEY NAMES</div>
           <div class="setup-row setup-sub-row">
@@ -9289,6 +9354,14 @@
   $('isfCatalogueUrl').addEventListener('change',()=>{
     try{ localStorage.setItem(ISF_CATALOGUE_KEY,$('isfCatalogueUrl').value.trim()); }catch(e){}
   });
+  // Where exported shaders live on disk, for the Magic project request's
+  // absolute "shader" path. A machine setting like the catalogue address, not
+  // project data — it never goes into a .mmvp.
+  const ISF_SHADER_FOLDER_KEY='mmv-isf-shader-folder';
+  try{ const v=localStorage.getItem(ISF_SHADER_FOLDER_KEY); if(v!==null) $('isfShaderFolder').value=v; }catch(e){}
+  $('isfShaderFolder').addEventListener('change',()=>{
+    try{ localStorage.setItem(ISF_SHADER_FOLDER_KEY,$('isfShaderFolder').value.trim()); }catch(e){}
+  });
 
   // Accepts what a Windows user actually has to hand — C:\path\file.html,
   // with either slash direction, quoted or not — and turns it into a real
@@ -11295,7 +11368,7 @@
           const def=inp.DEFAULT||inp.default||[0,0,0,1];
           const chNames=['R','G','B','A'];
           for(let ci=0;ci<4;ci++){
-            rows.push({name:nm+'.'+chNames[ci],srcName:nm,type:'color',min:0,max:1,
+            rows.push({name:nm+'.'+chNames[ci],srcName:nm,type:'color',min:0,max:1,minGiven:true,maxGiven:true,
               defaultVal:typeof def[ci]==='number'?def[ci]:0,isColor:true,colorCh:ci});
           }
         } else if(t==='point2D'||t==='point2d'){
@@ -11315,9 +11388,15 @@
             const mn=Array.isArray(minRaw)?(minRaw[ai]!=null?minRaw[ai]:0):(minRaw!=null?minRaw:0);
             const mx=Array.isArray(maxRaw)?(maxRaw[ai]!=null?maxRaw[ai]:1):(maxRaw!=null?maxRaw:1);
             rows.push({name:nm+' '+axNames[ai],srcName:nm,type:'float',min:mn,max:mx,
+              minGiven:minRaw!=null,maxGiven:maxRaw!=null,
               defaultVal:typeof def[ai]==='number'?def[ai]:0,isPoint2D:true,pointAxis:ai});
           }
         } else if(t==='float'){
+          // Whether the shader actually DECLARED a range, as opposed to this
+          // falling back to 0..1. The modifier advice is only as good as the
+          // MIN/MAX it is derived from, so a guessed range has to be called
+          // out rather than printed as though it were fact.
+          const minGiven=inp.MIN!=null||inp.min!=null, maxGiven=inp.MAX!=null||inp.max!=null;
           const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
           const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:1);
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
@@ -11328,13 +11407,18 @@
           // a VALUES/LABELS array rather than TYPE "long" — without this,
           // Steps/LABELS silently get dropped for exactly those parameters.
           const isfSteps=vals?vals.length:0;
-          rows.push({name:nm,srcName:nm,type:'float',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
+          rows.push({name:nm,srcName:nm,type:'float',min:mn,max:mx,minGiven,maxGiven,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
         } else if(t==='bool'||t==='boolean'){
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:false);
-          rows.push({name:nm,srcName:nm,type:'bool',min:0,max:1,defaultVal:dv?1:0,steps:2});
+          // A bool is 0..1 by definition, not by assumption — nothing guessed.
+          rows.push({name:nm,srcName:nm,type:'bool',min:0,max:1,minGiven:true,maxGiven:true,defaultVal:dv?1:0,steps:2});
         } else if(t==='long'||t==='int'){
           const vals=inp.VALUES||inp.values||null;
           const labs=inp.LABELS||inp.labels||null;
+          // A VALUES list defines the range as surely as MIN/MAX would; a bare
+          // long with neither falls back to 0..10, which is invented and has
+          // to be flagged as such rather than dressed up as the real range.
+          const minGiven=inp.MIN!=null||inp.min!=null, maxGiven=inp.MAX!=null||inp.max!=null||!!vals;
           const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
           const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:(vals?vals.length-1:10));
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
@@ -11342,7 +11426,7 @@
           // an explicit VALUES list gives its own option count, otherwise a
           // plain integer range is inherently one step per integer.
           const isfSteps=vals?vals.length:Math.max(2,Math.round(mx-mn+1));
-          rows.push({name:nm,srcName:nm,type:'long',min:mn,max:mx,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
+          rows.push({name:nm,srcName:nm,type:'long',min:mn,max:mx,minGiven,maxGiven,defaultVal:dv,values:vals,labels:labs,steps:isfSteps});
         }
       }
       return rows;
@@ -11416,6 +11500,20 @@
       if(!await verifyDirPermission(projDirHandle,true)) return;
       const fh=await projDirHandle.getFileHandle(filename,{create:true});
       const w=await fh.createWritable(); await w.write(text); await w.close();
+    }
+
+    // Writes a companion file into the projects folder, returning whether it
+    // landed there. Used for the Magic project request, which has to sit
+    // beside the exported shader — but must never take the export down with
+    // it if the folder is gone or read-only, hence the caught failure.
+    async function writeTextIntoProjectFolder(filename,text){
+      if(!projDirHandle) return false;
+      try{
+        if(!await verifyDirPermission(projDirHandle,true)) return false;
+        const fh=await projDirHandle.getFileHandle(filename,{create:true});
+        const w=await fh.createWritable(); await w.write(text); await w.close();
+        return true;
+      }catch(e){ return false; }
     }
 
     // Update ISF's export target (the button was "Migrate to MMV" until this
@@ -12363,20 +12461,46 @@
     // guessed.
     function computeModifiers(row){
       const scale=row.max-row.min, offset=row.min;
+      // A range MME had to invent because the shader declared no MIN/MAX
+      // produces modifier numbers that look every bit as authoritative as
+      // real ones. Carry the doubt through so the advice can admit it rather
+      // than quietly presenting 0..1 (or a long's 0..10) as fact.
+      const guessed=(row.minGiven===false)||(row.maxGiven===false);
+      const guessNote=guessed
+        ? ('Shader declares no '
+          +(row.minGiven===false&&row.maxGiven===false?'MIN or MAX':(row.minGiven===false?'MIN':'MAX'))
+          +' — range assumed, check it in MMV.')
+        : null;
       // Discrete = long/bool, OR a float carrying its own VALUES array (some
       // real ISF shaders declare an enum-style control as TYPE "float" with
       // VALUES/LABELS instead of TYPE "long" — see buildMappingRows).
       const hasValues=Array.isArray(row.values)&&row.values.length>1;
       const discrete=row.type==='long'||row.type==='bool'||(row.type==='float'&&hasValues);
-      if(!discrete) return {scale,offset,step:null,warning:null};
-      if(row.type==='bool') return {scale,offset,step:1,warning:null};
+      function out(step,warning){
+        return {scale,offset,step,guessedRange:guessed,
+          warning:[guessNote,warning].filter(Boolean).join(' ')||null};
+      }
+      if(!discrete) return out(null,null);
+      if(row.type==='bool') return out(1,null);
       if(hasValues){
         const diffs=[]; for(let i=1;i<row.values.length;i++) diffs.push(row.values[i]-row.values[i-1]);
         const d0=diffs[0], even=diffs.every(function(d){ return Math.abs(d-d0)<1e-6; });
-        if(!even) return {scale,offset,step:null,warning:'Irregular VALUES spacing — set Step manually in MMV.'};
-        return {scale,offset,step:d0,warning:null};
+        if(!even) return out(null,'Irregular VALUES spacing — set Step manually in MMV.');
+        return out(d0,null);
       }
-      return {scale,offset,step:1,warning:null};
+      return out(1,null);
+    }
+    // The modifier chain a parameter actually needs, in words. A modifier the
+    // user does not need is noise in a Help panel they are reading to find out
+    // what to set up, so an all-zero Offset or an already-0..1 range is said
+    // rather than printed as a number they would have to recognise as a no-op.
+    function modifierAdvice(mods){
+      if(mods.scale===1&&mods.offset===0) return 'no modifiers needed (already 0.00-1.00)';
+      let s=(mods.offset===0)
+        ? 'Scale='+fmtNum(mods.scale)
+        : 'Scale='+fmtNum(mods.scale)+', then Offset='+fmtNum(mods.offset);
+      if(mods.step!=null) s+=', Step='+fmtNum(mods.step);
+      return s;
     }
 
     function findRowLane(batchId,row){
@@ -12444,11 +12568,8 @@
           // Spelling out the native range is what makes this readable inside
           // MMV's right-click > Help, months later, with no MME project open:
           // "Scale=6.28" means nothing on its own, "range 0 .. 6.28" explains it.
-          const rng='range '+fmtNum(r.row.min)+' .. '+fmtNum(r.row.max);
-          const native=(r.mods.scale===1&&r.mods.offset===0)?' (already 0-1, no Scale needed)':'';
-          let line='  '+r.row.name+' ['+rng+']'+native+': '+wireFeatureLabel(r)
-            +', Scale='+fmtNum(r.mods.scale)+', Offset='+fmtNum(r.mods.offset);
-          if(r.mods.step!=null) line+=', Step='+fmtNum(r.mods.step);
+          const rng='range '+fmtNum(r.row.min)+' .. '+fmtNum(r.row.max)+(r.mods.guessedRange?' (assumed)':'');
+          let line='  '+r.row.name+' ['+rng+']: '+wireFeatureLabel(r)+', '+modifierAdvice(r.mods);
           if(r.mods.warning) line+='  ['+r.mods.warning+']';
           lines.push(line);
         });
@@ -12512,6 +12633,61 @@
       let out=entry.source.replace(/\/\*\s*[\s\S]*?\s*\*\//,'/*\n'+json+'\n*/');
       out=embedNotesInSource(out,notesText);
       return out;
+    }
+
+    // ── "Create Magic project" request ──────────────────────────────
+    // A .magic project cannot safely be edited while MMV has it open: MMV
+    // takes no file lock, but it holds the project in memory and reserialises
+    // the whole thing on its next save, so an external edit is written,
+    // verifies clean, and is then silently discarded. Rather than fight that,
+    // MME writes a request describing the wiring, the ISF Catalogue turns it
+    // into its own .magic project, and the user imports that into the live
+    // one — no edit-in-place, no lost work.
+    //
+    // Deliberately carries NO Scale/Offset. The catalogue derives the modifier
+    // chain from the shader's own MIN/MAX, so the formula lives in exactly one
+    // place; two implementations of it would eventually disagree, and the one
+    // that mattered would be whichever the user was not looking at.
+    const MAGIC_REQ_SUFFIX='.magic-request.json';
+    // MMV's own MIDI feature names. Note "Pitch Bend" is the bipolar one —
+    // 16,384 steps centred on zero rather than 0..127 rising from it — so its
+    // modifier maths is NOT the CC formula and the catalogue handles it apart.
+    function magicSourceType(lane){
+      if(laneIsPb(lane)) return {type:'Pitch Bend', numbered:false};
+      if(laneIsCp(lane)) return {type:'Channel Pressure', numbered:false};
+      return {type:'CC', numbered:true};
+    }
+    function magicShaderPath(filename){
+      let base='';
+      try{ base=(document.getElementById('isfShaderFolder')||{}).value||''; }catch(e){}
+      base=base.trim();
+      if(!base) return filename; // no folder known — catalogue resolves it beside the request
+      const sep=base.indexOf('\\')>=0?'\\':'/';
+      return base.replace(/[\\/]+$/,'')+sep+filename;
+    }
+    function buildMagicRequest(entry,wireRefs){
+      // Every row of one ISF import shares a channel, so the first wired row
+      // decides the source channel for the whole request.
+      const firstLane=wireRefs.length?wireRefs[0].lane:null;
+      const req={
+        shader:magicShaderPath(entry.filename),
+        project_name:((state.projectName||entry.label||entry.filename.replace(/\.[^.]+$/,''))+' - MME'),
+        source:{
+          device:(state.midiOut&&state.midiOut.name)?state.midiOut.name:'Out to Visuals',
+          channel:firstLane?(firstLane.ch+1):1,
+        },
+        assignments:wireRefs.map(function(r){
+          const k=magicSourceType(r.lane);
+          // The ISF NAME exactly as declared. Converting it to MMV's displayed
+          // label is the catalogue's job — that rule expands a colour into four
+          // rows and a point2D into two, and re-deriving it here would be a
+          // second implementation to keep in step.
+          const a={input:r.row.srcName||r.row.name, type:k.type};
+          if(k.numbered) a.number=r.lane.cc;
+          return a;
+        }),
+      };
+      return JSON.stringify(req,null,2);
     }
 
     function buildWiringSheetText(entry,wireRefs){
@@ -12716,6 +12892,18 @@
       rowRefs.forEach(function(r){ r.updateCb.addEventListener('change',updateCount); r.wireCb.addEventListener('change',updateCount); });
       updateCount();
 
+      // "Create Magic project" — writes the request the ISF Catalogue turns
+      // into a .magic project. It describes the same rows as the wiring sheet,
+      // so it is only meaningful when at least one row is wire-ticked.
+      const magicLbl=document.createElement('label');
+      magicLbl.style.cssText='display:flex;align-items:center;gap:5px;font-size:11px;color:#7a8099;cursor:pointer;';
+      const magicCb=document.createElement('input');
+      magicCb.type='checkbox'; magicCb.id='isfMagicReqCb';
+      magicLbl.appendChild(magicCb);
+      magicLbl.appendChild(document.createTextNode('Create Magic project'));
+      magicLbl.title='Also write a request file the ISF Catalogue turns into a .magic project, with every wired parameter already connected. '
+        +'Import that project into your live MMV project — a .magic file cannot safely be edited while MMV has it open, because MMV rewrites the whole project from memory on its next save and would discard the edit.';
+
       const closeBtn=document.createElement('button');
       closeBtn.textContent='Cancel';
       closeBtn.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;margin-left:auto;';
@@ -12750,11 +12938,29 @@
         if(wireRefs.length){
           downloadText(entry.filename.replace(/\.[^.]+$/,'')+'-wiring-sheet.txt',buildWiringSheetText(entry,wireRefs),'text/plain');
         }
+
+        // The Magic project request goes next to the exported shader, by the
+        // same route: into the projects folder when there is one, otherwise a
+        // download for the user to file themselves.
+        let magicNote='';
+        if(magicCb.checked){
+          if(!wireRefs.length){
+            magicNote=' — no Magic project written, nothing was wire-ticked';
+          } else {
+            const reqName=entry.filename.replace(/\.[^.]+$/,'')+MAGIC_REQ_SUFFIX;
+            const reqText=buildMagicRequest(entry,wireRefs);
+            const reqInPlace=await writeTextIntoProjectFolder(reqName,reqText);
+            if(!reqInPlace) downloadText(reqName,reqText,'application/json');
+            magicNote=' + Magic project request'+(reqInPlace?'':' (downloaded)');
+          }
+        }
+
         dlg.close(); dlg.remove();
-        flash((wroteInPlace?'Updated ':'Downloaded ')+entry.filename+(wireRefs.length?' + wiring sheet':'')+'.');
+        flash((wroteInPlace?'Updated ':'Downloaded ')+entry.filename+(wireRefs.length?' + wiring sheet':'')+magicNote+'.');
       });
 
       footer.appendChild(countLbl);
+      footer.appendChild(magicLbl);
       footer.appendChild(closeBtn);
       footer.appendChild(exportBtn);
       dlg.appendChild(footer);
