@@ -135,7 +135,20 @@ function buildTestHtml() {
       '  window._TEST_applyScrollLock = () => applyScrollLock();',
       '  window._TEST_prScrollWidth = () => document.getElementById(\'prScroll\').clientWidth;',
       '  window._TEST_hasFSA = () => hasFSA;',
-      '  window._TEST_setProjDirHandle = (h) => { projDirHandle = h; };',
+      // Keeps its pre-v0.9.56 meaning — "this one folder is the projects
+      // folder" — now expressed as a one-entry list.
+      '  window._TEST_setProjDirHandle = (h) => { projDirs = h ? [h] : []; projDirHandle = h; };',
+      // v0.9.56 multiple project folders.
+      '  window._TEST_setProjDirs = (hs) => { projDirs = hs || []; projDirHandle = projDirs[0] || null; };',
+      '  window._TEST_projDirs = () => projDirs.map(h => h.name);',
+      '  window._TEST_projDirPrimary = () => projDirHandle ? projDirHandle.name : null;',
+      '  window._TEST_setProjDirPrimary = (h) => { projDirHandle = h; };',
+      '  window._TEST_removeProjectFolder = (i) => removeProjectFolder(i);',
+      '  window._TEST_renderProjFolders = () => renderProjFolders();',
+      '  window._TEST_listProjectFiles = () => listProjectFiles().then(fs => fs.map(f => ({ name: f.name, dir: f.dir ? f.dir.name : null })));',
+      '  window._TEST_findProjectAudio = (n, e) => findProjectAudio(n, e).then(h => h ? h.label : null);',
+      '  window._TEST_pickStoredProjDirs = (list, single) => pickStoredProjDirs(list, single);',
+      '  window._TEST_reloadProjectAudioClips = () => reloadProjectAudioClips();',
       '  window._TEST_getProjDirHandle = () => projDirHandle;',
       '  window._TEST_renderProjList = () => renderProjList();',
       '  window._TEST_saveProject = () => saveProject();',
@@ -3950,6 +3963,170 @@ async function run() {
     check('Save Project writes directly into the remembered folder when one is set', savedInDir === true, savedInDir);
 
     await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  // ---------------- Multiple project folders (v0.9.56) ----------------
+
+  await withPage(browser, async (page) => {
+    // One remembered folder meant anything kept elsewhere opened without its
+    // audio — a browser only hands a page the single file picked through
+    // <input type=file>, never its siblings, so a folder handle is the only
+    // way to find them. Every remembered folder is now searched.
+    const seeded = await page.evaluate(() => {
+      class MockFileHandle {
+        constructor(name, content, lastModified) { this.kind = 'file'; this.name = name; this._content = content; this._lastModified = lastModified; }
+        async getFile() { return new File([this._content], this.name, { lastModified: this._lastModified }); }
+        async createWritable() {
+          const self = this;
+          return { async write(s) { this._buf = s; }, async close() { self._content = this._buf; self._lastModified = Date.now(); } };
+        }
+      }
+      class MockDirHandle {
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); }
+        async queryPermission() { return 'granted'; }
+        async requestPermission() { return 'granted'; }
+        async isSameEntry(o) { return o === this; }
+        async getFileHandle(name, opts) {
+          if (!this._files.has(name)) {
+            if (opts && opts.create) this._files.set(name, new MockFileHandle(name, '', Date.now()));
+            else { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          }
+          return this._files.get(name);
+        }
+        async *entries() { for (const [name, handle] of this._files) yield [name, handle]; }
+      }
+      const wavBytes = new Uint8Array([
+        0x52,0x49,0x46,0x46, 0x2c,0x00,0x00,0x00, 0x57,0x41,0x56,0x45,
+        0x66,0x6d,0x74,0x20, 0x10,0x00,0x00,0x00, 0x01,0x00, 0x01,0x00,
+        0x44,0xac,0x00,0x00, 0x88,0x58,0x01,0x00, 0x02,0x00, 0x10,0x00,
+        0x64,0x61,0x74,0x61, 0x08,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      ]);
+      // Folder A: sketches. Folder B: the show — project AND its audio.
+      const a = new MockDirHandle('Sketches');
+      a._files.set('doodle.mmvp', new MockFileHandle('doodle.mmvp', JSON.stringify({
+        version: 1, projectName: 'doodle',
+        snapshot: { notes: [], lanes: [], bpm: 120, bars: 4, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 1, pitchNames: {}, projectName: 'doodle', locS: null, locE: null },
+      }), Date.now() - 9000));
+      const b = new MockDirHandle('AIMusical');
+      b._files.set('the-show.mmvp', new MockFileHandle('the-show.mmvp', JSON.stringify({
+        version: 1, projectName: 'the-show', audioFile: 'overture.wav',
+        snapshot: {
+          notes: [], lanes: [], bpm: 120, bars: 8, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 50,
+          pitchNames: {}, projectName: 'the-show', locS: null, locE: null,
+          audioClips: [{ id: 41, name: 'overture.wav', startTick: 0, durSec: 0.0001 }],
+        },
+      }), Date.now() - 1000));
+      b._files.set('overture.wav', new MockFileHandle('overture.wav', wavBytes, Date.now()));
+      window.__A = a; window.__B = b;
+      window._TEST_setProjDirs([a, b]);
+      return { dirs: window._TEST_projDirs(), primary: window._TEST_projDirPrimary() };
+    });
+    check('several folders can be remembered at once, the first being the write target',
+      seeded.dirs.join(',') === 'Sketches,AIMusical' && seeded.primary === 'Sketches', seeded);
+
+    const listed = await page.evaluate(() => window._TEST_listProjectFiles());
+    check('Recent Projects lists projects from every folder, newest first, tagged with the folder each came from',
+      listed.length === 2 && listed[0].name === 'the-show.mmvp' && listed[0].dir === 'AIMusical'
+      && listed[1].name === 'doodle.mmvp' && listed[1].dir === 'Sketches', listed);
+
+    // The audio search reaches into a folder that is NOT the write target —
+    // this is the whole point of the change.
+    const hit = await page.evaluate(() => window._TEST_findProjectAudio('overture', null));
+    check('audio is found in a non-primary folder', hit === 'AIMusical/overture.wav', hit);
+
+    // Open the show out of folder B and its clip reloads, though the primary
+    // folder is still A.
+    await page.evaluate(async () => {
+      const fh = window.__B._files.get('the-show.mmvp');
+      window._TEST_loadProject(await fh.getFile());
+    });
+    await page.waitForTimeout(400);
+    const clips = await page.evaluate(() => window._TEST_audioClips());
+    check('opening a project whose audio lives in another remembered folder reloads that audio',
+      clips.length === 1 && clips[0].name === 'overture.wav' && clips[0].loaded === true, clips);
+
+    // Removing the folder stops it being searched.
+    await page.evaluate(() => window._TEST_removeProjectFolder(1));
+    await page.waitForTimeout(60);
+    const afterRemove = await page.evaluate(async () => ({
+      dirs: window._TEST_projDirs(),
+      hit: await window._TEST_findProjectAudio('overture', null),
+      listed: (await window._TEST_listProjectFiles()).map(f => f.name),
+    }));
+    check('removing a folder stops it being searched for projects or audio',
+      afterRemove.dirs.join(',') === 'Sketches' && afterRemove.hit === null
+      && afterRemove.listed.join(',') === 'doodle.mmvp', afterRemove);
+
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  await withPage(browser, async (page) => {
+    // Adding the folder mid-session must rescue an already-open project whose
+    // clips came up empty — that is the flow when you open a show before
+    // telling MME where it lives.
+    const state = await page.evaluate(async () => {
+      class MockFileHandle {
+        constructor(name, content) { this.kind = 'file'; this.name = name; this._content = content; }
+        async getFile() { return new File([this._content], this.name, { lastModified: Date.now() }); }
+      }
+      class MockDirHandle {
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); }
+        async queryPermission() { return 'granted'; }
+        async requestPermission() { return 'granted'; }
+        async getFileHandle(name) {
+          if (!this._files.has(name)) { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          return this._files.get(name);
+        }
+        async *entries() { for (const [n, h] of this._files) yield [n, h]; }
+      }
+      const wavBytes = new Uint8Array([
+        0x52,0x49,0x46,0x46, 0x2c,0x00,0x00,0x00, 0x57,0x41,0x56,0x45,
+        0x66,0x6d,0x74,0x20, 0x10,0x00,0x00,0x00, 0x01,0x00, 0x01,0x00,
+        0x44,0xac,0x00,0x00, 0x88,0x58,0x01,0x00, 0x02,0x00, 0x10,0x00,
+        0x64,0x61,0x74,0x61, 0x08,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      ]);
+      // Project loaded with NO folder remembered: the clip has its slot but
+      // no audio behind it.
+      window._TEST_setProjDirs([]);
+      window._TEST_loadProject(new File([JSON.stringify({
+        version: 1, projectName: 'stranded',
+        snapshot: {
+          notes: [], lanes: [], bpm: 120, bars: 8, tsNum: 4, tsDen: 4, tsMap: [{ tick: 0, num: 4, den: 4 }], ppq: 480, next: 90,
+          pitchNames: {}, projectName: 'stranded', locS: null, locE: null,
+          audioClips: [{ id: 77, name: 'lost.wav', startTick: 960, durSec: 0.0001 }],
+        },
+      })], 'stranded.mmvp'));
+      await new Promise(r => setTimeout(r, 350));
+      const before = window._TEST_audioClips();
+      const late = new MockDirHandle('FoundIt');
+      late._files.set('lost.wav', new MockFileHandle('lost.wav', wavBytes));
+      window._TEST_setProjDirs([late]);
+      const n = await window._TEST_reloadProjectAudioClips();
+      return { before, n, after: window._TEST_audioClips() };
+    });
+    check('a project opened before its folder was known keeps the clip slot, marked as missing',
+      state.before.length === 1 && state.before[0].loaded === false && state.before[0].startTick === 960, state.before);
+    check('...and adding the folder afterwards fills the audio in, at its saved position',
+      state.n === 1 && state.after[0].loaded === true && state.after[0].startTick === 960, state);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  await withPage(browser, async (page) => {
+    // Migration off the pre-v0.9.56 single-handle key, and the precedence
+    // between the two keys. Checked as a plain function because a real
+    // IndexedDB round trip cannot preserve a directory handle in a test.
+    const r = await page.evaluate(() => ({
+      bothKeys: window._TEST_pickStoredProjDirs(['new1', 'new2'], 'old'),
+      onlyOld: window._TEST_pickStoredProjDirs(undefined, 'old'),
+      onlyNew: window._TEST_pickStoredProjDirs(['new1'], undefined),
+      neither: window._TEST_pickStoredProjDirs(undefined, undefined),
+      emptyList: window._TEST_pickStoredProjDirs([], 'old'),
+    }));
+    check('a folder remembered by an older build is carried over as the first entry',
+      r.onlyOld.join(',') === 'old', r.onlyOld);
+    check('...the new list wins once it exists, and an empty list is respected rather than falling back',
+      r.bothKeys.join(',') === 'new1,new2' && r.onlyNew.join(',') === 'new1'
+      && r.emptyList.length === 0 && r.neither.length === 0, r);
   });
 
   await withPage(browser, async (page) => {

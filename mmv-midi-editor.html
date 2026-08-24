@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.55
+  MMV MIDI & CC Curve Editor v0.9.56
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1496,6 +1496,46 @@
   34 minutes at 120bpm, so it cannot address a feature-length project anyway.
   Locating in a show that long is MIDI Time Code's job, not clock's.
 
+  v0.9.56 — Several project folders, not one.
+
+  MME could remember exactly one folder, and only what lived inside it opened
+  with its audio. Everything else came up silent — not an oversight but a
+  browser rule: a file chosen through <input type=file> is handed to the page
+  on its own, with no way to see what sits next to it, so a directory handle
+  from showDirectoryPicker() is the only way to find a project's audio at all.
+  One handle therefore meant one folder's worth of projects, and work rarely
+  lives in one place.
+
+  "Choose Projects Folder…" becomes "Add Folder…", and the popover now lists
+  every remembered folder with a × to drop one. All of them are searched, for
+  projects and for the audio a project refers to. Recent Projects merges them
+  into one list, newest first, tagging each entry with the folder it came from
+  once there is more than one to tell apart.
+
+  One folder still has to be singular: Save Project, and the ISF
+  copy-into-project-folder helpers, write to a specific place rather than a
+  list. That target follows what you opened — open a project out of a folder
+  and saving goes back there, and that folder also goes to the front of the
+  audio search, so a filename that exists in two places resolves to the copy
+  beside the project. Otherwise it is the first folder in the list, marked in
+  the popover so it is never a guess.
+
+  Adding a folder retries the open project's clips straight away, so the flow
+  that prompted this — open a show, find its audio missing, point MME at the
+  folder — fills the waveforms in on the spot rather than needing the project
+  closed and reopened. A clip whose file still cannot be found keeps its slot
+  at its saved position, marked ⚠, and the "not found" message now names Add
+  Folder as the remedy instead of leaving it to be guessed.
+
+  A folder remembered by an older build is carried over automatically as the
+  first entry; nobody has to re-pick it. Folders whose permission the browser
+  has since dropped are quietly skipped, and one dead folder no longer stops
+  the others being searched.
+
+  Nine new checks, including the one that matters most: a project opened
+  before its folder was known keeps its clip slots, and adding the folder
+  afterwards fills the audio back in at the saved positions.
+
 -->
 
 
@@ -1778,6 +1818,15 @@
   #projList button:hover{border-color:var(--accent);}
   #projList button .projFileTime{color:var(--txt2);font-size:9px;flex-shrink:0;}
   #projList .hint{font-size:11px;color:var(--txt2);}
+  /* Remembered folders, each with its own remove button. The folder a project
+     was opened from is marked, since that is where Save writes back to. */
+  #projFolders{display:flex;flex-direction:column;gap:2px;max-height:110px;overflow-y:auto;}
+  #projFolders .pf{display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 4px;color:var(--txt2);}
+  #projFolders .pf .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  #projFolders .pf.primary .nm{color:var(--accent2);}
+  #projFolders .pf button{font-size:10px;padding:0 5px;line-height:16px;flex-shrink:0;}
+  #projFolders .hint{font-size:11px;color:var(--txt2);}
+  #projList button .projFolderTag{color:var(--accent2);font-size:9px;flex-shrink:0;}
   .dur{font-family:ui-monospace,Consolas,monospace;color:var(--txt);cursor:pointer;border:1px solid var(--line);
     border-radius:5px;padding:4px 7px;background:var(--panel2);min-width:96px;text-align:center;}
   .dur:hover{border-color:var(--accent);}
@@ -2299,8 +2348,10 @@
         <div id="projPopover">
           <div class="setup-title">Recent Projects</div>
           <div id="projList"><span class="hint">—</span></div>
+          <div class="setup-title" style="margin-top:4px;">Project Folders</div>
+          <div id="projFolders"><span class="hint">—</span></div>
           <div class="setup-row">
-            <button id="projPickFolderBtn" title="Remember a folder so projects (and matching audio) can be opened with one click">Choose Projects Folder…</button>
+            <button id="projPickFolderBtn" title="Remember another folder. Every remembered folder is searched for projects and for the audio a project refers to — so adding the folder a project lives in is what lets its audio reload automatically.">Add Folder…</button>
           </div>
           <div class="setup-row">
             <button id="projBrowseBtn" title="Pick a single .mmvp file the usual way">Browse for file…</button>
@@ -6980,7 +7031,18 @@
   // API (Firefox, Safari) keep the original <input type=file>/download flow
   // untouched, and the "Projects Folder" UI just says so instead of showing.
   const hasFSA = 'showDirectoryPicker' in window;
-  let projDirHandle = null; // FileSystemDirectoryHandle, once chosen/restored
+  // Several folders, not one. Work lives in more than one place — a show in
+  // its own folder, sketches in another — and a single remembered folder meant
+  // everything outside it opened without its audio, since a file picked
+  // through <input type=file> exposes only that one file and never its
+  // siblings. Every remembered folder is searched, for projects and for the
+  // audio a project refers to.
+  let projDirs = [];        // FileSystemDirectoryHandle[], in the order added
+  // The write target: Save Project, and the ISF copy-into-project-folder
+  // helpers, all need ONE folder rather than a list. It follows the project
+  // you opened — open a project out of a folder and saving goes back there —
+  // and otherwise defaults to the first remembered folder.
+  let projDirHandle = null;
 
   function idbOpen(){ return new Promise((res,rej)=>{ const rq=indexedDB.open('mmv-fsa',1);
     rq.onupgradeneeded=()=>rq.result.createObjectStore('handles');
@@ -7000,21 +7062,87 @@
     if(await handle.requestPermission(opts)==='granted') return true;
     return false;
   }
+  // What to restore, given whatever the two storage keys hold. Split out as a
+  // plain function so the pre-v0.9.56 migration is testable without a real
+  // IndexedDB round trip — directory handles cannot survive one in a test.
+  // Older builds stored a single handle under 'projectsDir'; it becomes the
+  // first entry of the list rather than making the user re-pick it.
+  function pickStoredProjDirs(list,single){
+    if(Array.isArray(list)) return list;
+    return single?[single]:[];
+  }
+  async function saveProjDirs(){
+    try{ await idbSet('projectsDirs',projDirs); }
+    catch(e){ /* IndexedDB unavailable — folders just won't survive this session */ }
+  }
+  // Two handles for the same directory are different objects, so identity
+  // comparison never catches a re-pick of a folder already in the list.
+  async function projDirIndexOf(handle){
+    for(let i=0;i<projDirs.length;i++){
+      try{ if(await projDirs[i].isSameEntry(handle)) return i; }catch(e){ /* stale handle — skip */ }
+    }
+    return -1;
+  }
   async function restoreProjDir(){
     if(!hasFSA) return;
     try{
-      const h=await idbGet('projectsDir');
-      if(h && await h.queryPermission({mode:'read'})==='granted') projDirHandle=h;
-    }catch(e){ /* IndexedDB unavailable, or the handle no longer resolves — user can re-pick */ }
+      const list=pickStoredProjDirs(await idbGet('projectsDirs'), await idbGet('projectsDir'));
+      const ok=[];
+      for(const h of list){
+        // Only folders the browser still considers granted: re-requesting
+        // permission needs a user gesture, and page load isn't one.
+        try{ if(await h.queryPermission({mode:'read'})==='granted') ok.push(h); }catch(e){ /* handle no longer resolves */ }
+      }
+      projDirs=ok;
+      projDirHandle=projDirs[0]||null;
+    }catch(e){ /* IndexedDB unavailable, or handles no longer resolve — user can re-pick */ }
+    renderProjFolders();
   }
   async function pickProjectsFolder(){
     if(!hasFSA) return;
     try{
       const h=await window.showDirectoryPicker({id:'mmv-projects',mode:'readwrite'});
-      projDirHandle=h; await idbSet('projectsDir',h);
-      flash('Projects folder set: '+h.name);
-      renderProjList();
-    }catch(e){ if(e.name!=='AbortError') flash('Could not set projects folder: '+e.message); }
+      const existing=await projDirIndexOf(h);
+      if(existing>=0){ flash('Already remembered: '+h.name); return; }
+      projDirs.push(h);
+      if(!projDirHandle) projDirHandle=h;
+      await saveProjDirs();
+      renderProjFolders(); renderProjList();
+      // Adding the folder a project's audio actually lives in is the whole
+      // reason to add one, so retry the open project's clips straight away
+      // rather than making the user close and reopen it to find out.
+      const found=await reloadProjectAudioClips();
+      flash('Folder added: '+h.name+(found?' — reloaded '+found+' audio clip'+(found===1?'':'s'):''));
+      if(found) requestDraw();
+    }catch(e){ if(e.name!=='AbortError') flash('Could not add folder: '+e.message); }
+  }
+  async function removeProjectFolder(i){
+    if(i<0||i>=projDirs.length) return;
+    const gone=projDirs.splice(i,1)[0];
+    if(projDirHandle===gone) projDirHandle=projDirs[0]||null;
+    await saveProjDirs();
+    renderProjFolders(); renderProjList();
+    flash('Folder removed: '+(gone&&gone.name?gone.name:'(folder)'));
+  }
+  function renderProjFolders(){
+    const el=$('projFolders'); if(!el) return;
+    el.textContent='';
+    if(!hasFSA){ const s=document.createElement('span'); s.className='hint';
+      s.textContent='Not supported in this browser.'; el.appendChild(s); return; }
+    if(!projDirs.length){ const s=document.createElement('span'); s.className='hint';
+      s.textContent='None yet — add one so projects and their audio can be found.'; el.appendChild(s); return; }
+    projDirs.forEach((h,i)=>{
+      const row=document.createElement('div');
+      row.className='pf'+(h===projDirHandle?' primary':'');
+      const nm=document.createElement('span'); nm.className='nm';
+      nm.textContent=h.name||'(folder)';
+      nm.title=(h===projDirHandle?'Saves are written here. ':'')+'Searched for projects and for audio.';
+      const del=document.createElement('button');
+      del.textContent='×'; del.title='Stop searching this folder';
+      del.addEventListener('click',()=>removeProjectFolder(i));
+      row.appendChild(nm); row.appendChild(del);
+      el.appendChild(row);
+    });
   }
   const AUDIO_EXTS=['wav','mp3','ogg','flac','m4a','aac'];
   // Subfolders (relative to the Projects Folder) checked, in order, if the
@@ -7028,21 +7156,33 @@
   // fallback below and by the per-clip reload a multi-clip project needs.
   // `exts` lets a caller that already knows the full filename (a saved clip)
   // ask for that exact name instead of probing every audio extension.
+  // Every remembered folder, the one the current project came from first —
+  // so a name that exists in two folders resolves to the copy sitting beside
+  // the project rather than to whichever folder happens to be listed first.
+  function projDirsToSearch(){
+    const out=[];
+    if(projDirHandle) out.push(projDirHandle);
+    projDirs.forEach(h=>{ if(h!==projDirHandle) out.push(h); });
+    return out;
+  }
   async function findProjectAudio(baseName,exts){
-    if(!projDirHandle) return null;
-    if(!await verifyDirPermission(projDirHandle,false)) return null;
-    const dirs=[{h:projDirHandle,label:''}];
-    for(const sub of AUDIO_SUBDIRS){
-      try{ dirs.push({h:await projDirHandle.getDirectoryHandle(sub),label:sub+'/'}); }
-      catch(e){ /* no such subfolder — fine */ }
-    }
-    for(const d of dirs){
-      for(const ext of (exts||AUDIO_EXTS)){
-        const name=ext?baseName+'.'+ext:baseName;
-        try{
-          const fh=await d.h.getFileHandle(name);
-          return {file:await fh.getFile(), label:d.label+name};
-        }catch(e){ /* not found here — try the next one */ }
+    for(const root of projDirsToSearch()){
+      let ok=false;
+      try{ ok=await verifyDirPermission(root,false); }catch(e){ ok=false; }
+      if(!ok) continue; // permission gone for this one — the others may still work
+      const dirs=[{h:root,label:''}];
+      for(const sub of AUDIO_SUBDIRS){
+        try{ dirs.push({h:await root.getDirectoryHandle(sub),label:sub+'/'}); }
+        catch(e){ /* no such subfolder — fine */ }
+      }
+      for(const d of dirs){
+        for(const ext of (exts||AUDIO_EXTS)){
+          const name=ext?baseName+'.'+ext:baseName;
+          try{
+            const fh=await d.h.getFileHandle(name);
+            return {file:await fh.getFile(), label:(root===projDirHandle?'':root.name+'/')+d.label+name};
+          }catch(e){ /* not found here — try the next one */ }
+        }
       }
     }
     return null;
@@ -7060,9 +7200,10 @@
   // so reopening restores the running order instead of making you rebuild it.
   async function reloadProjectAudioClips(){
     const cs=audioClips();
-    if(!cs.length||!projDirHandle) return 0;
+    if(!cs.length||!projDirs.length) return 0;
     let loaded=0;
     for(const c of cs.slice()){
+      if(audioBufs.has(c.id)) continue; // already has its audio — nothing to find
       // Exact saved filename first; a re-render that changed format (a .wav
       // swapped for the .mp3 it was bounced to) still resolves by basename.
       const hit=await findProjectAudio(c.name,[''])
@@ -7072,19 +7213,19 @@
     return loaded;
   }
   // Called whenever a project finishes loading (see loadProject below) — the
-  // single place that decides whether a sibling audio file can be found and
-  // loaded automatically. Requires a Projects Folder handle to already have
-  // been granted (via "Choose Projects Folder…"): a plain <input type=file>
-  // picker never exposes sibling files to the page, so without that handle
-  // this is a documented, silent no-op and the user reloads audio by hand,
-  // same as before. When a handle IS available, it's tried regardless of how
-  // the project itself was opened — Recent Projects list, Browse for file,
-  // or the plain Load button fallback in browsers without File System Access.
+  // single place that decides whether a project's audio can be found and
+  // loaded automatically. Requires at least one remembered folder (via "Add
+  // Folder…"): a plain <input type=file> picker never exposes sibling files to
+  // the page, so with no folder this is a documented, silent no-op and the
+  // user reloads audio by hand, same as before. When folders ARE available
+  // they're all searched, regardless of how the project itself was opened —
+  // Recent Projects list, Browse for file, or the plain Load button fallback
+  // in browsers without File System Access.
   // Prefers the project's own saved audioFile name (so a renamed/relocated
   // basename still resolves), then falls back to a file sharing the
   // project's own basename across the usual audio extensions.
   async function autoLoadProjectAudio(data,baseName){
-    if(!projDirHandle) return false;
+    if(!projDirs.length) return false;
     // A project that saved a clip arrangement restores that arrangement —
     // the single-file paths below are only for projects that never had one.
     if(audioClips().length){
@@ -7103,15 +7244,22 @@
     }
     return false;
   }
+  // Across every remembered folder, newest first, each entry carrying the
+  // folder it came from so opening it can point saves back at the right place.
   async function listProjectFiles(){
-    if(!projDirHandle) return [];
-    if(!await verifyDirPermission(projDirHandle,false)) return [];
     const out=[];
-    for await (const [name,handle] of projDirHandle.entries()){
-      if(handle.kind==='file' && /\.mmvp$/i.test(name)){
-        const file=await handle.getFile();
-        out.push({name,handle,lastModified:file.lastModified});
-      }
+    for(const root of projDirs){
+      let ok=false;
+      try{ ok=await verifyDirPermission(root,false); }catch(e){ ok=false; }
+      if(!ok) continue;
+      try{
+        for await (const [name,handle] of root.entries()){
+          if(handle.kind==='file' && /\.mmvp$/i.test(name)){
+            const file=await handle.getFile();
+            out.push({name,handle,lastModified:file.lastModified,dir:root});
+          }
+        }
+      }catch(e){ /* folder went away — the others still list */ }
     }
     out.sort((a,b)=>b.lastModified-a.lastModified);
     return out;
@@ -7119,19 +7267,33 @@
   async function renderProjList(){
     const list=$('projList'); if(!list) return;
     if(!hasFSA){ list.innerHTML='<span class="hint">Not supported in this browser — use Browse for file.</span>'; return; }
-    if(!projDirHandle){ list.innerHTML='<span class="hint">No folder set yet — choose one below.</span>'; return; }
+    if(!projDirs.length){ list.innerHTML='<span class="hint">No folders yet — add one below.</span>'; return; }
     list.innerHTML='<span class="hint">Loading…</span>';
     const files=await listProjectFiles();
-    if(!files.length){ list.innerHTML='<span class="hint">No .mmvp files found in '+projDirHandle.name+'.</span>'; return; }
+    if(!files.length){ list.innerHTML='<span class="hint">No .mmvp files found in '
+      +(projDirs.length===1?projDirs[0].name:projDirs.length+' folders')+'.</span>'; return; }
     list.innerHTML='';
+    const showFolder=projDirs.length>1;
     for(const f of files){
       const b=document.createElement('button');
       const nameSpan=document.createElement('span'); nameSpan.textContent=f.name.replace(/\.mmvp$/i,'');
+      b.appendChild(nameSpan);
+      // Which folder each project came from only matters once there is more
+      // than one to tell apart.
+      if(showFolder && f.dir){
+        const tag=document.createElement('span'); tag.className='projFolderTag';
+        tag.textContent=f.dir.name; b.appendChild(tag);
+      }
       const timeSpan=document.createElement('span'); timeSpan.className='projFileTime'; timeSpan.textContent=new Date(f.lastModified).toLocaleDateString();
-      b.appendChild(nameSpan); b.appendChild(timeSpan);
-      b.title='Open '+f.name;
+      b.appendChild(timeSpan);
+      b.title='Open '+f.name+(f.dir?'  ('+f.dir.name+')':'');
       b.addEventListener('click',async()=>{
         $('projPopover').classList.remove('open');
+        // Opening a project out of a folder makes that folder the write
+        // target, so Save goes back where the project came from rather than
+        // to whichever folder happens to be first in the list. It also puts
+        // that folder at the front of the audio search.
+        if(f.dir){ projDirHandle=f.dir; renderProjFolders(); }
         const file=await f.handle.getFile();
         loadProject(file);
       });
@@ -7179,7 +7341,14 @@
         const audioLoaded=await autoLoadProjectAudio(data,baseName);
         if(!audioLoaded){
           const n=audioClips().length;
-          if(n>1) flash('Project loaded. '+n+' audio clips could not be found — use Add to point at the files again.');
+          // Name the actual remedy. With no folder remembered there is nothing
+          // to search, and adding the folder the project lives in is what makes
+          // this automatic from then on.
+          const how=hasFSA&&!projDirs.length
+            ? ' — add its folder under Load Project ▸ Add Folder… so it reloads automatically'
+            : (hasFSA ? ' — if they live elsewhere, add that folder under Load Project ▸ Add Folder…' : '');
+          if(n>1) flash('Project loaded. '+n+' audio clips could not be found'+how+'.');
+          else if(n===1) flash('Project loaded. Audio not found: '+audioClips()[0].name+how+'.');
           else if(data.audioFile) flash('Project loaded. Reload audio file: '+data.audioFile);
           else flash('Project loaded');
         }
@@ -9242,7 +9411,7 @@
   $('loadProjectBtn').addEventListener('click',e=>{ e.stopPropagation();
     if(!hasFSA){ $('projectFileInput').click(); return; }
     const open=$('projPopover').classList.toggle('open');
-    if(open) renderProjList();
+    if(open){ renderProjFolders(); renderProjList(); }
   });
   $('projPickFolderBtn').addEventListener('click',pickProjectsFolder);
   $('projBrowseBtn').addEventListener('click',()=>{ $('projPopover').classList.remove('open'); $('projectFileInput').click(); });
