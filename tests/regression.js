@@ -176,6 +176,7 @@ function buildTestHtml() {
       '  window._TEST_packAudioClips = () => packAudioClips();',
       '  window._TEST_audioEndTick = () => audioEndTick();',
       '  window._TEST_updateAudioOffsetBadge = () => updateAudioOffsetBadge();',
+      '  window._TEST_viewLeftX = () => viewLeftX();',
       // v0.9.53 metronome clock re-anchoring. clickTimeOffset is the bridge
       // between the transport clock and the click AudioContext's own clock.
       '  window._TEST_scheduleClickAt = (wallMs, accent) => scheduleClickAt(wallMs, accent);',
@@ -4119,6 +4120,116 @@ async function run() {
     check('Save Project writes directly into the remembered folder when one is set', savedInDir === true, savedInDir);
 
     await page.evaluate(() => window._TEST_setProjDirHandle(null));
+  });
+
+  // ---------------- The GUTTER dead strip (v0.9.58) ----------------
+
+  await withPage(browser, async (page) => {
+    // beginPane() shifts each pane by -scrollLeft and the pane then shifts by
+    // +GUTTER, so screen x 0 shows content X (scrollLeft - GUTTER). Loops that
+    // started at scrollLeft began GUTTER pixels in, leaving the first 44px of
+    // every row unpainted — a dead strip with no curve, no waveform and no
+    // vertical grid lines, while CC points and the playhead sat correctly
+    // across it. It read as the audio and the automation starting late.
+    const gutter = await page.evaluate(() => window._TEST_GUTTER());
+    check('viewLeftX() is GUTTER to the LEFT of scrollLeft — the content actually at screen x 0',
+      await page.evaluate(() => { window._TEST_state.scrollLeft = 600; return window._TEST_viewLeftX(); }) === 600 - gutter,
+      { gutter });
+
+    const laneId = await page.evaluate(() => {
+      const id = window._TEST_addLane(20, 0);
+      for (let b = 0; b < 40; b++) window._TEST_upsertPoint(id, b * 480, (b % 2) ? 10 : 117);
+      window._TEST_state.bars = 60;
+      return id;
+    });
+
+    // How much of each column is painted, sampled straight off the canvas.
+    // A column carrying the curve and its fill has several distinct colours;
+    // one with only the panel background and horizontal rules has two.
+    const columnRichness = async (scrollLeft) => {
+      await page.evaluate((x) => { window._TEST_state.scrollLeft = x; window._TEST_requestDraw(); }, scrollLeft);
+      await page.waitForTimeout(150);
+      return page.evaluate((id) => {
+        const cv = document.querySelector(`.lane[data-id="${id}"] canvas`);
+        const ctx = cv.getContext('2d');
+        const img = ctx.getImageData(0, 0, cv.width, cv.height).data;
+        const per = [];
+        for (let x = 0; x < Math.min(cv.width, 120); x++) {
+          const seen = new Set();
+          for (let y = 0; y < cv.height; y++) {
+            const i = (y * cv.width + x) * 4;
+            seen.add(img[i] + ',' + img[i + 1] + ',' + img[i + 2]);
+          }
+          per.push(seen.size);
+        }
+        return per;
+      }, laneId);
+    };
+    const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+
+    const scrolled = await columnRichness(600);
+    const stripAvg = avg(scrolled.slice(0, gutter));
+    const bodyAvg = avg(scrolled.slice(gutter, gutter + 40));
+    check('scrolled in, the first GUTTER pixels of a CC lane are painted as fully as the rest of the row',
+      stripAvg > bodyAvg * 0.8, { stripAvg: +stripAvg.toFixed(2), bodyAvg: +bodyAvg.toFixed(2), gutter });
+
+    // At the very start there is genuinely nothing to the left of tick 0, so
+    // the strip is allowed to be emptier — what must not happen is the strip
+    // being blank while the row beside it is full.
+    const atZero = await columnRichness(0);
+    check('...and at scroll 0 the strip is still drawn up to tick 0 rather than left bare',
+      avg(atZero.slice(0, gutter)) > 3, +avg(atZero.slice(0, gutter)).toFixed(2));
+  });
+
+  await withPage(browser, async (page) => {
+    // An audio clip's start marker must stay at the clip's start. It used to
+    // be drawn at the clamped edge of the visible span, so scrolling into a
+    // clip from the left redrew its start line at the left of the screen every
+    // frame — a bright line tracking the viewport, reading as "the audio
+    // begins here" when the real start was far off to the left.
+    const bytes = makeWavBytes(8);
+    await page.evaluate((b) => {
+      const f = new File([new Uint8Array(b)], 'long.wav', { type: 'audio/wav' });
+      return window._TEST_loadAudio(f);
+    }, bytes);
+    await page.waitForTimeout(400);
+    await page.evaluate(() => { window._TEST_state.bars = 40; window._TEST_setClipStart(0, 0); });
+
+    // Accent2 is the selected-clip edge colour. Counted in a band of columns,
+    // below the name plate. Note a clip at tick 0 viewed at scroll 0 draws its
+    // edge at screen x = GUTTER, not 0 — the gutter is to the LEFT of tick 0.
+    const accentNear = async (scrollLeft, fromX, toX) => {
+      await page.evaluate((x) => { window._TEST_state.scrollLeft = x; window._TEST_requestDraw(); }, scrollLeft);
+      await page.waitForTimeout(150);
+      return page.evaluate(([a, b]) => {
+        const cv = document.getElementById('audioCanvas');
+        const ctx = cv.getContext('2d');
+        const css = getComputedStyle(document.documentElement).getPropertyValue('--accent2').trim();
+        const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(css);
+        const want = m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
+        if (!want) return -1;
+        const img = ctx.getImageData(0, 0, cv.width, cv.height).data;
+        let hits = 0;
+        for (let x = Math.max(0, a); x < Math.min(cv.width, b); x++) {
+          for (let y = 20; y < cv.height; y++) {
+            const i = (y * cv.width + x) * 4;
+            if (Math.abs(img[i] - want[0]) < 12 && Math.abs(img[i + 1] - want[1]) < 12 && Math.abs(img[i + 2] - want[2]) < 12) hits++;
+          }
+        }
+        return hits;
+      }, [fromX, toX]);
+    };
+
+    const g = await page.evaluate(() => window._TEST_GUTTER());
+    // Clip starts at tick 0, view at scroll 0 -> its edge belongs at x = GUTTER.
+    const atRealStart = await accentNear(0, g - 3, g + 4);
+    // Same clip, scrolled 4000px in: the real start is now far off to the left,
+    // so nothing of it should be painted at the screen edge.
+    const atScreenEdge = await accentNear(4000, 0, 8);
+    check('the clip\'s start edge is drawn at the clip\'s real start (x = GUTTER for a clip at tick 0)',
+      atRealStart > 5, { atRealStart, gutter: g });
+    check('...and is NOT redrawn at the screen edge once the real start is scrolled off to the left',
+      atScreenEdge === 0, { atScreenEdge, atRealStart });
   });
 
   // ---------------- Multiple project folders (v0.9.56) ----------------

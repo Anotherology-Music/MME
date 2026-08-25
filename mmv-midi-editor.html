@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.57
+  MMV MIDI & CC Curve Editor v0.9.58
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1592,6 +1592,43 @@
 
   Nineteen new checks, including the change request's own worked examples
   carried through to what a CC of 0, 64 and 127 actually lands on.
+
+  v0.9.58 — Two drawing fixes: the dead strip, and the wandering clip edge.
+
+  Reported as a gap at the left of the timeline where curves and the waveform
+  were missing, making the audio look like it started late when it did not,
+  and the diagnosis in the report was right: it was the gutter.
+
+  beginPane() shifts a pane by -state.scrollLeft, and each pane then shifts by
+  +GUTTER so the bar-1 tempo and time-signature labels have somewhere to live.
+  Screen x 0 therefore shows content X (scrollLeft - GUTTER), not scrollLeft —
+  but every drawing loop started at scrollLeft, i.e. 44 pixels in. The first
+  44px of every row went unpainted while anything positioned individually — CC
+  points, the playhead, bar numbers, clip name plates — drew across it at its
+  true position. Hence the specific symptom of dots with no line between them.
+  Measured on a CC lane scrolled 600px in: 2.0 distinct colours per column in
+  the strip against 7.0 in the row beside it; after the fix, 7.3 against 7.0.
+
+  A viewLeftX() helper now names the content X actually at screen x 0, and the
+  ruler, piano roll, velocity row, CC lanes, marker row, grid lines and audio
+  waveform all span from there. At scroll 0 nothing changes: there is no
+  content to the left of tick 0, so the gutter still belongs to the bar-1
+  labels alone.
+
+  Second fix: an audio clip's start edge was drawn at the CLAMPED edge of its
+  visible span rather than at its real start. Scrolling into a clip from the
+  left therefore redrew that bright edge at the left of the screen on every
+  frame — a line that tracked the viewport and read as "the audio begins
+  here" while the real start was far off to the left. Edges are now drawn at
+  the clip's true start and end; off-screen ones simply aren't painted. The
+  name plate still follows the visible part, deliberately, so a clip you have
+  scrolled into the middle of still says which one it is — it is a label along
+  the top, not a start marker.
+
+  Five new checks, sampling actual canvas pixels rather than trusting the
+  arithmetic: how much of each column is painted either side of the gutter
+  boundary, and whether the clip's accent edge appears at its real start
+  (yes) and at the screen edge once scrolled past (no).
 
 -->
 
@@ -3206,6 +3243,16 @@
   // time-signature marker on that same left side, so the gutter has to clear
   // the wider of the two labels ("400 BPM") rather than just "32/16".
   const GUTTER=44;
+  // Content X at the LEFT EDGE of a pane, once it has been translated.
+  // beginPane() shifts by -state.scrollLeft, then each pane shifts by +GUTTER,
+  // so screen x 0 shows content X (scrollLeft - GUTTER) — not scrollLeft.
+  // Drawing loops that began at scrollLeft therefore started GUTTER pixels in,
+  // leaving the first 44px of every row unpainted: a dead strip in which
+  // curves, waveforms and vertical grid lines were all missing, while anything
+  // positioned individually — CC points, the playhead, bar numbers — sat
+  // correctly across it. The effect was a gap that made the audio and the
+  // automation look like they began late when they did not.
+  function viewLeftX(){ return state.scrollLeft-GUTTER; }
   function pitchToY(p){ return (PITCH_MAX-p)*state.noteHeight; }
   function yToPitch(y){ return clamp(PITCH_MAX - Math.floor(y/state.noteHeight), PITCH_MIN, PITCH_MAX); }
   function fracTicks(s){ if(typeof s!=='string') return ticksPerBeat();
@@ -3677,7 +3724,7 @@
       out.push({barIdx,startTick:tick,tpb,tpe}); tick+=tpb; barIdx++; }
     return out;
   }
-  function gridLinesX(ctx,y0,y1,vw){ const sx=state.scrollLeft; const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
+  function gridLinesX(ctx,y0,y1,vw){ const sx=viewLeftX(); const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
     const sub=snapTicks(); const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
     if(state.snap!=='off'&&state.snap!=='bar'&&sub*state.pxPerTick>5){
       ctx.strokeStyle=getCss('--grid'); ctx.lineWidth=1; ctx.beginPath();
@@ -3713,7 +3760,7 @@
     ctx.fillStyle=getCss('--panel2'); ctx.fillRect(sx,0,vw,h);
     ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
     drawLocators(ctx,h);
-    const t0=Math.max(0,xToTick(sx)), t1=Math.min(totalTicks(),xToTick(sx+vw));
+    const t0=Math.max(0,xToTick(viewLeftX())), t1=Math.min(totalTicks(),xToTick(viewLeftX()+vw));
     const bars=barsInView(t0,t1+segTicksPerBar(tsSegAt(t1)));
     const changeAt=new Map(tsMapSorted().filter(s=>s.tick>0).map(s=>[s.tick,s]));
     const tempoChangeAt=new Map(tempoMapSorted().filter(s=>s.tick>0).map(s=>[s.tick,s]));
@@ -3922,11 +3969,16 @@
     // it earlier (content before tick 0 is simply never shown). Each clip then
     // adds its own startTick on top.
     const off=state.audioOffset||0;
-    clips.forEach(c=>drawAudioClip(ctx,c,sx,w,h,off));
+    // Clip content is drawn after the GUTTER translate, so it spans from
+    // viewLeftX() — see that function on why starting at scrollLeft left the
+    // first 44px of the row unpainted and made the audio look like it began
+    // late when it did not.
+    const lx=viewLeftX();
+    clips.forEach(c=>drawAudioClip(ctx,c,lx,w,h,off));
     // zero line, drawn once across the whole row rather than per clip so the
     // gaps between clips still read as a continuous track
     ctx.strokeStyle=getCss('--line'); ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(sx,h/2+0.5); ctx.lineTo(sx+w,h/2+0.5); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(lx,h/2+0.5); ctx.lineTo(lx+w,h/2+0.5); ctx.stroke();
     drawTempoDragGhost(ctx,h);
   }
   const AUDIO_LABEL_H=13;
@@ -3985,12 +4037,18 @@
       ctx.fillText((buf?'':'⚠ ')+c.name,x0+4,AUDIO_LABEL_H/2+0.5);
     }
     ctx.restore();
-    // Edges last and unclipped, so abutting clips still show a seam
+    // Edges last and unclipped, so abutting clips still show a seam. Drawn at
+    // the clip's TRUE start and end (x0f/x1f), never the clamped x0/x1: those
+    // are pinned to the edges of the view, so a clip scrolled into from the
+    // left had its start marker redrawn at the left of the screen on every
+    // frame — a bright line that tracked the viewport and read as "the audio
+    // begins here" when the real start was far off to the left. Off-screen
+    // edges simply aren't painted, which is the correct answer.
     ctx.strokeStyle=sel?getCss('--accent2'):getCss('--line');
     ctx.lineWidth=sel?2:1;
     ctx.beginPath();
-    ctx.moveTo(Math.round(x0)+0.5,0); ctx.lineTo(Math.round(x0)+0.5,h);
-    ctx.moveTo(Math.round(x1)-0.5,0); ctx.lineTo(Math.round(x1)-0.5,h);
+    ctx.moveTo(Math.round(x0f)+0.5,0); ctx.lineTo(Math.round(x0f)+0.5,h);
+    ctx.moveTo(Math.round(x1f)-0.5,0); ctx.lineTo(Math.round(x1f)-0.5,h);
     ctx.stroke();
   }
   function drawKeys(){ const w=keysCanvas.width,h=keysCanvas.height,nh=state.noteHeight;
@@ -4019,7 +4077,7 @@
     for(let p=PITCH_MIN;p<=PITCH_MAX;p++){ const y=Math.round(pitchToY(p))+0.5; ctx.strokeStyle=(p%12===0)?getCss('--gridBeat'):getCss('--grid'); ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(sx,y); ctx.lineTo(sx+vw,y); ctx.stroke(); }
     ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content (grid/notes) shifts right by the gutter
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
-    const t0=xToTick(sx),t1=xToTick(sx+vw);
+    const t0=xToTick(viewLeftX()),t1=xToTick(viewLeftX()+vw);
     const hasSel=state.selection.size>0;
     // Built once per frame rather than searched per note: drawNote runs for
     // every visible note on every draw, and macroById() is a linear scan.
@@ -4108,7 +4166,7 @@
     ctx.strokeStyle=getCss('--grid'); ctx.beginPath(); [0.25,0.5,0.75].forEach(f=>{ const y=Math.round(h*f)+0.5; ctx.moveTo(sx,y); ctx.lineTo(sx+vw,y);}); ctx.stroke();
     ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content shifts right by the gutter
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
-    const t0=xToTick(sx),t1=xToTick(sx+vw);
+    const t0=xToTick(viewLeftX()),t1=xToTick(viewLeftX()+vw);
     const hasSel2=state.selection.size>0;
     function drawVelBar(n,sel){ const x=tickToX(n.start), bh=(n.vel/127)*(h-4), bw=Math.max(2,Math.min(8,tickToX(n.length)));
       ctx.fillStyle=sel?getCss('--sel'):velColor(n.vel); ctx.fillRect(x,h-bh-1,bw,bh);
@@ -4190,10 +4248,16 @@
     ctx.translate(GUTTER,0); // background stays edge-to-edge; tick content (curve/points) shifts right by the gutter
     gridLinesX(ctx,0,h,vw); drawLocators(ctx,h);
     const r=laneRange(lane);
+    // Everything below is drawn AFTER the GUTTER translate, so it has to span
+    // the pane from viewLeftX() — the content X actually at screen x 0 — not
+    // from state.scrollLeft, which is GUTTER pixels further right. Starting at
+    // scrollLeft is what left the curve and its fill missing from the first
+    // 44px while the points scattered across it drew correctly.
+    const lx=viewLeftX();
     ctx.strokeStyle=lane.color; ctx.lineWidth=2; ctx.beginPath();
-    for(let px=0;px<=vw;px+=2){ const cx=sx+px, t=xToTick(cx), v=clamp(laneValueAt(lane,t),r.min,r.max), y=val2yForLane(h,v,lane); if(px===0) ctx.moveTo(cx,y); else ctx.lineTo(cx,y);} ctx.stroke();
-    ctx.lineTo(sx+vw,h); ctx.lineTo(sx,h); ctx.closePath(); ctx.fillStyle=lane.color+'22'; ctx.fill();
-    const t0=xToTick(sx),t1=xToTick(sx+vw); ctx.fillStyle=lane.color;
+    for(let px=0;px<=vw;px+=2){ const cx=lx+px, t=xToTick(cx), v=clamp(laneValueAt(lane,t),r.min,r.max), y=val2yForLane(h,v,lane); if(px===0) ctx.moveTo(cx,y); else ctx.lineTo(cx,y);} ctx.stroke();
+    ctx.lineTo(lx+vw,h); ctx.lineTo(lx,h); ctx.closePath(); ctx.fillStyle=lane.color+'22'; ctx.fill();
+    const t0=xToTick(lx),t1=xToTick(lx+vw); ctx.fillStyle=lane.color;
     const hasExplicitSel=ccSel.size>0;
     const rangeHi=(!hasExplicitSel&&state.locStart!=null&&state.locEnd!=null)?{a:state.locStart,b:state.locEnd}:null;
     for(const p of lane.points){ if(p.t<t0-5||p.t>t1+5) continue; const x=tickToX(p.t), y=val2yForLane(h,p.v,lane); const sel=ccSel.has(p)||(!!rangeHi&&p.t>=rangeHi.a&&p.t<=rangeHi.b); ctx.beginPath(); ctx.arc(x,y,2.6,0,7); ctx.fillStyle=sel?'#ffffff':lane.color; ctx.fill(); } ctx.fillStyle=lane.color;
@@ -9618,7 +9682,7 @@
       ctx.fillText('Section markers — press M, or double-click here, to add one',sx+8,h/2);
       return;
     }
-    const t0=xToTick(sx), t1=xToTick(sx+w);
+    const t0=xToTick(viewLeftX()), t1=xToTick(viewLeftX()+w);
     // Culled by tick span rather than by index: a 37-section show at working
     // zoom has two or three on screen and there is no reason to lay out 34
     // labels nobody can see. The pad is one plate's worth of ticks, so a
