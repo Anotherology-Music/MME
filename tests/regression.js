@@ -177,6 +177,14 @@ function buildTestHtml() {
       '  window._TEST_audioEndTick = () => audioEndTick();',
       '  window._TEST_updateAudioOffsetBadge = () => updateAudioOffsetBadge();',
       '  window._TEST_viewLeftX = () => viewLeftX();',
+      // v0.9.59 project-folder layout.
+      '  window._TEST_normDirName = (s) => normDirName(s);',
+      '  window._TEST_isProjSubdir = (s) => isProjSubdir(s);',
+      '  window._TEST_projSubdirs = () => ({ audio: PROJ_SUBDIR_AUDIO, midi: PROJ_SUBDIR_MIDI, isf: PROJ_SUBDIR_ISF });',
+      '  window._TEST_findSubDirName = async (root, name) => { const h = await findSubDir(root, name); return h ? h.name : null; };',
+      '  window._TEST_writeProjectExport = (sub, fn, txt) => writeProjectExport(sub, fn, txt);',
+      '  window._TEST_exportMidi = () => exportMidi();',
+      '  window._TEST_exportSyncTrack = () => exportSyncTrack();',
       // v0.9.53 metronome clock re-anchoring. clickTimeOffset is the bridge
       // between the transport clock and the click AudioContext's own clock.
       '  window._TEST_scheduleClickAt = (wallMs, accent) => scheduleClickAt(wallMs, accent);',
@@ -3018,8 +3026,10 @@ async function run() {
       ];
       return JSON.parse(window._TEST_buildMagicRequest(entry, refs));
     });
-    check('the request names the shader by absolute path, composed from the Shader folder setting',
-      req.shader === 'C:\\path\\to\\the\\exported\\shader.fs', req.shader);
+    // v0.9.59: the setting became the projects ROOT, and MME appends the ISF
+    // subfolder itself (plus the project folder name, when the project has one).
+    check('the request names the shader by absolute path, composed from the projects root',
+      req.shader === 'C:\\path\\to\\the\\exported\\MME - ISF\\shader.fs', req.shader);
     check('...carries a project name derived from the MME project',
       req.project_name === 'Kali Deep Flight - MME', req.project_name);
     check('...and a source of device + channel, which is what MMV Project Import matches on',
@@ -3046,8 +3056,8 @@ async function run() {
       document.getElementById('isfShaderFolder').value = '/home/me/isf/';
       return window._TEST_magicShaderPath('shader.fs');
     });
-    check('...and a POSIX folder joins with a forward slash, with no doubled separator',
-      fwd === '/home/me/isf/shader.fs', fwd);
+    check('...and a POSIX root joins with forward slashes, with no doubled separator',
+      fwd === '/home/me/isf/MME - ISF/shader.fs', fwd);
   });
 
   await withPage(browser, async (page) => {
@@ -4122,6 +4132,164 @@ async function run() {
     await page.evaluate(() => window._TEST_setProjDirHandle(null));
   });
 
+  // ---------------- Project folder layout (v0.9.59) ----------------
+
+  // A shared mock of the File System Access directory API, with subfolder
+  // creation — enough to exercise discovery, the named subfolders, and where
+  // exports actually land.
+  // Hung off window rather than declared: a class declared inside eval() is
+  // scoped to that eval and never reaches the caller, which is exactly how
+  // this failed the first time.
+  const MOCK_FS = `
+    window.MockFileHandle = class MockFileHandle {
+      constructor(name, content){ this.kind='file'; this.name=name; this._content=content; this._lastModified=Date.now(); }
+      async getFile(){ return new File([this._content], this.name, { lastModified: this._lastModified }); }
+      async createWritable(){ const self=this; return { async write(s){ this._buf=s; }, async close(){ self._content=this._buf; self._lastModified=Date.now(); } }; }
+    };
+    window.MockDirHandle = class MockDirHandle {
+      constructor(name){ this.kind='directory'; this.name=name; this._files=new Map(); this._dirs=new Map(); }
+      async queryPermission(){ return 'granted'; }
+      async requestPermission(){ return 'granted'; }
+      async isSameEntry(o){ return o===this; }
+      async getFileHandle(name, opts){
+        if(!this._files.has(name)){
+          if(opts&&opts.create) this._files.set(name, new window.MockFileHandle(name,''));
+          else { const e=new Error('nf'); e.name='NotFoundError'; throw e; }
+        }
+        return this._files.get(name);
+      }
+      async getDirectoryHandle(name, opts){
+        if(!this._dirs.has(name)){
+          if(opts&&opts.create) this._dirs.set(name, new window.MockDirHandle(name));
+          else { const e=new Error('nf'); e.name='NotFoundError'; throw e; }
+        }
+        return this._dirs.get(name);
+      }
+      async *entries(){
+        for(const [n,h] of this._files) yield [n,h];
+        for(const [n,h] of this._dirs) yield [n,h];
+      }
+      addFile(n,c){ this._files.set(n, new window.MockFileHandle(n,c)); return this; }
+      addDir(n){ const d=new window.MockDirHandle(n); this._dirs.set(n,d); return d; }
+    };
+    window.mkProj = (name)=>JSON.stringify({version:1,projectName:name,snapshot:{notes:[],lanes:[],bpm:120,bars:4,tsNum:4,tsDen:4,tsMap:[{tick:0,num:4,den:4}],ppq:480,next:1,pitchNames:{},projectName:name,locS:null,locE:null}});
+  `;
+
+  await withPage(browser, async (page) => {
+    // Folder names are matched however they are spelled. An exact-name lookup
+    // would quietly create a second folder beside the one already there, and
+    // exports would start landing somewhere the user never looks.
+    const r = await page.evaluate(() => ({
+      variants: ['MME - ISF', 'MME-ISF', 'mme isf', 'mme_isf', 'MME  -  ISF'].map(s => window._TEST_normDirName(s)),
+      subdirs: window._TEST_projSubdirs(),
+      isSub: ['Audio', 'audio', 'MME - MIDI', 'mme-midi', 'Videos', 'Images', 'Audio Stems'].map(s => window._TEST_isProjSubdir(s)),
+    }));
+    check('folder names normalise across casing, spacing and punctuation',
+      new Set(r.variants).size === 1, r.variants);
+    check('the three known subfolders are recognised in any spelling; anything else is left alone',
+      r.isSub.join(',') === 'true,true,true,true,false,false,false', { isSub: r.isSub, subdirs: r.subdirs });
+
+    const found = await page.evaluate(async (fs) => {
+      eval(fs);
+      const p = new window.MockDirHandle('Music Project 1');
+      p.addDir('mme - isf');           // deliberately a different spelling
+      return {
+        exact: await window._TEST_findSubDirName(p, 'MME - ISF'),
+        missing: await window._TEST_findSubDirName(p, 'MME - MIDI'),
+      };
+    }, MOCK_FS);
+    check('...so an existing folder is found rather than a near-duplicate created beside it',
+      found.exact === 'mme - isf' && found.missing === null, found);
+  });
+
+  await withPage(browser, async (page) => {
+    // Discovery: projects directly in the remembered folder (the flat layout
+    // that has always worked) AND one per subfolder, but never deeper — a
+    // project's Videos/Images folders must cost nothing to ignore.
+    await page.evaluate(async (fs) => {
+      eval(fs);
+      const root = new window.MockDirHandle('Visuals');
+      root.addFile('loose-project.mmvp', window.mkProj('loose'));      // flat layout
+      const p1 = root.addDir('Music Project 1');
+      p1.addFile('show.mmvp', window.mkProj('show'));
+      p1.addFile('show.magic', 'not ours');
+      p1.addDir('Audio').addFile('song.wav', 'x');
+      p1.addDir('MME - MIDI');
+      const vids = p1.addDir('Videos');
+      vids.addDir('nested').addFile('buried.mmvp', window.mkProj('buried')); // must NOT be found
+      const p2 = root.addDir('Music Project 2');
+      p2.addFile('second.mmvp', window.mkProj('second'));
+      window._TEST_setProjDirs([root]);
+      window.__root = root;
+    }, MOCK_FS);
+
+    const listed = await page.evaluate(() => window._TEST_listProjectFiles());
+    const names = listed.map(f => f.name).sort();
+    check('projects are found both loose in the folder and one level down, in their own folders',
+      names.join(',') === 'loose-project.mmvp,second.mmvp,show.mmvp', names);
+    check('...each tagged with the folder that actually contains it, not the folder you added',
+      listed.find(f => f.name === 'show.mmvp').dir === 'Music Project 1'
+      && listed.find(f => f.name === 'loose-project.mmvp').dir === 'Visuals', listed);
+    check('...and nothing two levels down is picked up, so a Videos folder costs nothing to ignore',
+      !names.includes('buried.mmvp'), names);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  await withPage(browser, async (page) => {
+    // Exports land in the open project's own folders, creating them on first
+    // use so the names never have to be typed.
+    const out = await page.evaluate(async (fs) => {
+      eval(fs);
+      const projectFolder = new window.MockDirHandle('Music Project 1');
+      window._TEST_setProjDirs([new window.MockDirHandle('Visuals')]);
+      window._TEST_setProjDirPrimary(projectFolder);   // as if this project were open
+      const wrote = await window._TEST_writeProjectExport('MME - MIDI', 'show.mid', 'bytes');
+      return {
+        wrote,
+        madeFolder: projectFolder._dirs.has('MME - MIDI'),
+        hasFile: projectFolder._dirs.has('MME - MIDI') && projectFolder._dirs.get('MME - MIDI')._files.has('show.mid'),
+      };
+    }, MOCK_FS);
+    check('an export creates its subfolder on first use and writes into it',
+      out.wrote === 'MME - MIDI/show.mid' && out.madeFolder && out.hasFile, out);
+
+    // With no project folder at all there is nowhere to file it, so the export
+    // must fall back rather than guess.
+    const none = await page.evaluate(async () => {
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      return window._TEST_writeProjectExport('MME - MIDI', 'show.mid', 'bytes');
+    });
+    check('...and with no project folder open it reports nowhere to write, for the caller to fall back to a download',
+      none === null, none);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Magic request's absolute path is composed from one root setting plus
+    // what MME already knows, so it does not need re-editing per project.
+    const r = await page.evaluate(async (fs) => {
+      eval(fs);
+      document.getElementById('isfShaderFolder').value = 'C:\\Visuals';
+      const root = new window.MockDirHandle('Visuals');
+      const p1 = new window.MockDirHandle('Music Project 1');
+      window._TEST_setProjDirs([root]);
+      window._TEST_setProjDirPrimary(p1);
+      const nested = window._TEST_magicShaderPath('shader.fs');
+      window._TEST_setProjDirPrimary(root);           // flat layout: root IS the project folder
+      const flat = window._TEST_magicShaderPath('shader.fs');
+      document.getElementById('isfShaderFolder').value = '';
+      const unset = window._TEST_magicShaderPath('shader.fs');
+      return { nested, flat, unset };
+    }, MOCK_FS);
+    check('the shader path is composed from the root, the project folder and the ISF folder',
+      r.nested === 'C:\\Visuals\\Music Project 1\\MME - ISF\\shader.fs', r.nested);
+    check('...with no project-folder segment repeated when the remembered folder IS the project folder',
+      r.flat === 'C:\\Visuals\\MME - ISF\\shader.fs', r.flat);
+    check('...and with no root set it still names the shader by filename rather than inventing a path',
+      r.unset === 'shader.fs', r.unset);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
   // ---------------- The GUTTER dead strip (v0.9.58) ----------------
 
   await withPage(browser, async (page) => {
@@ -4410,7 +4578,7 @@ async function run() {
         }
       }
       class MockDirHandle {
-        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); }
+        constructor(name) { this.kind = 'directory'; this.name = name; this._files = new Map(); this._dirs = new Map(); }
         async queryPermission() { return 'granted'; }
         async requestPermission() { return 'granted'; }
         async getFileHandle(name, opts) {
@@ -4420,8 +4588,22 @@ async function run() {
           }
           return this._files.get(name);
         }
+        // v0.9.59: shader copies live in the project's "MME - ISF" subfolder,
+        // so the mock has to be able to hand one out (and create it).
+        async getDirectoryHandle(name, opts) {
+          if (!this._dirs.has(name)) {
+            if (opts && opts.create) this._dirs.set(name, new MockDirHandle(name));
+            else { const e = new Error('not found'); e.name = 'NotFoundError'; throw e; }
+          }
+          return this._dirs.get(name);
+        }
+        async *entries() {
+          for (const [n, h] of this._files) yield [n, h];
+          for (const [n, h] of this._dirs) yield [n, h];
+        }
       }
       window.__mockIsfDir = new MockDirHandle('MyProjects');
+      window.__isfSub = () => window.__mockIsfDir._dirs.get('MME - ISF');
       window._TEST_setProjDirHandle(window.__mockIsfDir);
     });
 
@@ -4433,9 +4615,15 @@ async function run() {
     await page.click('#isfDialog button:has-text("Import Lanes")');
     await page.waitForTimeout(150); // copyIsfToProjectFolder is fire-and-forget async — give it a moment
 
-    const afterImport = await page.evaluate(() => [...window.__mockIsfDir._files.keys()]);
-    check('Import copies the working "(MME)" file into the Projects Folder (not the raw uploaded name)',
-      afterImport.includes('inplace (MME).fs') && !afterImport.includes('inplace.fs'), afterImport);
+    // v0.9.59: into the project's own "MME - ISF" folder, created on demand,
+    // rather than loose in the projects folder.
+    const afterImport = await page.evaluate(() => {
+      const sub = window.__isfSub();
+      return { sub: sub ? [...sub._files.keys()] : null, root: [...window.__mockIsfDir._files.keys()] };
+    });
+    check('Import copies the working "(MME)" file into the project\'s MME - ISF folder (not the raw uploaded name, not loose in the root)',
+      !!afterImport.sub && afterImport.sub.includes('inplace (MME).fs')
+      && !afterImport.sub.includes('inplace.fs') && afterImport.root.length === 0, afterImport);
 
     const entryId = await page.evaluate(() => window._TEST_state.isfHistory[window._TEST_state.isfHistory.length - 1].id);
     await page.evaluate((id) => window._TEST_openMigrateSheetById(id), entryId);
@@ -4446,8 +4634,8 @@ async function run() {
     await page.click('#isfMigrateDialog button:has-text("Export")');
     await page.waitForTimeout(300);
 
-    const folderContent = await page.evaluate(() => window.__mockIsfDir._files.get('inplace (MME).fs')._content);
-    check('Export updates the SAME file already in the Projects Folder in place, not a browser download',
+    const folderContent = await page.evaluate(() => window.__isfSub()._files.get('inplace (MME).fs')._content);
+    check('Export updates the SAME file Import already put in MME - ISF, in place, not a browser download',
       !downloadFired && typeof folderContent === 'string' && folderContent.includes('MME Migration Notes'), { downloadFired, hasContent: typeof folderContent === 'string' });
 
     await page.evaluate(() => window._TEST_setProjDirHandle(null));

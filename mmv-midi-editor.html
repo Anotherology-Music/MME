@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.58
+  MMV MIDI & CC Curve Editor v0.9.59
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1630,6 +1630,59 @@
   boundary, and whether the clip's accent edge appears at its real start
   (yes) and at the screen edge once scrolled past (no).
 
+  v0.9.59 — A folder per project, and exports that live inside it.
+
+  A remembered folder could only hold projects directly, and most exports went
+  to the browser's Downloads, so a project's pieces ended up scattered across
+  two places that had nothing to do with each other. A remembered folder can
+  now hold one folder per project:
+
+    Visuals/                  <- the folder you add to MME
+      Music Project 1/
+        project.mmvp
+        project.magic         <- MME never touches this
+        Audio/                <- audio, looked up by the saved filename
+        MME - MIDI/           <- .mid exports and the sync track
+        MME - ISF/            <- shader working copy, wiring sheet, requests
+        Videos/ Images/ ...   <- MME never looks inside these
+
+  Discovery goes exactly two levels: .mmvp files loose in the remembered folder
+  (the flat layout, which still works untouched) and .mmvp files one level down
+  in their own folders. Never deeper. Only the three MME subfolder names are
+  ever known, and they are asked for BY NAME rather than enumerated, so a
+  project folder full of video files costs nothing to skip. The work is
+  proportional to how many projects there are, not how many files.
+
+  Recent Projects lists both layouts together, tagging each entry with the
+  folder that actually contains it. Opening a project makes THAT folder the
+  active one, so Save goes back to it, exports are filed under it, and its own
+  Audio/ leads the audio search — which matters more than it sounds, because
+  with a folder per project the same filename ("03-bridge-narrative.mp3") now
+  exists in several of them, and the copy beside the open project has to win.
+
+  MIDI exports, the sync track and the ISF wiring sheet no longer go to
+  Downloads; they are written into the project, with the subfolder created on
+  first use so those names never have to be typed. Folder names are matched
+  case- and spacing-insensitively, so "MME - ISF", "MME-ISF" and "mme isf" are
+  one folder rather than three — an exact-name lookup would have quietly made a
+  second folder beside the one already there and filed exports where nobody was
+  looking. With no project folder at all (a project never opened or saved from
+  one), exports fall back to a download and say why rather than guessing.
+
+  ISF import and export deliberately SHARE one folder. The imported working
+  copy is what Export ISF updates in place, so MMV can point at a single file
+  that keeps improving; separate import and export folders would leave two
+  copies with MMV loading the stale one, and every Export ISF would appear to
+  do nothing.
+
+  The Create Magic project path setting is now the projects ROOT rather than a
+  shader folder, because MME can supply the rest itself: "C:\Visuals" becomes
+  "C:\Visuals\Music Project 1\MME - ISF\shader.fs". One setting covers every
+  project instead of needing an edit per project.
+
+  Thirteen new checks, including that a .mmvp two levels down is NOT found —
+  the guarantee that a project's Videos folder is never walked.
+
 -->
 
 
@@ -2571,12 +2624,12 @@
           <div class="setup-note">Opens your ISF Catalogue in a new tab. A browser cannot launch a <code>.cmd</code> (or any program) &mdash; that is a hard security rule, not an MME limitation &mdash; so point this at the catalogue&rsquo;s <code>.html</code> file. A <code>file://</code> address only works when MME itself was opened from a file; if you are running MME from a web address, the browser will refuse the link, and you should serve the catalogue over <code>http://</code> and paste that address here instead.</div>
 
           <div class="setup-row setup-sub-row">
-            <span class="lbl">Shader folder</span>
+            <span class="lbl">Projects root path</span>
             <input type="text" id="isfShaderFolder" style="flex:1 1 240px;min-width:160px;"
-              placeholder="C:\Users\YourName\ISF\_shaders"
-              title="Absolute path of the folder your exported shaders end up in. Used only to fill in the shader path in a Create Magic project request. Saved in this browser.">
+              placeholder="C:\Visuals"
+              title="Absolute path of the folder that holds your projects — the same folder you added under Load Project. MME appends the project folder and MME - ISF itself. Used only to fill in the shader path in a Create Magic project request. Saved in this browser.">
           </div>
-          <div class="setup-note">Only needed for <b>Create Magic project</b>. A browser is never told where on disk a folder actually is &mdash; it is handed a permission to read the folder, not its path &mdash; so the generated project request cannot work out the shader&rsquo;s absolute path on its own. Paste the folder here once and MME will compose it. Leave it empty and the request names the shader by filename alone, for the catalogue to resolve next to the request file.</div>
+          <div class="setup-note">Only needed for <b>Create Magic project</b>. A browser is never told where on disk a folder actually is &mdash; it is handed permission to read the folder, not its path &mdash; so the generated request cannot work out the shader&rsquo;s absolute path on its own. Give the <b>root</b> once and MME composes the rest from what it already knows: <code>C:\Visuals</code> becomes <code>C:\Visuals\Music Project 1\MME - ISF\shader.fs</code>. Leave it empty and the request names the shader by filename alone, for the catalogue to resolve next to the request file.</div>
 
           <div class="setup-subtitle">KEY NAMES</div>
           <div class="setup-row setup-sub-row">
@@ -7118,10 +7171,25 @@
     const th=[0x4D,0x54,0x72,0x6B,(trk.length>>24)&255,(trk.length>>16)&255,(trk.length>>8)&255,trk.length&255];
     return new Uint8Array([...hdr,...th,...trk]); }
   function projFilename(suffix){ return (state.projectName.trim()||'mmv-curve').replace(/[^a-z0-9_\-. ]/gi,'_')+suffix; }
-  function exportMidi(){
+  // Exports land in the open project's own "MME - MIDI" folder rather than the
+  // browser's Downloads, so everything a project needs travels with it when
+  // the folder is copied or archived. With no project folder to write into —
+  // a project never opened or saved from one — it falls back to a download and
+  // says why, rather than silently putting it somewhere unexpected.
+  function downloadBytes(bytes,filename,mime){
+    const blob=new Blob([bytes],{type:mime||'application/octet-stream'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=filename; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  }
+  async function exportMidiFile(bytes,filename){
+    const wrote=await writeProjectExport(PROJ_SUBDIR_MIDI,filename,new Blob([bytes],{type:'audio/midi'}));
+    if(wrote) flash('Exported '+wrote);
+    else { downloadBytes(bytes,filename,'audio/midi'); flash('Downloaded '+filename+' — open or save the project from a folder to file exports with it.'); }
+  }
+  async function exportMidi(){
     const opts={soloOnly:$('exportSoloOnly').checked,excludeMuted:$('exportExcludeMuted').checked};
-    const bytes=buildMidi(opts); const blob=new Blob([bytes],{type:'audio/midi'});
-    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=projFilename('.mid'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+    await exportMidiFile(buildMidi(opts),projFilename('.mid'));
+  }
 
   function buildSyncTrack(){
     // Generates a Type 0 MIDI file with one short Ch16 note per beat.
@@ -7147,8 +7215,7 @@
     const th=[0x4D,0x54,0x72,0x6B,(trk.length>>24)&255,(trk.length>>16)&255,(trk.length>>8)&255,trk.length&255];
     return new Uint8Array([...hdr,...th,...trk]);
   }
-  function exportSyncTrack(){ const bytes=buildSyncTrack(); const blob=new Blob([bytes],{type:'audio/midi'});
-    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=projFilename('-sync.mid'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
+  async function exportSyncTrack(){ await exportMidiFile(buildSyncTrack(),projFilename('-sync.mid')); }
 
   // ---------- File System Access (recent projects, direct folder save, auto-audio) ----------
   // Chromium-only convenience layer for local use: remembering a "Projects
@@ -7273,11 +7340,71 @@
       el.appendChild(row);
     });
   }
+  // ---- Project folder layout ----------------------------------------------
+  // A remembered folder can hold projects directly (the flat layout MME has
+  // always had), or hold one folder per project — which is what lets a project
+  // keep its audio and its exports beside it and travel as one thing when you
+  // copy or archive it.
+  //
+  //   Visuals/                  <- the folder you add to MME
+  //     Music Project 1/
+  //       project.mmvp
+  //       project.magic         <- MME never touches this
+  //       Audio/                <- audio, looked up by the saved filename
+  //       MME - MIDI/           <- .mid exports and the sync track
+  //       MME - ISF/            <- shader working copy, wiring sheet, requests
+  //       Videos/ Images/ ...   <- MME never looks inside these
+  //
+  // Only these three names are ever known. Everything else in a project folder
+  // is left alone: MME asks for a subfolder BY NAME rather than enumerating,
+  // so a folder of video files costs nothing to ignore.
+  const PROJ_SUBDIR_AUDIO='Audio';
+  const PROJ_SUBDIR_MIDI='MME - MIDI';
+  const PROJ_SUBDIR_ISF='MME - ISF';
+  const PROJ_SUBDIRS=[PROJ_SUBDIR_AUDIO,PROJ_SUBDIR_MIDI,PROJ_SUBDIR_ISF];
+  // Matched case-insensitively and with spacing/punctuation ignored, so
+  // "MME - ISF", "MME-ISF" and "mme isf" are one folder rather than three.
+  // An exact-name lookup would quietly create a second folder beside the one
+  // already there, and the user would never see why exports went missing.
+  function normDirName(s){ return String(s||'').toLowerCase().replace(/[\s._-]+/g,''); }
+  function isProjSubdir(name){ const n=normDirName(name); return PROJ_SUBDIRS.some(function(s){ return normDirName(s)===n; }); }
+  async function findSubDir(root,name){
+    if(!root) return null;
+    try{ return await root.getDirectoryHandle(name); }catch(e){ /* try a spelling variant below */ }
+    const want=normDirName(name);
+    try{
+      for await (const [n,h] of root.entries()){
+        if(h.kind==='directory'&&normDirName(n)===want) return h;
+      }
+    }catch(e){ /* unreadable — treated as absent */ }
+    return null;
+  }
+  // Same, but creates the folder when it isn't there. Only ever called on the
+  // way to writing a file into it, so MME never litters folders it didn't use.
+  async function ensureSubDir(root,name){
+    const found=await findSubDir(root,name);
+    if(found) return found;
+    try{ return await root.getDirectoryHandle(name,{create:true}); }catch(e){ return null; }
+  }
+  // Writes an export into the open project's folder, under one of the known
+  // subfolders. Returns the path written, or null if there is nowhere to put
+  // it — a project that has never been opened or saved from a folder has no
+  // folder, and the caller falls back to a download rather than guessing.
+  async function writeProjectExport(subdir,filename,data){
+    if(!projDirHandle) return null;
+    try{
+      if(!await verifyDirPermission(projDirHandle,true)) return null;
+      const dir=await ensureSubDir(projDirHandle,subdir);
+      if(!dir) return null;
+      const fh=await dir.getFileHandle(filename,{create:true});
+      const w=await fh.createWritable(); await w.write(data); await w.close();
+      return subdir+'/'+filename;
+    }catch(e){ return null; }
+  }
   const AUDIO_EXTS=['wav','mp3','ogg','flac','m4a','aac'];
-  // Subfolders (relative to the Projects Folder) checked, in order, if the
-  // audio isn't sitting right next to the .mmvp — an "Audio" subfolder is a
-  // common way to keep a project directory tidy when there are several takes.
-  const AUDIO_SUBDIRS=['Audio','audio'];
+  // (The "Audio" subfolder this used to list explicitly, in both casings, is
+  // now PROJ_SUBDIR_AUDIO looked up through findSubDir, which matches any
+  // casing or spacing rather than the two spellings that were hard-coded.)
   // Returns true/false so callers (notably autoLoadProjectAudio below) can
   // fall back to a different name to try, or skip the "reload it yourself"
   // flash once this already succeeded.
@@ -7300,10 +7427,13 @@
       try{ ok=await verifyDirPermission(root,false); }catch(e){ ok=false; }
       if(!ok) continue; // permission gone for this one — the others may still work
       const dirs=[{h:root,label:''}];
-      for(const sub of AUDIO_SUBDIRS){
-        try{ dirs.push({h:await root.getDirectoryHandle(sub),label:sub+'/'}); }
-        catch(e){ /* no such subfolder — fine */ }
-      }
+      // The project's own Audio/ folder, matched however it is spelled. With a
+      // folder per project the same filename ("03-bridge-narrative.mp3") will
+      // exist in several projects, so this being searched under the OPEN
+      // project's folder first — see projDirsToSearch — is what stops another
+      // project's copy winning.
+      const aud=await findSubDir(root,PROJ_SUBDIR_AUDIO);
+      if(aud) dirs.push({h:aud,label:PROJ_SUBDIR_AUDIO+'/'});
       for(const d of dirs){
         for(const ext of (exts||AUDIO_EXTS)){
           const name=ext?baseName+'.'+ext:baseName;
@@ -7384,8 +7514,22 @@
       try{
         for await (const [name,handle] of root.entries()){
           if(handle.kind==='file' && /\.mmvp$/i.test(name)){
+            // Flat layout: the project sits in the remembered folder itself.
             const file=await handle.getFile();
-            out.push({name,handle,lastModified:file.lastModified,dir:root});
+            out.push({name,handle,lastModified:file.lastModified,dir:root,root});
+          } else if(handle.kind==='directory' && !isProjSubdir(name)){
+            // One level down: a folder per project. Deliberately no deeper —
+            // this looks for .mmvp files in each project folder and never
+            // descends into Videos/Images/Lyrics, so the cost is proportional
+            // to how many PROJECTS there are, not how many files.
+            try{
+              for await (const [n2,h2] of handle.entries()){
+                if(h2.kind==='file' && /\.mmvp$/i.test(n2)){
+                  const f2=await h2.getFile();
+                  out.push({name:n2,handle:h2,lastModified:f2.lastModified,dir:handle,root});
+                }
+              }
+            }catch(e){ /* unreadable project folder — the rest still list */ }
           }
         }
       }catch(e){ /* folder went away — the others still list */ }
@@ -7402,13 +7546,14 @@
     if(!files.length){ list.innerHTML='<span class="hint">No .mmvp files found in '
       +(projDirs.length===1?projDirs[0].name:projDirs.length+' folders')+'.</span>'; return; }
     list.innerHTML='';
-    const showFolder=projDirs.length>1;
+    // The containing folder is worth showing whenever it isn't simply the
+    // remembered folder itself — with a folder per project that is the name
+    // you actually think of the project by.
+    const showFolder=projDirs.length>1||files.some(function(f){ return f.dir!==f.root; });
     for(const f of files){
       const b=document.createElement('button');
       const nameSpan=document.createElement('span'); nameSpan.textContent=f.name.replace(/\.mmvp$/i,'');
       b.appendChild(nameSpan);
-      // Which folder each project came from only matters once there is more
-      // than one to tell apart.
       if(showFolder && f.dir){
         const tag=document.createElement('span'); tag.className='projFolderTag';
         tag.textContent=f.dir.name; b.appendChild(tag);
@@ -11555,47 +11700,38 @@
       return /\(MME\)$/.test(base)?(base+ext):(base+' (MME)'+ext);
     }
 
-    // Best-effort copy of the imported shader into the current Projects
-    // Folder (if one has been chosen — see pickProjectsFolder), mirroring
-    // audio file handling. Silent no-op when no folder is set, permission is
-    // denied, or the File System Access API isn't available at all.
+    // Best-effort copy of the imported shader into the open project's
+    // "MME - ISF" folder. Silent no-op when there is no project folder,
+    // permission is denied, or the File System Access API isn't available.
+    //
+    // Import and export share ONE folder deliberately. The working copy is
+    // updated in place by Export ISF, so MMV can be pointed at a single file
+    // that keeps getting better; splitting import and export into separate
+    // folders would leave two copies of the same shader with MMV loading the
+    // stale one, and every Export ISF would appear to do nothing.
     async function copyIsfToProjectFolder(filename,text){
-      if(!projDirHandle) return;
-      if(!await verifyDirPermission(projDirHandle,true)) return;
-      const fh=await projDirHandle.getFileHandle(filename,{create:true});
-      const w=await fh.createWritable(); await w.write(text); await w.close();
+      await writeProjectExport(PROJ_SUBDIR_ISF,filename,text);
     }
 
-    // Writes a companion file into the projects folder, returning whether it
-    // landed there. Used for the Magic project request, which has to sit
-    // beside the exported shader — but must never take the export down with
-    // it if the folder is gone or read-only, hence the caught failure.
+    // Companion files for an ISF export — the wiring sheet and the Magic
+    // project request — sit beside the shader in "MME - ISF". Returns whether
+    // it landed there; must never take the export down with it if the folder
+    // is gone or read-only, hence the caught failure inside writeProjectExport.
     async function writeTextIntoProjectFolder(filename,text){
-      if(!projDirHandle) return false;
-      try{
-        if(!await verifyDirPermission(projDirHandle,true)) return false;
-        const fh=await projDirHandle.getFileHandle(filename,{create:true});
-        const w=await fh.createWritable(); await w.write(text); await w.close();
-        return true;
-      }catch(e){ return false; }
+      return !!await writeProjectExport(PROJ_SUBDIR_ISF,filename,text);
     }
 
     // Update ISF's export target (the button was "Migrate to MMV" until this
     // release; the internal openMigrateSheet/isfMigrate* names still say so):
     // the same "(MME)" working copy every time, updated in place — not a fresh
-    // "...migrated.fs" per export.
+    // "...migrated.fs" per export — in the project's own "MME - ISF" folder,
+    // which is the same folder Import put the working copy in.
     // Mirrors saveProject()'s own try-the-project-folder-then-download
     // fallback. Returns true if it wrote straight into the folder, false if
     // it fell back to a browser download the user needs to save over the
     // original themselves.
     async function writeIsfUpdateInPlace(filename,text){
-      if(projDirHandle && await verifyDirPermission(projDirHandle,true)){
-        try{
-          const fh=await projDirHandle.getFileHandle(filename,{create:true});
-          const w=await fh.createWritable(); await w.write(text); await w.close();
-          return true;
-        }catch(e){ /* fall through to download */ }
-      }
+      if(await writeProjectExport(PROJ_SUBDIR_ISF,filename,text)) return true;
       downloadText(filename,text,'text/plain');
       return false;
     }
@@ -12721,13 +12857,24 @@
       if(laneIsCp(lane)) return {type:'Channel Pressure', numbered:false};
       return {type:'CC', numbered:true};
     }
+    // Composed from the ROOT path the user gave once, plus what MME already
+    // knows: the open project's folder name, and the ISF subfolder the shader
+    // was just written to. So one setting covers every project rather than
+    // needing re-editing each time — "C:\Visuals" yields
+    // "C:\Visuals\Music Project 1\MME - ISF\shader.fs".
     function magicShaderPath(filename){
       let base='';
       try{ base=(document.getElementById('isfShaderFolder')||{}).value||''; }catch(e){}
       base=base.trim();
-      if(!base) return filename; // no folder known — catalogue resolves it beside the request
+      if(!base) return filename; // no root known — catalogue resolves it beside the request
       const sep=base.indexOf('\\')>=0?'\\':'/';
-      return base.replace(/[\\/]+$/,'')+sep+filename;
+      const parts=[base.replace(/[\\/]+$/,'')];
+      // Only when the open project sits in its OWN folder inside the root. In
+      // the flat layout the remembered folder IS the project folder, so adding
+      // its name would repeat the last segment of the path the user gave.
+      if(projDirHandle&&projDirs.indexOf(projDirHandle)<0&&projDirHandle.name) parts.push(projDirHandle.name);
+      parts.push(PROJ_SUBDIR_ISF,filename);
+      return parts.join(sep);
     }
     function buildMagicRequest(entry,wireRefs){
       // Every row of one ISF import shares a channel, so the first wired row
@@ -12999,8 +13146,14 @@
         const wroteInPlace=await writeIsfUpdateInPlace(entry.filename,newSource);
         entry.source=newSource; // keep the retained source in sync for a second export later in the same session
 
+        // Wiring sheet beside the shader it describes, rather than in the
+        // browser's Downloads where it parts company with the project.
+        let sheetNote='';
         if(wireRefs.length){
-          downloadText(entry.filename.replace(/\.[^.]+$/,'')+'-wiring-sheet.txt',buildWiringSheetText(entry,wireRefs),'text/plain');
+          const sheetName=entry.filename.replace(/\.[^.]+$/,'')+'-wiring-sheet.txt';
+          const sheetText=buildWiringSheetText(entry,wireRefs);
+          if(await writeTextIntoProjectFolder(sheetName,sheetText)) sheetNote=' + wiring sheet';
+          else { downloadText(sheetName,sheetText,'text/plain'); sheetNote=' + wiring sheet (downloaded)'; }
         }
 
         // The Magic project request goes next to the exported shader, by the
@@ -13020,7 +13173,7 @@
         }
 
         dlg.close(); dlg.remove();
-        flash((wroteInPlace?'Updated ':'Downloaded ')+entry.filename+(wireRefs.length?' + wiring sheet':'')+magicNote+'.');
+        flash((wroteInPlace?'Updated ':'Downloaded ')+entry.filename+sheetNote+magicNote+'.');
       });
 
       footer.appendChild(countLbl);
