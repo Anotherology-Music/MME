@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.59
+  MMV MIDI & CC Curve Editor v0.9.60
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1683,6 +1683,54 @@
   Thirteen new checks, including that a .mmvp two levels down is NOT found —
   the guarantee that a project's Videos folder is never walked.
 
+  v0.9.60 — What tempo am I actually at, and how do I move a marker.
+
+  All from one report on a 37-section project with a tempo change per section
+  and several meter changes inside some of them.
+
+  The Tempo and Sig fields are the project's STARTING values — that is what
+  they edit — and on a project like that they say almost nothing about what you
+  are hearing. A "Now" readout beside them reports the tempo and time signature
+  actually in force at the playhead, following both maps as it moves and
+  lighting up once it differs from the opening values. On a flat project it
+  mirrors them and stays quiet, so the simple case gains nothing to ignore.
+
+  The Time Sig and Tempo Map panels ran off the bottom of the screen. With
+  dozens of entries the list grew unbounded and pushed the "At bar / + Add" row
+  past the window edge, so there was no way to reach the end of the list AND no
+  way to add an entry — both halves of the complaint, one cause. The list now
+  scrolls inside a panel capped at the window. The cap is measured on open
+  rather than set in CSS: the panel hangs off a toolbar button a hundred-odd
+  pixels down, so a viewport-relative max-height limits its HEIGHT while its top
+  is already well down the screen, and it still overran. A first attempt did
+  exactly that and the test caught it.
+
+  Rows in both lists are now clickable — they scroll that change into view and
+  open its editor. Hunting the right marker along a ruler spanning a hundred
+  minutes is not a way in.
+
+  And both marker editors gained a position field, so a change can be MOVED and
+  not merely revalued: a bar number for a time signature (which can only fall on
+  a bar line) and bar or bar.beat for a tempo. This is distinct from the tempo
+  editor's existing "Align to", which keeps the point where it is and changes
+  the BPM so it lands at a given time; the new field moves the point and leaves
+  the BPM alone. Moving is remove-then-add in that order, so moving onto a
+  position that already carries a change replaces it rather than leaving both.
+
+  The Setup panel now echoes which folder the open project came from and the
+  exact shader path a Magic request would carry. MME cannot read a folder's real
+  path — the browser hands over a permission, not a location, so it also cannot
+  check that the root you typed matches where the project actually lives. What
+  it can do is show its own answer, so a root pointing at a different project
+  reads as a path that plainly isn't where the project is, instead of failing
+  quietly later in the catalogue. magicShaderPath moved to top level to make
+  that possible: it had been inside the ISF section's private scope, invisible
+  to the Setup panel.
+
+  Fifteen new checks. Two pre-existing checks re-aimed: rows carry a
+  click-to-edit button as well as their ×, so "#tempoMapList button" was no
+  longer unambiguous and the delete buttons gained a class of their own.
+
 -->
 
 
@@ -1827,6 +1875,30 @@
   .map-btn-grp{display:flex;gap:1px;}
   #tsWrapper,#tempoWrapper{position:relative;}
   #tsPanel,#tempoPanel{position:absolute;top:calc(100% + 3px);left:0;width:320px;background:var(--panel);border:1px solid var(--line);border-radius:0 0 8px 8px;box-shadow:0 10px 28px rgba(0,0,0,.6);z-index:500;display:none;padding:9px 14px;flex-direction:column;gap:6px;}
+  /* The list scrolls; nothing else in the panel does. A project with a tempo
+     change per section has dozens of rows, and with the list free to grow the
+     panel ran off the bottom of the screen taking the "At bar / + Add" row with
+     it — so there was no way to scroll to the end of the list AND no way to add
+     a new entry, which is exactly how it was reported. */
+  /* A fallback only: the real cap is set on open by fitMapPanel(), which can
+     see how far down the window the panel actually starts. */
+  #tsPanel,#tempoPanel{max-height:calc(100vh - 96px);}
+  #tsMapList,#tempoMapList{flex:0 1 auto;min-height:0;overflow-y:auto;}
+  #tsPanel>.setup-row,#tempoPanel>.setup-row,#tsPanel>.setup-title,#tempoPanel>.setup-title{flex-shrink:0;}
+  /* Rows are clickable: with fifty entries, hunting the right marker along the
+     ruler is not a reasonable way to reach one for editing. */
+  .map-row{display:flex;align-items:center;gap:6px;}
+  .map-row .map-go{flex:1;text-align:left;background:transparent;border:1px solid transparent;color:var(--txt2);font-size:11px;padding:1px 4px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .map-row .map-go:hover{border-color:var(--accent);color:var(--txt);}
+  /* "Now" readout: quiet while it matches the project start, lit once the
+     playhead has moved onto a different tempo or meter. */
+  #nowGrp b{color:var(--txt2);font-variant-numeric:tabular-nums;min-width:4ch;display:inline-block;text-align:right;}
+  #nowGrp #nowSig{min-width:3.5ch;text-align:left;}
+  #nowGrp.now-differs b{color:var(--tempoVar);font-weight:700;}
+  /* Read-only path echoes in Setup. Monospace and wrapping, because a real
+     Windows path with OneDrive in it is long and the whole point is being able
+     to read it and see that it is the wrong folder. */
+  .setup-mono{flex:1 1 240px;min-width:0;font-family:ui-monospace,Consolas,monospace;font-size:10px;color:var(--txt2);word-break:break-all;line-height:1.4;}
   #tsPanel{border-top:2px solid var(--accent2);}
   #tempoPanel{border-top:2px solid var(--tempoVar);}
   #tsPanel.open,#tempoPanel.open{display:flex;}
@@ -2521,6 +2593,16 @@
         <select id="tsDen" style="width:48px;"><option>2</option><option selected>4</option><option>8</option><option>16</option></select>
         <span id="sigVarBadge" class="var-badge">◆</span>
       </div>
+      <!-- The Tempo/Sig fields above are the project's STARTING values, which
+           is what they edit. On a project with a tempo and meter change per
+           section they say almost nothing about what you are hearing, so this
+           reads out what is actually in force at the playhead. On a flat
+           project it simply mirrors them. -->
+      <div class="group" id="nowGrp" title="Tempo and time signature in force at the playhead. The fields to the left are the project's starting values.">
+        <span class="lbl">Now</span>
+        <b id="nowBpm">120</b><span class="pill">BPM</span>
+        <b id="nowSig">4/4</b>
+      </div>
       <div class="group">
         <span class="lbl">Length</span>
         <span id="durDisp" class="dur" title="Click to toggle h:m:s:cs / total seconds">00:00:00:00</span>
@@ -2629,7 +2711,15 @@
               placeholder="C:\Visuals"
               title="Absolute path of the folder that holds your projects — the same folder you added under Load Project. MME appends the project folder and MME - ISF itself. Used only to fill in the shader path in a Create Magic project request. Saved in this browser.">
           </div>
-          <div class="setup-note">Only needed for <b>Create Magic project</b>. A browser is never told where on disk a folder actually is &mdash; it is handed permission to read the folder, not its path &mdash; so the generated request cannot work out the shader&rsquo;s absolute path on its own. Give the <b>root</b> once and MME composes the rest from what it already knows: <code>C:\Visuals</code> becomes <code>C:\Visuals\Music Project 1\MME - ISF\shader.fs</code>. Leave it empty and the request names the shader by filename alone, for the catalogue to resolve next to the request file.</div>
+          <div class="setup-note">Only needed for <b>Create Magic project</b>. A browser is never told where on disk a folder actually is &mdash; it is handed permission to read the folder, not its path &mdash; so MME cannot read your project&rsquo;s real path, and cannot check that what you type here matches it. Give the <b>root</b> that contains your project folders and MME composes the rest from what it already knows. The line below shows exactly what would be written, so a root pointing somewhere else is visible rather than silent. Leave it empty and the request names the shader by filename alone, for the catalogue to resolve next to the request file.</div>
+          <div class="setup-row setup-sub-row">
+            <span class="lbl">Open project</span>
+            <span id="isfActiveFolder" class="setup-mono">&mdash;</span>
+          </div>
+          <div class="setup-row setup-sub-row">
+            <span class="lbl">Shader path</span>
+            <span id="isfShaderPathPreview" class="setup-mono">&mdash;</span>
+          </div>
 
           <div class="setup-subtitle">KEY NAMES</div>
           <div class="setup-row setup-sub-row">
@@ -7401,6 +7491,29 @@
       return subdir+'/'+filename;
     }catch(e){ return null; }
   }
+  // Composed from the ROOT path the user gave once, plus what MME already
+  // knows: the open project's folder name, and the ISF subfolder the shader
+  // is written to. So one setting covers every project rather than needing
+  // re-editing each time — "C:\\Visuals" yields
+  // "C:\\Visuals\\Music Project 1\\MME - ISF\\shader.fs".
+  //
+  // Lives at top level, not inside the ISF section that uses it, because the
+  // Setup panel's path preview needs it too — and a function defined inside
+  // that private scope is invisible from out here.
+  function magicShaderPath(filename){
+    let base='';
+    try{ base=(document.getElementById('isfShaderFolder')||{}).value||''; }catch(e){}
+    base=base.trim();
+    if(!base) return filename; // no root known — catalogue resolves it beside the request
+    const sep=base.indexOf('\\')>=0?'\\':'/';
+    const parts=[base.replace(/[\\/]+$/,'')];
+    // Only when the open project sits in its OWN folder inside the root. In
+    // the flat layout the remembered folder IS the project folder, so adding
+    // its name would repeat the last segment of the path the user gave.
+    if(projDirHandle&&projDirs.indexOf(projDirHandle)<0&&projDirHandle.name) parts.push(projDirHandle.name);
+    parts.push(PROJ_SUBDIR_ISF,filename);
+    return parts.join(sep);
+  }
   const AUDIO_EXTS=['wav','mp3','ogg','flac','m4a','aac'];
   // (The "Audio" subfolder this used to list explicitly, in both casings, is
   // now PROJ_SUBDIR_AUDIO looked up through findSubDir, which matches any
@@ -7613,6 +7726,7 @@
         // audio wiped out a moment later when this callback ran).
         const baseName=(file.name||'').replace(/\.mmvp$/i,'');
         const audioLoaded=await autoLoadProjectAudio(data,baseName);
+        updateIsfPathPreview();
         if(!audioLoaded){
           const n=audioClips().length;
           // Name the actual remedy. With no folder remembered there is nothing
@@ -8944,7 +9058,24 @@
   }
   function toggleMetronome(){ state.metronomeOn=!state.metronomeOn; $('metroBtn').classList.toggle('on',state.metronomeOn);
     if(state.playing) rescheduleCurrentPass(); }
-  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockHundredths(tickToSeconds(state.playhead)); }
+  function updatePlayPos(){ $('stPlay').textContent=tickToBBT(state.playhead); $('stPlaySec').textContent=fmtClockHundredths(tickToSeconds(state.playhead)); updateNowTempoSig(); }
+  // Tempo and meter in force AT THE PLAYHEAD, as against the project's starting
+  // values that the Tempo/Sig fields edit. Driven from updatePlayPos so it
+  // tracks the playhead during playback, scrubbing and every seek alike; also
+  // called when either map changes, since the value under a stationary
+  // playhead can change without the playhead moving.
+  function updateNowTempoSig(){
+    const b=$('nowBpm'), s=$('nowSig'); if(!b||!s) return;
+    const t=state.playhead||0;
+    const bpm=tempoSegAt(t).bpm, seg=tsSegAt(t);
+    b.textContent=String(Math.round(bpm*100)/100);
+    s.textContent=seg.num+'/'+seg.den;
+    // Lit only when it differs from the project start — so on a flat project
+    // it stays quiet, and on a mapped one it is obvious you have moved off the
+    // opening tempo or meter.
+    const off=(Math.abs(bpm-tempoSegAt(0).bpm)>1e-6)||(seg.num!==tsSegAt(0).num)||(seg.den!==tsSegAt(0).den);
+    const g=$('nowGrp'); if(g) g.classList.toggle('now-differs',off);
+  }
   function updateLoopStatus(){
     const hasRange=state.locStart!=null&&state.locEnd!=null&&state.locEnd>state.locStart;
     const on=state.loopOn!==false;
@@ -9018,12 +9149,17 @@
     list.innerHTML='';
     tsMapSorted().forEach(s=>{
       const {bar}=walkToTick(s.tick);
-      const row=document.createElement('div'); row.style.cssText='display:flex;align-items:center;gap:6px;';
-      const lbl=document.createElement('span'); lbl.textContent='Bar '+(bar+1)+': '+s.num+'/'+s.den;
-      lbl.style.cssText='flex:1;color:var(--txt2);';
-      row.appendChild(lbl);
+      const row=document.createElement('div'); row.className='map-row';
+      const go=document.createElement('button'); go.className='map-go';
+      go.textContent='Bar '+(bar+1)+': '+s.num+'/'+s.den;
+      go.title='Go to this time signature change and edit it';
+      go.addEventListener('click',()=>{
+        seekPlayhead(s.tick); scrollTickIntoView(s.tick);
+        openTsMarkerPopover(s.tick,s.tick===0);
+      });
+      row.appendChild(go);
       if(s.tick!==0){
-        const del=document.createElement('button'); del.textContent='×'; del.title='Remove this time signature change';
+        const del=document.createElement('button'); del.className='map-del'; del.textContent='×'; del.title='Remove this time signature change';
         del.style.cssText='font-size:10px;padding:1px 5px;';
         del.addEventListener('click',()=>removeTsMapChange(s.tick));
         row.appendChild(del);
@@ -9072,17 +9208,36 @@
     flash('Time signature moved to bar '+(bar+1));
   }
 
+  // Caps the panel at the bottom of the window. CSS alone cannot do this: the
+  // panel is absolutely positioned under whichever toolbar row its button sits
+  // in, so a max-height expressed against the viewport limits its HEIGHT while
+  // its TOP is already 130-odd pixels down — and it still ran off the screen,
+  // taking the "+ Add" row with it. Measured on open instead.
+  function fitMapPanel(panel){
+    if(!panel||!panel.classList.contains('open')) return;
+    panel.style.maxHeight='';
+    const top=panel.getBoundingClientRect().top;
+    panel.style.maxHeight=Math.max(160,Math.round(window.innerHeight-top-12))+'px';
+  }
   // ---------- Tempo map UI (mirrors the Time Sig map UI above) ----------
   function renderTempoMapUI(){
     const list=$('tempoMapList'); if(!list) return;
     list.innerHTML='';
     tempoMapSorted().forEach(s=>{
-      const row=document.createElement('div'); row.style.cssText='display:flex;align-items:center;gap:6px;';
-      const lbl=document.createElement('span'); lbl.textContent='Bar '+tickToBarBeat(s.tick)+': '+(Math.round(s.bpm*100)/100)+' BPM';
-      lbl.style.cssText='flex:1;color:var(--txt2);';
-      row.appendChild(lbl);
+      const row=document.createElement('div'); row.className='map-row';
+      // Clicking the row scrolls that point into view and opens its editor —
+      // the ruler marker is unreachable in practice once a project has dozens
+      // of them spread over a hundred minutes.
+      const go=document.createElement('button'); go.className='map-go';
+      go.textContent='Bar '+tickToBarBeat(s.tick)+': '+(Math.round(s.bpm*100)/100)+' BPM';
+      go.title='Go to this tempo change and edit it';
+      go.addEventListener('click',()=>{
+        seekPlayhead(s.tick); scrollTickIntoView(s.tick);
+        openTempoMarkerPopover(s.tick,s.tick===0);
+      });
+      row.appendChild(go);
       if(s.tick!==0){
-        const del=document.createElement('button'); del.textContent='×'; del.title='Remove this tempo change';
+        const del=document.createElement('button'); del.className='map-del'; del.textContent='×'; del.title='Remove this tempo change';
         del.style.cssText='font-size:10px;padding:1px 5px;';
         del.addEventListener('click',()=>removeTempoMapChange(s.tick));
         row.appendChild(del);
@@ -9157,13 +9312,31 @@
     [2,4,8,16].forEach(d=>{ const o=document.createElement('option'); o.value=d; o.textContent=d; if(d===eff.den) o.selected=true; denS.appendChild(o); });
     row.appendChild(numI); row.appendChild(slash); row.appendChild(denS);
     pop.appendChild(row);
+    // Where it sits, editable. Dragging a marker on the ruler moves it, but a
+    // marker among dozens spread over a hundred minutes is not draggable in
+    // any practical sense — and the bar-1 entry cannot move at all, since the
+    // project has to start with a time signature.
+    let barI=null;
+    if(!isStart){
+      const brow=document.createElement('div'); brow.className='marker-pop-row';
+      const bl=document.createElement('span'); bl.textContent='At bar'; bl.style.color='var(--txt2)';
+      barI=document.createElement('input'); barI.id='tsMarkerBarInput'; barI.type='number'; barI.min=2; barI.step=1;
+      barI.value=bar+1; barI.style.width='72px';
+      barI.title='Move this change to a different bar. A time signature can only change on a bar line.';
+      brow.appendChild(bl); brow.appendChild(barI);
+      pop.appendChild(brow);
+    }
     const actions=document.createElement('div'); actions.className='marker-pop-actions';
     if(!isStart&&existing){ const rm=document.createElement('button'); rm.className='danger'; rm.textContent='Remove'; rm.title='Remove this time signature change';
       rm.addEventListener('click',()=>{ removeTsMapChange(tick); closeTsMarkerPopover(); }); actions.appendChild(rm); }
     const ok=document.createElement('button'); ok.textContent=existing?'Update':'Add';
     ok.addEventListener('click',()=>{
       const num=clamp(Math.round(+numI.value||4),1,32), den=+denS.value||4;
-      addTsMapChange(bar,num,den); closeTsMarkerPopover();
+      const newBar=barI?Math.max(1,Math.round(+barI.value||(bar+1))-1):bar;
+      // Moving is remove-then-add. Done in that order so a move onto a bar that
+      // already carries a change replaces it rather than leaving both.
+      if(existing&&newBar!==bar) removeTsMapChange(tick);
+      addTsMapChange(newBar,num,den); closeTsMarkerPopover();
     });
     actions.appendChild(ok);
     pop.appendChild(actions);
@@ -9192,6 +9365,20 @@
     const lbl=document.createElement('span'); lbl.textContent='BPM'; lbl.style.color='var(--txt2)';
     row.appendChild(bpmI); row.appendChild(lbl);
     pop.appendChild(row);
+    // Where it sits, editable — as bar or bar.beat, the same form the ruler
+    // labels and this popover's own title use. Distinct from "Align to" below:
+    // that keeps the point where it is and changes the TEMPO so it lands at a
+    // given time; this MOVES the point and leaves its BPM alone.
+    let posI=null;
+    if(!isStart){
+      const prow=document.createElement('div'); prow.className='marker-pop-row';
+      const pl=document.createElement('span'); pl.textContent='At bar'; pl.style.color='var(--txt2)';
+      posI=document.createElement('input'); posI.id='tempoMarkerPosInput'; posI.type='text';
+      posI.value=tickToBarBeat(tick); posI.style.width='72px';
+      posI.title='Move this tempo change to a different position — "12" for bar 12, or "12.3" for bar 12 beat 3. The BPM is unchanged.';
+      prow.appendChild(pl); prow.appendChild(posI);
+      pop.appendChild(prow);
+    }
     // "Align to" — the tempo-matching gesture, typed instead of dragged. You
     // read the time off the audio (or off the ruler in one of its time modes)
     // and MME derives the BPM that gets this point there, rather than you
@@ -9218,7 +9405,15 @@
     const ok=document.createElement('button'); ok.id='tempoMarkerOkBtn'; ok.textContent=existing?'Update':'Add';
     ok.addEventListener('click',()=>{
       const bpm=clamp(Math.round((+bpmI.value||120)*100)/100,20,400);
-      setTempoAtTick(tick,bpm); closeTempoMarkerPopover();
+      let newTick=tick;
+      if(posI){
+        const parsed=Math.max(0,Math.round(bbtToTick(String(posI.value||'').trim()||tickToBarBeat(tick))));
+        if(isFinite(parsed)) newTick=parsed;
+      }
+      // Remove first so moving onto a position that already has a change
+      // replaces it instead of leaving a stale entry behind.
+      if(existing&&newTick!==tick&&tick!==0) removeTempoMapChange(tick);
+      setTempoAtTick(newTick,bpm); closeTempoMarkerPopover();
     });
     actions.appendChild(ok);
     pop.appendChild(actions);
@@ -9282,6 +9477,9 @@
     return newBpm;
   }
   function updateVariabilityIndicators(){
+    // The value under a stationary playhead changes whenever either map does,
+    // so the "Now" readout has to refresh here as well as on playhead moves.
+    updateNowTempoSig();
     const bpmEl=$('bpm'), tempoBadge=$('tempoVarBadge');
     if(bpmEl&&tempoBadge){
       const tm=tempoMapSorted();
@@ -9570,7 +9768,24 @@
   try{ const v=localStorage.getItem(ISF_SHADER_FOLDER_KEY); if(v!==null) $('isfShaderFolder').value=v; }catch(e){}
   $('isfShaderFolder').addEventListener('change',()=>{
     try{ localStorage.setItem(ISF_SHADER_FOLDER_KEY,$('isfShaderFolder').value.trim()); }catch(e){}
+    updateIsfPathPreview();
   });
+  $('isfShaderFolder').addEventListener('input',updateIsfPathPreview);
+  // MME cannot read the real path of the folder it was granted — the browser
+  // hands over a permission, not a location — so the honest thing it CAN do is
+  // show which folder is open by name, and exactly what path the request would
+  // carry. A root that points at some other project then shows up as a path
+  // that plainly isn't where the project lives, instead of failing silently
+  // later in the catalogue.
+  function updateIsfPathPreview(){
+    const nameEl=$('isfActiveFolder'), pathEl=$('isfShaderPathPreview');
+    if(!nameEl||!pathEl) return;
+    const dir=(typeof projDirHandle!=='undefined'&&projDirHandle)?projDirHandle:null;
+    const proj=(state.projectName||'').trim();
+    nameEl.textContent=dir?(dir.name+(proj?'  ('+proj+')':'')):'— not opened from a folder yet —';
+    const example=(proj?proj.replace(/[\\/:*?"<>|]/g,'-'):'shader')+' (MME).fs';
+    pathEl.textContent=(typeof magicShaderPath==='function')?magicShaderPath(example):example;
+  }
 
   // Accepts what a Windows user actually has to hand — C:\path\file.html,
   // with either slash direction, quoted or not — and turns it into a real
@@ -9630,6 +9845,10 @@
   // the panel is shut, and the Clear Note Names picker shows channel names
   // that are edited further down this same panel.
   function refreshSetupPanelDynamics(){
+    // Which folder is open, and the exact path a Magic request would carry —
+    // refreshed on open so a root pointing at a different project is visible
+    // the moment you look at the panel.
+    updateIsfPathPreview();
     if(!$('midiImportInsert').checked||document.activeElement!==$('midiInsertAt')) $('midiInsertAt').value=tickToBBT(state.playhead);
     // Name the channel in the option itself rather than making you look back
     // at the main window to find out what "View CH" currently is. When View CH
@@ -12857,25 +13076,6 @@
       if(laneIsCp(lane)) return {type:'Channel Pressure', numbered:false};
       return {type:'CC', numbered:true};
     }
-    // Composed from the ROOT path the user gave once, plus what MME already
-    // knows: the open project's folder name, and the ISF subfolder the shader
-    // was just written to. So one setting covers every project rather than
-    // needing re-editing each time — "C:\Visuals" yields
-    // "C:\Visuals\Music Project 1\MME - ISF\shader.fs".
-    function magicShaderPath(filename){
-      let base='';
-      try{ base=(document.getElementById('isfShaderFolder')||{}).value||''; }catch(e){}
-      base=base.trim();
-      if(!base) return filename; // no root known — catalogue resolves it beside the request
-      const sep=base.indexOf('\\')>=0?'\\':'/';
-      const parts=[base.replace(/[\\/]+$/,'')];
-      // Only when the open project sits in its OWN folder inside the root. In
-      // the flat layout the remembered folder IS the project folder, so adding
-      // its name would repeat the last segment of the path the user gave.
-      if(projDirHandle&&projDirs.indexOf(projDirHandle)<0&&projDirHandle.name) parts.push(projDirHandle.name);
-      parts.push(PROJ_SUBDIR_ISF,filename);
-      return parts.join(sep);
-    }
     function buildMagicRequest(entry,wireRefs){
       // Every row of one ISF import shares a channel, so the first wired row
       // decides the source channel for the whole request.
@@ -13322,8 +13522,8 @@
     // those readouts are meaningless if they show where the playhead was the
     // last time the panel happened to be opened.
     $('setupBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('setupPanel'); const open=p.classList.toggle('open'); $('setupBtn').classList.toggle('open',open); $('setupBtn').textContent=open?'⚙ Setup ▴':'⚙ Setup ▾'; if(open) refreshSetupPanelDynamics(); });
-    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); } });
-    $('tempoBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tempoPanel'); const open=p.classList.toggle('open'); $('tempoBtn').classList.toggle('open',open); $('tempoBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTempoMapUI(); $('tempoMapBar').value=nearestBarAt(state.playhead); } });
+    $('tsBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tsPanel'); const open=p.classList.toggle('open'); $('tsBtn').classList.toggle('open',open); $('tsBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTsMapUI(); $('tsMapBar').value=nearestBarAt(state.playhead); fitMapPanel(p); } });
+    $('tempoBtn').addEventListener('click',e=>{ e.stopPropagation(); const p=$('tempoPanel'); const open=p.classList.toggle('open'); $('tempoBtn').classList.toggle('open',open); $('tempoBtnCaret').textContent=open?'▴':'▾'; if(open){ renderTempoMapUI(); $('tempoMapBar').value=nearestBarAt(state.playhead); fitMapPanel(p); } });
     // Note Info manual minimize/maximize — same ▾/▸ two-state convention as
     // the CC lane toggle, independent of the existing auto-collapse (see
     // updateNoteInfo()); a UI-only in-memory preference, not persisted.

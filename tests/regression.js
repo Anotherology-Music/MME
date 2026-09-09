@@ -244,6 +244,13 @@ function buildTestHtml() {
       '  window._TEST_commitTempoDrag = (tick0, dropLocalX) => commitTempoDrag(tick0, dropLocalX);',
       '  window._TEST_alignTempoToTime = (tick0, sec) => alignTempoToTime(tick0, sec);',
       '  window._TEST_setTempoAtTick = (tick, bpm) => setTempoAtTick(tick, bpm);',
+      // v0.9.60: playhead tempo/meter readout, map panel, marker repositioning.
+      '  window._TEST_updateNowTempoSig = () => updateNowTempoSig();',
+      '  window._TEST_openTempoMarkerPopover = (t, st) => openTempoMarkerPopover(t, st);',
+      '  window._TEST_openTsMarkerPopover = (t, st) => openTsMarkerPopover(t, st);',
+      '  window._TEST_renderTsMapUI = () => renderTsMapUI();',
+      '  window._TEST_addTsMapChange = (bar, num, den) => addTsMapChange(bar, num, den);',
+      '  window._TEST_updateIsfPathPreview = () => updateIsfPathPreview();',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
       '  window._TEST_beatLineHitTest = (localX) => beatLineHitTest(localX);',
       '  window._TEST_tickToBarBeat = (t) => tickToBarBeat(t);',
@@ -824,7 +831,7 @@ async function run() {
     check('Time Signature Changes list shows the new entry', listText.includes('Bar 3: 3/4'), listText);
 
     // remove it, bar 4 (0-indexed 3) should revert to plain 4/4: 3 * 1920 = 5760
-    await page.click('#tsMapList button');
+    await page.click('#tsMapList .map-del'); // × — rows also carry a click-to-edit button since v0.9.60
     await page.waitForTimeout(50);
     const bar4TickAfterRemove = await page.evaluate(() => window._TEST_barToTick(3));
     check('removing the change reverts later bars to 4/4 (bar 4 = 5760)', bar4TickAfterRemove === 5760, bar4TickAfterRemove);
@@ -4290,6 +4297,187 @@ async function run() {
     await page.evaluate(() => window._TEST_setProjDirs([]));
   });
 
+  // ---------------- Tempo/meter at the playhead, map panel, moving markers (v0.9.60) ----------------
+
+  await withPage(browser, async (page) => {
+    // The Tempo/Sig fields are the project's STARTING values. On a project with
+    // a change per section they say almost nothing about what you are hearing,
+    // so a "Now" readout reports what is actually in force at the playhead.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 200;
+      s.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 90 }, { tick: 7680, bpm: 144 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 1920, num: 7, den: 8 }];
+      s.playhead = 0;
+      window._TEST_updateNowTempoSig();
+    });
+    const read = async (tick) => page.evaluate((t) => {
+      window._TEST_state.playhead = t;
+      window._TEST_updateNowTempoSig();
+      return {
+        bpm: document.getElementById('nowBpm').textContent,
+        sig: document.getElementById('nowSig').textContent,
+        lit: document.getElementById('nowGrp').classList.contains('now-differs'),
+      };
+    }, tick);
+
+    const atStart = await read(0);
+    check('the Now readout shows the project\'s opening tempo and meter at bar 1, unlit',
+      atStart.bpm === '120' && atStart.sig === '4/4' && atStart.lit === false, atStart);
+
+    const atSecond = await read(2000);
+    check('...and follows the tempo AND meter maps once the playhead moves past a change',
+      atSecond.bpm === '90' && atSecond.sig === '7/8', atSecond);
+    check('...lighting up to show it is no longer the project\'s starting values', atSecond.lit === true, atSecond);
+
+    const atThird = await read(8000);
+    check('...picking up a later tempo change while the meter stays where it was',
+      atThird.bpm === '144' && atThird.sig === '7/8', atThird);
+
+    // A flat project must stay quiet — no false signal on the simple case.
+    const flat = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.tempoMap = [{ tick: 0, bpm: 120 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      s.playhead = 50000;
+      window._TEST_updateNowTempoSig();
+      return {
+        bpm: document.getElementById('nowBpm').textContent,
+        lit: document.getElementById('nowGrp').classList.contains('now-differs'),
+      };
+    });
+    check('on a project with no changes the readout mirrors the start and stays unlit',
+      flat.bpm === '120' && flat.lit === false, flat);
+  });
+
+  await withPage(browser, async (page) => {
+    // With a change per section the panel grew past the bottom of the screen,
+    // taking the "At bar / + Add" row with it — so there was no way to reach
+    // the end of the list AND no way to add a new entry.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 400;
+      const tm = [{ tick: 0, bpm: 120 }];
+      for (let i = 1; i < 60; i++) tm.push({ tick: i * 1920, bpm: 100 + (i % 40) });
+      s.tempoMap = tm;
+      window._TEST_renderTsMapUI();
+    });
+    await page.click('#tempoBtn');
+    await page.waitForTimeout(120);
+    const geom = await page.evaluate(() => {
+      const panel = document.getElementById('tempoPanel');
+      const list = document.getElementById('tempoMapList');
+      const addBtn = document.getElementById('tempoMapAddBtn');
+      const pr = panel.getBoundingClientRect(), ar = addBtn.getBoundingClientRect();
+      return {
+        rows: list.querySelectorAll('.map-row').length,
+        listScrolls: list.scrollHeight > list.clientHeight + 2,
+        panelBottom: pr.bottom, viewportH: window.innerHeight,
+        addBtnBottom: ar.bottom, addBtnVisible: ar.bottom <= window.innerHeight && ar.height > 0,
+      };
+    });
+    check('setup: 60 tempo changes rendered', geom.rows === 60, geom.rows);
+    check('the panel stays within the window instead of running off the bottom',
+      geom.panelBottom <= geom.viewportH + 1, geom);
+    check('...the list scrolls inside it', geom.listScrolls === true, geom);
+    check('...and the "+ Add" row stays on screen, so a new entry can still be added',
+      geom.addBtnVisible === true, geom);
+
+    // Rows are reachable: clicking one opens that marker's editor, which is the
+    // only practical way in once the ruler holds dozens of them.
+    await page.evaluate(() => {
+      const rows = document.querySelectorAll('#tempoMapList .map-row .map-go');
+      rows[rows.length - 1].click();
+    });
+    await page.waitForTimeout(120);
+    const opened = await page.evaluate(() => {
+      const p = document.getElementById('tempoMarkerPopover');
+      return { open: !!p && p.classList.contains('open'), hasPos: !!document.getElementById('tempoMarkerPosInput') };
+    });
+    check('clicking a row in the list opens that change\'s editor', opened.open === true, opened);
+    check('...which now carries a position field, not just a value', opened.hasPos === true, opened);
+  });
+
+  await withPage(browser, async (page) => {
+    // Moving a change, rather than only editing its value. Dragging a marker on
+    // the ruler re-tempos ("Align to"); it does not move the point.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 100;
+      s.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 1920, bpm: 90 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 3840, num: 3, den: 4 }];
+    });
+    await page.evaluate(() => window._TEST_openTempoMarkerPopover(1920, false));
+    await page.waitForTimeout(80);
+    const prefill = await page.evaluate(() => document.getElementById('tempoMarkerPosInput').value);
+    check('the tempo editor pre-fills the change\'s current position', prefill === '2', prefill);
+
+    await page.evaluate(() => {
+      document.getElementById('tempoMarkerPosInput').value = '5';
+      document.getElementById('tempoMarkerOkBtn').click();
+    });
+    await page.waitForTimeout(120);
+    const movedTempo = await page.evaluate(() => window._TEST_state.tempoMap.map(x => ({ tick: x.tick, bpm: x.bpm })));
+    // Bar 5 is derived, not assumed: this project turns 3/4 at bar 3, so bar 5
+    // does NOT start at 4 x 1920. Hard-coding it was my arithmetic being wrong.
+    const bar5 = await page.evaluate(() => window._TEST_barToTick(4));
+    check('changing the position moves the tempo change and leaves its BPM alone',
+      movedTempo.length === 2 && movedTempo.some(x => x.tick === 0)
+      && movedTempo.some(x => x.tick === bar5 && x.bpm === 90)
+      && !movedTempo.some(x => x.tick === 1920), { movedTempo, bar5 });
+
+    // Same for time signatures, which can only move to a bar line.
+    await page.evaluate(() => window._TEST_openTsMarkerPopover(3840, false));
+    await page.waitForTimeout(80);
+    const tsPrefill = await page.evaluate(() => document.getElementById('tsMarkerBarInput').value);
+    check('the time signature editor pre-fills its current bar', tsPrefill === '3', tsPrefill);
+
+    await page.evaluate(() => {
+      document.getElementById('tsMarkerBarInput').value = '8';
+      document.querySelector('#tsMarkerPopover .marker-pop-actions button:last-child').click();
+    });
+    await page.waitForTimeout(120);
+    const movedTs = await page.evaluate(() => window._TEST_state.tsMap.map(x => ({ tick: x.tick, num: x.num, den: x.den })));
+    check('changing the bar moves the time signature change, keeping its value and leaving no stale entry',
+      movedTs.length === 2 && movedTs.some(x => x.tick === 0)
+      && movedTs.some(x => x.num === 3 && x.den === 4 && x.tick !== 3840)
+      && !movedTs.some(x => x.tick === 3840), movedTs);
+  });
+
+  await withPage(browser, async (page) => {
+    // MME cannot read a folder's real path — it is handed a permission, not a
+    // location — so the honest answer is to show which folder is open and the
+    // exact path a Magic request would carry, making a mismatched root visible.
+    const r = await page.evaluate(() => {
+      window.MockDir = class MockDir {
+        constructor(n){ this.kind='directory'; this.name=n; }
+        async queryPermission(){ return 'granted'; }
+      };
+      document.getElementById('isfShaderFolder').value = 'E:\\OneDrive\\Visuals';
+      window._TEST_state.projectName = 'Chapter 3';
+      window._TEST_setProjDirs([new window.MockDir('Visuals')]);
+      window._TEST_setProjDirPrimary(new window.MockDir('Music Project 1'));
+      window._TEST_updateIsfPathPreview();
+      return {
+        folder: document.getElementById('isfActiveFolder').textContent,
+        path: document.getElementById('isfShaderPathPreview').textContent,
+      };
+    });
+    check('Setup names the folder the open project actually came from',
+      /Music Project 1/.test(r.folder) && /Chapter 3/.test(r.folder), r.folder);
+    check('...and previews the exact shader path the request would carry, so a wrong root is visible',
+      r.path === 'E:\\OneDrive\\Visuals\\Music Project 1\\MME - ISF\\Chapter 3 (MME).fs', r.path);
+
+    const none = await page.evaluate(() => {
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      window._TEST_updateIsfPathPreview();
+      return document.getElementById('isfActiveFolder').textContent;
+    });
+    check('...saying so plainly when no project has been opened from a folder',
+      /not opened from a folder/.test(none), none);
+  });
+
   // ---------------- The GUTTER dead strip (v0.9.58) ----------------
 
   await withPage(browser, async (page) => {
@@ -7689,7 +7877,7 @@ async function run() {
     const listText = await page.evaluate(() => document.getElementById('tempoMapList').textContent);
     check('Tempo Map popover list shows the new breakpoint', /140/.test(listText), listText);
 
-    await page.click('#tempoMapList button'); // × on the (only removable) row
+    await page.click('#tempoMapList .map-del'); // × on the (only removable) row
     await page.waitForTimeout(50);
     const afterRemove = await page.evaluate(() => window._TEST_state.tempoMap.slice());
     check('Tempo Map popover: × removes a breakpoint (tick-0 entry always remains)',
