@@ -251,6 +251,9 @@ function buildTestHtml() {
       '  window._TEST_renderTsMapUI = () => renderTsMapUI();',
       '  window._TEST_addTsMapChange = (bar, num, den) => addTsMapChange(bar, num, den);',
       '  window._TEST_updateIsfPathPreview = () => updateIsfPathPreview();',
+      '  window._TEST_restoreHeldCcPoints = (pts) => restoreHeldCcPoints(pts);',
+      '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
+      '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
       '  window._TEST_beatLineHitTest = (localX) => beatLineHitTest(localX);',
       '  window._TEST_tickToBarBeat = (t) => tickToBarBeat(t);',
@@ -4297,6 +4300,152 @@ async function run() {
     await page.evaluate(() => window._TEST_setProjDirs([]));
   });
 
+  await withPage(browser, async (page) => {
+    // Projects belong in their own folder, not loose in the folder you added.
+    // A new project only ever had the remembered root to fall back on, which
+    // dropped a bare .mmvp in among the project folders.
+    const out = await page.evaluate(async (fs) => {
+      eval(fs);
+      const root = new window.MockDirHandle('Visuals');
+      window._TEST_setProjDirs([root]);
+      window._TEST_setProjDirPrimary(root);
+      window._TEST_state.projectName = 'Chapter 7';
+      await window._TEST_saveProject();
+      const made = root._dirs.get('Chapter 7');
+      return {
+        looseInRoot: [...root._files.keys()],
+        madeFolder: !!made,
+        inFolder: made ? [...made._files.keys()] : null,
+        activeNow: window._TEST_projDirPrimary(),
+      };
+    }, MOCK_FS);
+    check('saving a new project creates its own folder under the remembered root',
+      out.madeFolder === true && out.looseInRoot.length === 0, out);
+    check('...with the .mmvp inside it, not loose in the root',
+      !!out.inFolder && out.inFolder.includes('Chapter 7.mmvp'), out);
+    check('...and that folder becomes the active one, so exports and audio follow it',
+      out.activeNow === 'Chapter 7', out.activeNow);
+
+    // A project already living in its own folder saves back there, unchanged —
+    // no folder-inside-a-folder on every save.
+    const again = await page.evaluate(async () => {
+      window._TEST_state.projectName = 'Chapter 7 renamed';
+      await window._TEST_saveProject();
+      return { active: window._TEST_projDirPrimary() };
+    });
+    check('...while a project already in its own folder keeps saving there, not nesting deeper',
+      again.active === 'Chapter 7', again);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  // ---------------- CC step round-trip through a .mid (v0.9.61) ----------------
+
+  await withPage(browser, async (page) => {
+    // MIDI CC is a step function: a value holds until the next event, so a held
+    // stretch is encoded as the ABSENCE of events. MME's lanes interpolate
+    // between points, so importing verbatim turned every hold into a slow ramp
+    // — a stepped lane came back as a diagonal line. Reported after a lane that
+    // stepped through images in a folder survived export but not re-import.
+    const laneId = await page.evaluate(() => {
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_state.bars = 9;
+      // A staircase: flat across each bar, then a jump. The hold point sits
+      // well back from the next step because upsertPoint drops anything within
+      // half a sample period of the point being added.
+      [0, 20, 40, 60, 80, 100, 127].forEach((v, i) => {
+        window._TEST_upsertPoint(id, i * 1920, v);
+        window._TEST_upsertPoint(id, i * 1920 + 1800, v);
+      });
+      return id;
+    });
+    const midSteps = [960, 2880, 4800, 6720, 8640, 10560, 12480];
+    const before = await page.evaluate(({ id, ts }) => ts.map(t => Math.round(window._TEST_laneValueAt(id, t))),
+      { id: laneId, ts: midSteps });
+    check('setup: the lane holds a flat value across each bar before jumping',
+      before.join(',') === '0,20,40,60,80,100,127', before);
+
+    // Export, then read the file back the way an import would.
+    const bytes = await page.evaluate(() => window._TEST_buildMidi({}));
+    const recovered = await page.evaluate((b) => {
+      const r = window._TEST_parseMidi(b);
+      // withPage seeds a baseline CC lane, so the first ccMap key is that one,
+      // not the staircase — pick by CC number.
+      const key = Object.keys(r.ccMap).find(k => r.ccMap[k].cc === 20);
+      return r.ccMap[key].points.map(p => ({ t: p.t, v: p.v }));
+    }, bytes);
+    check('the exported file carries no events across a held stretch — that is what MIDI means by "hold"',
+      recovered.some((p, i) => i > 0 && p.t - recovered[i - 1].t > 100), recovered.slice(0, 6));
+
+    // Verbatim, those points interpolate into a ramp. Restored, they step.
+    const sampled = await page.evaluate(({ pts, ts }) => {
+      const lin = (points, t) => {
+        if (t <= points[0].t) return points[0].v;
+        if (t >= points[points.length - 1].t) return points[points.length - 1].v;
+        for (let i = 0; i < points.length - 1; i++) {
+          if (t >= points[i].t && t <= points[i + 1].t) {
+            const f = (t - points[i].t) / ((points[i + 1].t - points[i].t) || 1);
+            return points[i].v + (points[i + 1].v - points[i].v) * f;
+          }
+        }
+        return points[points.length - 1].v;
+      };
+      const held = window._TEST_restoreHeldCcPoints(pts);
+      return {
+        verbatim: ts.map(t => Math.round(lin(pts, t))),
+        restored: ts.map(t => Math.round(lin(held, t))),
+        nVerbatim: pts.length, nRestored: held.length,
+      };
+    }, { pts: recovered, ts: midSteps });
+
+    check('taken verbatim the staircase collapses into a ramp — the bug as reported',
+      sampled.verbatim.join(',') !== before.join(','), sampled.verbatim);
+    check('restoring the hold reproduces the original staircase exactly',
+      sampled.restored.join(',') === before.join(','), { restored: sampled.restored, before });
+    check('...at the cost of one point per held stretch, not a doubling of the curve',
+      sampled.nRestored - sampled.nVerbatim <= 8, { nVerbatim: sampled.nVerbatim, nRestored: sampled.nRestored });
+  });
+
+  await withPage(browser, async (page) => {
+    // A continuously moving curve must NOT gain guard points: its events are
+    // one sampling period apart, where interpolating is both what was meant and
+    // indistinguishable from stepping.
+    const r = await page.evaluate(() => {
+      const step = Math.max(1, Math.round(window._TEST_state.ppq / window._TEST_state.ccRes));
+      const dense = [];
+      for (let i = 0; i < 40; i++) dense.push({ t: i * step, v: i * 3 });
+      const held = [{ t: 0, v: 10 }, { t: 5000, v: 90 }, { t: 9000, v: 20 }];
+      return {
+        denseIn: dense.length, denseOut: window._TEST_restoreHeldCcPoints(dense).length,
+        heldIn: held.length, heldOut: window._TEST_restoreHeldCcPoints(held).length,
+        step,
+      };
+    });
+    check('a densely sampled curve passes through untouched', r.denseOut === r.denseIn, r);
+    check('...while widely spaced events each gain their hold point', r.heldOut === r.heldIn + 2, r);
+  });
+
+  await withPage(browser, async (page) => {
+    // End to end through the real import path, not the helper in isolation.
+    const laneId = await page.evaluate(() => {
+      const id = window._TEST_addLane(30, 0);
+      window._TEST_state.bars = 5;
+      [0, 60, 127].forEach((v, i) => {
+        window._TEST_upsertPoint(id, i * 1920, v);
+        window._TEST_upsertPoint(id, i * 1920 + 1800, v);
+      });
+      return id;
+    });
+    const bytes = await page.evaluate(() => window._TEST_buildMidi({}));
+    const after = await page.evaluate((b) => {
+      const r = window._TEST_parseMidi(b);
+      window._TEST_applyMidiImport(r, 'replace', false, null);
+      const lane = window._TEST_state.ccLanes.find(l => l.cc === 30);
+      return [960, 2880, 4800].map(t => Math.round(window._TEST_laneValueAt(lane.id, t)));
+    }, bytes);
+    check('importing an exported file with "replace" brings the steps back, not a diagonal',
+      after.join(',') === '0,60,127', after);
+  });
+
   // ---------------- Tempo/meter at the playhead, map panel, moving markers (v0.9.60) ----------------
 
   await withPage(browser, async (page) => {
@@ -6930,9 +7079,15 @@ async function run() {
     }));
     await page.evaluate((r) => window._TEST_applyMidiImport(r, 'replace'), r);
     const lane = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.type === 'cp'));
+    // v0.9.61 restores the hold that MIDI encodes as an absence of events, so
+    // a widely spaced change gains a guard point carrying the previous value.
+    // Channel Pressure holds exactly as CC does, so it gets the same treatment.
     check('applyMidiImport "replace" creates a type:"cp" lane from r.cpMap on the right channel',
-      lane && lane.ch === 3 && lane.points.length === 2, lane);
-    check('the imported CP lane keeps its original point values', lane && lane.points[0].v === 20 && lane.points[1].v === 90, lane);
+      lane && lane.ch === 3 && lane.points.length === 3, lane);
+    check('the imported CP lane keeps its original points, with the hold restored between them',
+      lane && lane.points[0].t === 0 && lane.points[0].v === 20
+      && lane.points[1].t === 959 && lane.points[1].v === 20
+      && lane.points[2].t === 960 && lane.points[2].v === 90, lane);
   });
 
   await withPage(browser, async (page) => {
@@ -9249,8 +9404,11 @@ async function run() {
       after.total === 4 && after.preexisting.length === 2 &&
       after.preexisting[0].start === 0 && after.preexisting[0].pitch === 60 &&
       after.preexisting[1].start === 1920 && after.preexisting[1].pitch === 62, after);
+    // The restored hold (v0.9.61) sits between the two imported points, so the
+    // second original point is now last rather than second.
     check('Insert offsets imported CC points too, onto a NEW lane on the focused channel',
-      after.ccLane && after.ccLane.ch === 9 && after.ccLane.points[0].t === bar5 && after.ccLane.points[1].t === bar5 + 480, after.ccLane);
+      after.ccLane && after.ccLane.ch === 9 && after.ccLane.points[0].t === bar5
+      && after.ccLane.points[after.ccLane.points.length - 1].t === bar5 + 480, after.ccLane);
   });
 
   await withPage(browser, async (page) => {

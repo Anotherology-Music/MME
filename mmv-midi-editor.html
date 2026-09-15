@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.60
+  MMV MIDI & CC Curve Editor v0.9.61
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1730,6 +1730,44 @@
   Fifteen new checks. Two pre-existing checks re-aimed: rows carry a
   click-to-edit button as well as their ×, so "#tempoMapList button" was no
   longer unambiguous and the delete buttons gained a class of their own.
+
+  v0.9.61 — Stepped CC lanes survive a round trip through a .mid.
+
+  Reported from a lane that stepped through the images in a folder: it exported
+  and played correctly, but re-importing that same file brought it back as a
+  plain diagonal, the holds gone.
+
+  The cause is a mismatch of models, not a lost event. MIDI CC is a STEP
+  function — a value holds until the next message — so a held stretch is
+  encoded as the ABSENCE of events. MME's lanes interpolate linearly between
+  points. Import took the file's events verbatim, so every flat stretch became
+  a slow ramp between the two events bracketing it. Measured on a seven-step
+  staircase: mid-step values read 0, 20, 40, 60, 80, 100, 127 before export and
+  2, 22, 42, 62, 82, 103, 127 after re-import — drifting upward across each
+  hold exactly as the line drawn through them would.
+
+  Import now rebuilds the hold: before any event that follows a gap, a point
+  carrying the PREVIOUS value is inserted, so the curve stays flat and then
+  jumps. Only for gaps wider than the sampling period (ppq/ccRes) — a
+  continuously moving curve emits an event every period, where interpolating is
+  both what was meant and indistinguishable from stepping, and guarding each
+  one would double the point count of every smooth curve for nothing. A
+  densely sampled curve therefore passes through untouched; the staircase above
+  costs six extra points and comes back exactly as it went out.
+
+  Applied to Pitch Bend and Channel Pressure too: all three hold until the next
+  message, so all three lost their holds the same way.
+
+  Also, projects now get their own folder. A project opened from a folder still
+  saves back to it, but a NEW project had only the remembered root to fall back
+  on — which dropped a loose .mmvp in among the project folders, and the root is
+  not where projects belong. Saving a new project now creates a folder named
+  after it and makes that the active project folder, so its exports, its audio
+  and its shader path all follow it from the first save.
+
+  Twelve new checks. Three pre-existing checks re-aimed at the restored hold:
+  their imported lanes gain a guard point, with every original point still at
+  its own tick and value.
 
 -->
 
@@ -7687,6 +7725,26 @@
       list.appendChild(b);
     }
   }
+  // Where a Save should land. A project opened from a folder saves back to that
+  // folder, unchanged. A NEW project, though, has only ever had the remembered
+  // ROOT to fall back on — which would drop a loose .mmvp in among the project
+  // folders, and the root is not where projects belong: each one lives in its
+  // own folder with its Audio, MME - MIDI and MME - ISF beside it. So a new
+  // project gets that folder made for it, named after the project.
+  async function resolveSaveDir(){
+    if(!projDirHandle) return null;
+    // Already a project folder (opened from one, or made by an earlier save).
+    if(projDirs.indexOf(projDirHandle)<0) return projDirHandle;
+    const base=(state.projectName||'').trim().replace(/[^a-z0-9_\-. ]/gi,'_').replace(/\s+/g,' ').trim();
+    if(!base) return projDirHandle; // unnamed — no sensible folder name to make
+    const made=await ensureSubDir(projDirHandle,base);
+    if(!made) return projDirHandle;
+    // It is this project's home from now on: saves, exports and the audio
+    // search all follow the active project folder.
+    projDirHandle=made;
+    renderProjFolders();
+    return made;
+  }
   async function saveProject(){
     // The clip arrangement rides in the snapshot (state.audioClips). audioFile
     // is kept alongside it, naming the first clip, so a project saved here
@@ -7694,12 +7752,14 @@
     const cs=audioClips();
     const data={version:1,projectName:state.projectName,audioFile:cs.length?cs[0].name:'',snapshot:JSON.parse(snapshot())};
     const json=JSON.stringify(data,null,2);
-    if(projDirHandle && await verifyDirPermission(projDirHandle,true)){
+    const dir=await resolveSaveDir();
+    if(dir && await verifyDirPermission(dir,true)){
       try{
-        const fh=await projDirHandle.getFileHandle(projFilename('.mmvp'),{create:true});
+        const fh=await dir.getFileHandle(projFilename('.mmvp'),{create:true});
         const w=await fh.createWritable(); await w.write(json); await w.close();
-        flash('Saved to '+projDirHandle.name+'/'+projFilename('.mmvp'));
+        flash('Saved to '+dir.name+'/'+projFilename('.mmvp'));
         autosaveMarkClean();
+        updateIsfPathPreview();
         return;
       }catch(e){ flash('Could not save to folder ('+e.message+') — downloading instead'); }
     }
@@ -7796,6 +7856,30 @@
   }
   document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') autosaveTick(); });
 
+  // MIDI CC is a STEP function: a value holds until the next event, so a held
+  // stretch is encoded as the ABSENCE of events. MME's lanes interpolate
+  // linearly between points, so importing a file verbatim turned every held
+  // value into a slow ramp — a stepped lane (one CC value per image in a
+  // folder, say) exported fine and came back as a diagonal line, because the
+  // point that had been holding the value steady was never in the file to
+  // begin with. Re-insert it: before any event that follows a gap, add a point
+  // carrying the PREVIOUS value, so the curve stays flat and then jumps.
+  //
+  // Only for gaps wider than the sampling period. A continuously moving curve
+  // emits an event every ppq/ccRes ticks; interpolating between those is both
+  // what was meant and visually identical to stepping them, so guarding each
+  // one would double the point count of every smooth curve for no gain.
+  function restoreHeldCcPoints(points){
+    if(!points||points.length<2) return points||[];
+    const gapMin=Math.max(1,Math.round(state.ppq/state.ccRes));
+    const out=[];
+    for(let i=0;i<points.length;i++){
+      const cur=points[i], prev=i>0?points[i-1]:null;
+      if(prev && (cur.t-prev.t)>gapMin && cur.v!==prev.v) out.push({t:cur.t-1,v:prev.v});
+      out.push({t:cur.t,v:cur.v});
+    }
+    return out;
+  }
   function parseMidi(buf){ const dv=new DataView(buf); let p=0; const rd=n=>{let v=0;for(let i=0;i<n;i++){v=(v<<8)|dv.getUint8(p++);}return v;};
     if(rd(4)!==0x4D546864) throw new Error('Not a MIDI file'); rd(4); const fmt=rd(2), ntrk=rd(2), div=rd(2);
     const notes=[], ccMap={}, pbMap={}, cpMap={}, tsEvents=[], tempoEvents=[], markers=[]; let bpm=120, tsN=4,tsD=4, mmvMeta=null;
@@ -8214,9 +8298,9 @@
       state.markers.forEach(m=>maxT=Math.max(maxT,m.tick));
       state.bars=Math.max(1,Math.ceil(maxT/ticksPerBar())+1);
       state.ccLanes.forEach(l=>l._row&&l._row.remove()); state.ccLanes=[];
-      Object.values(r.ccMap).forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:64},{t:totalTicks(),v:64}]; });
-      Object.values(r.pbMap||{}).forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; });
-      Object.values(r.cpMap||{}).forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?l.points.map(pt=>({t:pt.t,v:pt.v})):[{t:0,v:0},{t:totalTicks(),v:0}]; });
+      Object.values(r.ccMap).forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?restoreHeldCcPoints(l.points.map(pt=>({t:pt.t,v:pt.v}))):[{t:0,v:64},{t:totalTicks(),v:64}]; });
+      Object.values(r.pbMap||{}).forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?restoreHeldCcPoints(l.points.map(pt=>({t:pt.t,v:pt.v}))):[{t:0,v:0},{t:totalTicks(),v:0}]; });
+      Object.values(r.cpMap||{}).forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?restoreHeldCcPoints(l.points.map(pt=>({t:pt.t,v:pt.v}))):[{t:0,v:0},{t:totalTicks(),v:0}]; });
       if(!state.ccLanes.length) addLane(1,0);
       if(r.mmvMeta){
         state.pitchNames=r.mmvMeta.pitchNames||{};
@@ -8292,9 +8376,9 @@
     // the marker already there rather than hiding one underneath another.
     mkList.forEach(m=>addMarker(m.tick,m.name));
     const newLanes=[];
-    ccList.forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:64},{t:totalTicks(),v:64}]; newLanes.push(lane); });
-    pbList.forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
-    cpList.forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?l.points.map(shiftPt):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
+    ccList.forEach((l)=>{ const lane=addLane(l.cc,l.ch); lane.points=l.points.length?restoreHeldCcPoints(l.points.map(shiftPt)):[{t:0,v:64},{t:totalTicks(),v:64}]; newLanes.push(lane); });
+    pbList.forEach((l)=>{ const lane=addPbLane(l.ch); lane.points=l.points.length?restoreHeldCcPoints(l.points.map(shiftPt)):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
+    cpList.forEach((l)=>{ const lane=addCpLane(l.ch); lane.points=l.points.length?restoreHeldCcPoints(l.points.map(shiftPt)):[{t:0,v:0},{t:totalTicks(),v:0}]; newLanes.push(lane); });
     if(r.mmvMeta){
       Object.assign(state.pitchNames, r.mmvMeta.pitchNames||{});
       const ln=r.mmvMeta.laneNames||{};
