@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.61
+  MMV MIDI & CC Curve Editor v0.9.62
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1769,6 +1769,45 @@
   their imported lanes gain a guard point, with every original point still at
   its own tick and value.
 
+  v0.9.62 — Save As.
+
+  A second save button beside Save Project. It opens a folder picker, then a
+  sheet that shows exactly where the .mmvp will be written and what else has to
+  travel with it.
+
+  It picks a FOLDER rather than a file, and that is the whole design. A file
+  picker (showSaveFilePicker) gives a nicer dialog but hands back a file handle
+  with NO access to its parent — so MME would save the .mmvp and then be unable
+  to find the project's audio or file its exports, which is precisely the thing
+  Save As exists to avoid. Picking the folder keeps all of that working.
+
+  The sheet offers both shapes and shows which is which rather than guessing
+  silently: a new folder named after the project inside what you picked (the
+  usual case — pick "Visuals", get "Visuals/Chapter 3/Chapter 3.mmvp"), or
+  straight into the folder you picked, defaulted to that when the chosen folder
+  already holds a .mmvp and so is plainly a project folder already. The exact
+  path is echoed under the choice and updates as you type the name.
+
+  Underneath it lists every audio clip with where it sits now and where it has
+  to end up — "from Music Project 1/Audio/01-intro.wav" / "to Music Project
+  2/Audio/01-intro.wav" — because a project that arrives without its audio
+  opens silent and it is not obvious why. MME does not copy them: a full show
+  is gigabytes, and streaming that through the browser unasked is not something
+  to start behind your back. It says so on the sheet rather than leaving the
+  omission to be discovered.
+
+  On save, MME re-homes onto the new location: the project is renamed to match,
+  the new folder becomes the active project folder, and the folder is
+  remembered — the PARENT when a new folder was made, so sibling projects in
+  the same place are listed too, or the folder itself when saving straight in.
+  Exports, the audio search and the shader path all follow from that point.
+
+  Thirteen new checks. One of them is the dialog rendering at all: the header
+  was built with escHtml, which lives inside the ISF section's private scope
+  and is invisible from here, so the sheet would have thrown on open. It builds
+  its nodes with textContent now, which needs no escaping and cannot be got
+  wrong.
+
 -->
 
 
@@ -2600,6 +2639,7 @@
       <span class="lbl">Project</span>
       <input type="text" id="projectName" placeholder="Project name" style="flex:1;min-width:120px;font-size:12px;" title="Project name — used as the filename when exporting">
       <button id="saveProjectBtn" class="icon-btn" title="Save project as a .mmvp file (includes all notes, CC, settings — audio must be reloaded separately)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg></button>
+      <button id="saveProjectAsBtn" class="icon-btn" title="Save As — choose where this project lives. Opens a folder picker, then reports which audio files need copying across so it still opens with its audio."><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 13V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8"/><path d="M15 3v5H7V3"/><path d="M18 15v6"/><path d="M15 18h6"/></svg></button>
       <div id="projWrapper">
         <button id="loadProjectBtn" class="icon-btn" title="Load a previously saved .mmvp project file"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
         <div id="projPopover">
@@ -7768,6 +7808,196 @@
     a.download=projFilename('.mmvp'); a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
     autosaveMarkClean();
   }
+  // ---------- Save As ----------
+  // Picks a FOLDER, not a file. showSaveFilePicker would give a nicer dialog
+  // but hands back a file handle with no access to its parent — and MME needs
+  // the containing folder to find the project's audio and to file its exports.
+  // A file handle alone would save the .mmvp and quietly strand everything
+  // else, which is the opposite of what Save As is for.
+  //
+  // Reports what has to travel with the project rather than moving it: a
+  // 100-minute show is gigabytes, and silently streaming that through the
+  // browser is not something to start without asking.
+  function projectAudioMoveList(destProjectName){
+    const cs=audioClips();
+    if(!cs.length) return [];
+    const fromFolder=projDirHandle?projDirHandle.name:null;
+    return cs.map(function(c){
+      return {
+        name:c.name,
+        loaded:audioBufs.has(c.id),
+        from:fromFolder?(fromFolder+'/'+PROJ_SUBDIR_AUDIO+'/'+c.name):'(not opened from a folder — wherever you loaded it from)',
+        to:destProjectName+'/'+PROJ_SUBDIR_AUDIO+'/'+c.name,
+      };
+    });
+  }
+  async function saveProjectAs(){
+    if(!hasFSA){ flash('Save As needs a browser with folder access (Chrome or Edge). Use Save Project to download the file instead.'); return; }
+    let dest;
+    try{ dest=await window.showDirectoryPicker({id:'mmv-projects',mode:'readwrite'}); }
+    catch(e){ if(e.name!=='AbortError') flash('Could not open that folder: '+e.message); return; }
+
+    // Does the chosen folder already look like a project folder? If it holds a
+    // .mmvp it almost certainly is, and nesting another folder inside it would
+    // be wrong. Otherwise it is a parent like "Visuals" and the project wants
+    // its own folder in it.
+    let looksLikeProjectFolder=false;
+    try{
+      for await (const [n,h] of dest.entries()){
+        if(h.kind==='file'&&/\.mmvp$/i.test(n)){ looksLikeProjectFolder=true; break; }
+      }
+    }catch(e){ /* unreadable — fall back to offering a new folder */ }
+
+    const suggested=(state.projectName||'').trim()||'Untitled project';
+    showSaveAsDialog(dest,suggested,looksLikeProjectFolder);
+  }
+  function showSaveAsDialog(dest,suggestedName,intoDestDirectly){
+    const existing=document.getElementById('saveAsDialog'); if(existing) existing.remove();
+    const dlg=document.createElement('dialog');
+    dlg.id='saveAsDialog';
+    dlg.style.cssText='background:#1d2027;color:#c8cdd8;border:1px solid #2c313b;border-radius:8px;padding:0;width:min(620px,95vw);max-height:88vh;overflow:hidden;display:flex;flex-direction:column;';
+
+    const hdr=document.createElement('div');
+    hdr.style.cssText='padding:14px 18px 10px;border-bottom:1px solid #2c313b;flex-shrink:0;';
+    // Built as nodes rather than innerHTML: a folder name is user data, and
+    // escHtml lives inside the ISF section's own scope and is not visible here
+    // anyway — textContent needs no escaping and cannot be got wrong.
+    const hTitle=document.createElement('div');
+    hTitle.style.cssText='font-size:14px;font-weight:700;color:#e0e4ef;';
+    hTitle.textContent='Save project as';
+    const hSub=document.createElement('div');
+    hSub.style.cssText='font-size:11px;color:#7a8099;margin-top:3px;';
+    hSub.appendChild(document.createTextNode('Chosen folder: '));
+    const hName=document.createElement('b'); hName.style.color='#4fa3ff'; hName.textContent=dest.name;
+    hSub.appendChild(hName);
+    hdr.appendChild(hTitle); hdr.appendChild(hSub);
+    dlg.appendChild(hdr);
+
+    const body=document.createElement('div');
+    body.style.cssText='padding:12px 18px;overflow:auto;display:flex;flex-direction:column;gap:10px;';
+
+    const nameRow=document.createElement('div');
+    nameRow.style.cssText='display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
+    const nameLbl=document.createElement('span'); nameLbl.textContent='Project name'; nameLbl.style.cssText='font-size:11px;color:#7a8099;';
+    const nameI=document.createElement('input'); nameI.type='text'; nameI.id='saveAsName'; nameI.value=suggestedName;
+    nameI.style.cssText='flex:1 1 220px;min-width:0;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:4px 7px;font-size:12px;';
+    nameRow.appendChild(nameLbl); nameRow.appendChild(nameI);
+    body.appendChild(nameRow);
+
+    // Where the .mmvp actually goes. Defaulted from what the chosen folder
+    // looks like, but always visible and always changeable — guessing silently
+    // is how a project ends up somewhere the user did not intend.
+    const placeRow=document.createElement('div');
+    placeRow.style.cssText='display:flex;flex-direction:column;gap:4px;font-size:11px;color:#c8cdd8;';
+    const optNew=document.createElement('label'); optNew.style.cssText='display:flex;gap:6px;align-items:center;cursor:pointer;';
+    const rbNew=document.createElement('input'); rbNew.type='radio'; rbNew.name='saveAsPlace'; rbNew.id='saveAsPlaceNew'; rbNew.checked=!intoDestDirectly;
+    const newTxt=document.createElement('span');
+    optNew.appendChild(rbNew); optNew.appendChild(newTxt);
+    const optHere=document.createElement('label'); optHere.style.cssText='display:flex;gap:6px;align-items:center;cursor:pointer;';
+    const rbHere=document.createElement('input'); rbHere.type='radio'; rbHere.name='saveAsPlace'; rbHere.id='saveAsPlaceHere'; rbHere.checked=!!intoDestDirectly;
+    const hereTxt=document.createElement('span'); hereTxt.textContent='Straight into '+dest.name+'/';
+    optHere.appendChild(rbHere); optHere.appendChild(hereTxt);
+    placeRow.appendChild(optNew); placeRow.appendChild(optHere);
+    body.appendChild(placeRow);
+
+    const pathEcho=document.createElement('div');
+    pathEcho.style.cssText='font-family:ui-monospace,Consolas,monospace;font-size:10px;color:#7a8099;word-break:break-all;';
+    body.appendChild(pathEcho);
+
+    const moveTitle=document.createElement('div');
+    moveTitle.style.cssText='font-size:11px;font-weight:700;color:#e0e4ef;margin-top:4px;';
+    body.appendChild(moveTitle);
+    const moveBox=document.createElement('div');
+    moveBox.style.cssText='font-size:11px;color:#c8cdd8;display:flex;flex-direction:column;gap:5px;max-height:34vh;overflow:auto;';
+    body.appendChild(moveBox);
+
+    function safeName(n){ return (n||'').trim().replace(/[^a-z0-9_\-. ]/gi,'_').replace(/\s+/g,' ').trim(); }
+    function refresh(){
+      const base=safeName(nameI.value)||'Untitled project';
+      const folder=rbNew.checked?base:dest.name;
+      newTxt.textContent='Into a new folder "'+base+'" inside '+dest.name+'/';
+      pathEcho.textContent=(rbNew.checked?(dest.name+'/'+base+'/'):(dest.name+'/'))+base+'.mmvp';
+      const list=projectAudioMoveList(folder);
+      moveBox.textContent='';
+      if(!list.length){
+        moveTitle.textContent='Files to copy across';
+        const none=document.createElement('div'); none.style.color='#7a8099';
+        none.textContent='None — this project has no audio clips, so nothing else has to travel with it.';
+        moveBox.appendChild(none);
+        return;
+      }
+      moveTitle.textContent='Copy these '+list.length+' audio file'+(list.length===1?'':'s')+' across yourself, or the project opens without its audio';
+      list.forEach(function(f){
+        const row=document.createElement('div');
+        row.style.cssText='border-left:2px solid #3a404e;padding-left:7px;';
+        const nm=document.createElement('div'); nm.style.cssText='color:#e0e4ef;';
+        nm.textContent=f.name+(f.loaded?'':'  (already missing)');
+        const fr=document.createElement('div'); fr.style.cssText='color:#7a8099;font-family:ui-monospace,Consolas,monospace;font-size:10px;';
+        fr.textContent='from  '+f.from;
+        const to=document.createElement('div'); to.style.cssText='color:#7ed957;font-family:ui-monospace,Consolas,monospace;font-size:10px;';
+        to.textContent='to    '+f.to;
+        row.appendChild(nm); row.appendChild(fr); row.appendChild(to);
+        moveBox.appendChild(row);
+      });
+    }
+    nameI.addEventListener('input',refresh);
+    rbNew.addEventListener('change',refresh);
+    rbHere.addEventListener('change',refresh);
+    dlg.appendChild(body);
+
+    const footer=document.createElement('div');
+    footer.style.cssText='padding:10px 18px;border-top:1px solid #2c313b;flex-shrink:0;display:flex;gap:8px;align-items:center;';
+    const note=document.createElement('span');
+    note.style.cssText='font-size:10px;color:#7a8099;flex:1;';
+    note.textContent='MME cannot copy the audio for you — a full show is gigabytes, and that is not something to start behind your back.';
+    const cancel=document.createElement('button');
+    cancel.textContent='Cancel'; cancel.id='saveAsCancelBtn';
+    cancel.style.cssText='background:#2c313b;color:#c8cdd8;border:1px solid #3a404e;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;';
+    cancel.addEventListener('click',function(){ dlg.close(); dlg.remove(); });
+    const ok=document.createElement('button');
+    ok.textContent='Save here'; ok.id='saveAsConfirmBtn';
+    ok.style.cssText='background:#4fa3ff;color:#0d0f14;border:none;border-radius:4px;padding:6px 18px;cursor:pointer;font-size:13px;font-weight:700;';
+    ok.addEventListener('click',async function(){
+      const base=safeName(nameI.value)||'Untitled project';
+      const intoNew=rbNew.checked;
+      dlg.close(); dlg.remove();
+      await commitSaveAs(dest,base,intoNew);
+    });
+    footer.appendChild(note); footer.appendChild(cancel); footer.appendChild(ok);
+    dlg.appendChild(footer);
+
+    document.body.appendChild(dlg);
+    refresh();
+    dlg.showModal();
+    nameI.focus(); nameI.select();
+  }
+  // Writes the project to the chosen place and re-homes MME on it: the folder
+  // is remembered (so its audio and exports resolve from now on) and becomes
+  // the active project folder.
+  async function commitSaveAs(dest,base,intoNewFolder){
+    try{
+      if(!await verifyDirPermission(dest,true)){ flash('No permission to write to that folder.'); return null; }
+      const target=intoNewFolder?await ensureSubDir(dest,base):dest;
+      if(!target){ flash('Could not create the folder "'+base+'".'); return null; }
+      state.projectName=base;
+      if($('projectName')) $('projectName').value=base;
+      const cs=audioClips();
+      const data={version:1,projectName:base,audioFile:cs.length?cs[0].name:'',snapshot:JSON.parse(snapshot())};
+      const fh=await target.getFileHandle(base+'.mmvp',{create:true});
+      const w=await fh.createWritable(); await w.write(JSON.stringify(data,null,2)); await w.close();
+
+      // Remember the PARENT when a new folder was made, so sibling projects in
+      // the same place are listed too; otherwise remember the folder itself.
+      const root=intoNewFolder?dest:target;
+      if(await projDirIndexOf(root)<0){ projDirs.push(root); await saveProjDirs(); }
+      projDirHandle=target;
+      renderProjFolders(); updateIsfPathPreview(); autosaveMarkClean();
+      const n=cs.length;
+      flash('Saved to '+target.name+'/'+base+'.mmvp'
+        +(n?(' — now copy '+n+' audio file'+(n===1?'':'s')+' into '+target.name+'/'+PROJ_SUBDIR_AUDIO+'/'):''));
+      return target;
+    }catch(e){ flash('Save As failed: '+e.message); return null; }
+  }
   function loadProject(file){
     const fr=new FileReader(); fr.onload=async()=>{
       try{
@@ -9993,6 +10223,7 @@
     flash('Cleared '+doomed.length+' key name'+(doomed.length!==1?'s':'')+(v==='all'?' (all channels)':' on '+chLabelFor(+v))+' — Ctrl+Z to undo');
   });
   $('saveProjectBtn').onclick=saveProject;
+  $('saveProjectAsBtn').onclick=saveProjectAs;
   $('loadProjectBtn').addEventListener('click',e=>{ e.stopPropagation();
     if(!hasFSA){ $('projectFileInput').click(); return; }
     const open=$('projPopover').classList.toggle('open');

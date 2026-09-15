@@ -252,6 +252,11 @@ function buildTestHtml() {
       '  window._TEST_addTsMapChange = (bar, num, den) => addTsMapChange(bar, num, den);',
       '  window._TEST_updateIsfPathPreview = () => updateIsfPathPreview();',
       '  window._TEST_restoreHeldCcPoints = (pts) => restoreHeldCcPoints(pts);',
+      // v0.9.62 Save As. showSaveAsDialog is driven directly so the folder
+      // picker (which cannot be scripted) is out of the way.
+      '  window._TEST_showSaveAsDialog = (dest, name, into) => showSaveAsDialog(dest, name, into);',
+      '  window._TEST_commitSaveAs = (dest, base, intoNew) => commitSaveAs(dest, base, intoNew);',
+      '  window._TEST_projectAudioMoveList = (n) => projectAudioMoveList(n);',
       '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
       '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
@@ -4335,6 +4340,135 @@ async function run() {
     });
     check('...while a project already in its own folder keeps saving there, not nesting deeper',
       again.active === 'Chapter 7', again);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  // ---------------- Save As (v0.9.62) ----------------
+
+  await withPage(browser, async (page) => {
+    // Save As picks a FOLDER, not a file: showSaveFilePicker returns a file
+    // handle with no access to its parent, and MME needs the containing folder
+    // to find the project's audio and file its exports. The dialog is opened
+    // directly here — the OS picker itself cannot be driven from a test.
+    const wav = makeWavBytes(1);
+    await page.evaluate(async (b) => {
+      const f = new File([new Uint8Array(b)], 'overture.wav', { type: 'audio/wav' });
+      await window._TEST_loadAudio(f);
+    }, wav);
+    await page.waitForTimeout(300);
+
+    const shown = await page.evaluate(async (fs) => {
+      eval(fs);
+      const dest = new window.MockDirHandle('Visuals');
+      window.__dest = dest;
+      window._TEST_state.projectName = 'Chapter 3';
+      window._TEST_showSaveAsDialog(dest, 'Chapter 3', false);
+      const dlg = document.getElementById('saveAsDialog');
+      return {
+        open: !!dlg,
+        text: dlg ? dlg.textContent : '',
+        path: dlg ? dlg.querySelector('div[style*="monospace"]').textContent : '',
+      };
+    }, MOCK_FS);
+    // This is also the check that would have caught calling escHtml from out
+    // here: it lives in the ISF section's scope, so the dialog would have
+    // thrown on open rather than rendering at all.
+    check('the Save As dialog opens and names the chosen folder', shown.open && /Visuals/.test(shown.text), shown.text.slice(0, 120));
+    check('...echoing exactly where the .mmvp will be written',
+      shown.path === 'Visuals/Chapter 3/Chapter 3.mmvp', shown.path);
+    check('...and listing the audio that has to be copied across, from where to where',
+      /overture\.wav/.test(shown.text) && /Chapter 3\/Audio\/overture\.wav/.test(shown.text), shown.text.slice(-300));
+
+    // Switching to "straight into the chosen folder" changes both the path and
+    // where the audio is said to belong.
+    const direct = await page.evaluate(() => {
+      document.getElementById('saveAsPlaceHere').checked = true;
+      document.getElementById('saveAsPlaceHere').dispatchEvent(new Event('change'));
+      const dlg = document.getElementById('saveAsDialog');
+      return { path: dlg.querySelector('div[style*="monospace"]').textContent, text: dlg.textContent };
+    });
+    check('choosing "straight into" drops the extra folder from the path',
+      direct.path === 'Visuals/Chapter 3.mmvp', direct.path);
+    check('...and the copy list follows it', /Visuals\/Audio\/overture\.wav/.test(direct.text), direct.text.slice(-260));
+
+    await page.evaluate(() => { const d = document.getElementById('saveAsDialog'); if (d) { d.close(); d.remove(); } });
+  });
+
+  await withPage(browser, async (page) => {
+    // Committing it: the file lands in the right place and MME re-homes on it,
+    // so exports and the audio search follow the project to its new home.
+    const out = await page.evaluate(async (fs) => {
+      eval(fs);
+      const dest = new window.MockDirHandle('Visuals');
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      window._TEST_state.projectName = 'Old name';
+      const target = await window._TEST_commitSaveAs(dest, 'Chapter 9', true);
+      const made = dest._dirs.get('Chapter 9');
+      return {
+        wrote: !!made && [...made._files.keys()],
+        looseInDest: [...dest._files.keys()],
+        active: window._TEST_projDirPrimary(),
+        remembered: window._TEST_projDirs(),
+        projectName: window._TEST_state.projectName,
+        nameField: document.getElementById('projectName').value,
+        targetName: target ? target.name : null,
+      };
+    }, MOCK_FS);
+    check('Save As writes the .mmvp into the new folder, not loose in the folder you picked',
+      Array.isArray(out.wrote) && out.wrote.includes('Chapter 9.mmvp') && out.looseInDest.length === 0, out);
+    check('...renames the project to match, in state and in the toolbar field',
+      out.projectName === 'Chapter 9' && out.nameField === 'Chapter 9', out);
+    check('...makes the new folder the active one, so exports and audio follow the project',
+      out.active === 'Chapter 9' && out.targetName === 'Chapter 9', out);
+    check('...and remembers the PARENT, so sibling projects in the same place are listed too',
+      out.remembered.join(',') === 'Visuals', out.remembered);
+
+    // Saving straight into a folder remembers that folder itself.
+    const direct = await page.evaluate(async (fs) => {
+      eval(fs);
+      const dest = new window.MockDirHandle('Just This One');
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      await window._TEST_commitSaveAs(dest, 'Solo', false);
+      return { files: [...dest._files.keys()], active: window._TEST_projDirPrimary(), remembered: window._TEST_projDirs() };
+    }, MOCK_FS);
+    check('saving straight into a folder writes there and remembers that folder itself',
+      direct.files.includes('Solo.mmvp') && direct.active === 'Just This One'
+      && direct.remembered.join(',') === 'Just This One', direct);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  await withPage(browser, async (page) => {
+    // The move list is the point of the feature: it has to say where each file
+    // is now and where it must end up, and stay honest when there is no audio.
+    const empty = await page.evaluate(() => window._TEST_projectAudioMoveList('Somewhere'));
+    check('a project with no audio has nothing to copy across', empty.length === 0, empty);
+
+    const wav = makeWavBytes(1);
+    await page.evaluate(async (b) => {
+      for (const n of ['01-intro.wav', '02-verse.wav']) {
+        await window._TEST_loadAudio(new File([new Uint8Array(b)], n, { type: 'audio/wav' }));
+      }
+    }, wav);
+    await page.waitForTimeout(400);
+    const listed = await page.evaluate(async (fs) => {
+      eval(fs);
+      window._TEST_setProjDirPrimary(new window.MockDirHandle('Music Project 1'));
+      return window._TEST_projectAudioMoveList('Music Project 2');
+    }, MOCK_FS);
+    check('every audio clip is listed with its current folder and its destination',
+      listed.length === 2
+      && listed[0].from === 'Music Project 1/Audio/01-intro.wav'
+      && listed[0].to === 'Music Project 2/Audio/01-intro.wav'
+      && listed[1].to === 'Music Project 2/Audio/02-verse.wav', listed);
+
+    const stranded = await page.evaluate(() => {
+      window._TEST_setProjDirPrimary(null);
+      return window._TEST_projectAudioMoveList('Music Project 2');
+    });
+    check('...and with no folder to have come from, it says so rather than inventing one',
+      /not opened from a folder/.test(stranded[0].from), stranded[0]);
     await page.evaluate(() => window._TEST_setProjDirs([]));
   });
 
