@@ -257,6 +257,7 @@ function buildTestHtml() {
       '  window._TEST_showSaveAsDialog = (dest, name, into) => showSaveAsDialog(dest, name, into);',
       '  window._TEST_commitSaveAs = (dest, base, intoNew) => commitSaveAs(dest, base, intoNew);',
       '  window._TEST_projectAudioMoveList = (n) => projectAudioMoveList(n);',
+      '  window._TEST_savingToText = () => { renderProjFolders(); const e = document.getElementById("projSavingTo"); return e ? e.textContent : null; };',
       '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
       '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
@@ -4340,6 +4341,84 @@ async function run() {
     });
     check('...while a project already in its own folder keeps saving there, not nesting deeper',
       again.active === 'Chapter 7', again);
+    await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  // ---------------- "Saving to" line (v0.9.63) ----------------
+
+  await withPage(browser, async (page) => {
+    // The amber row in Project Folders only marks the active folder when it is
+    // one of the remembered ones. Open a project from its own folder and the
+    // active folder is a level down, so nothing was highlighted at all and
+    // there was no way to see where a Save would land.
+    const r = await page.evaluate(async (fs) => {
+      eval(fs);
+      const visuals = new window.MockDirHandle('Visuals');
+      const chapter = new window.MockDirHandle('Chapter 1');
+      const out = {};
+
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      out.none = window._TEST_savingToText();
+
+      window._TEST_setProjDirs([visuals]);          // active = the remembered root
+      out.atRoot = window._TEST_savingToText();
+
+      // As if a project had been opened from its own folder: active is the
+      // subfolder, which is NOT in the remembered list.
+      window._TEST_setProjDirPrimary(chapter);
+      out.subNoParent = window._TEST_savingToText();
+      out.noRowHighlighted = document.querySelectorAll('#projFolders .pf.primary').length;
+      return out;
+    }, MOCK_FS);
+
+    check('with no folder active it says so plainly, rather than leaving Save\'s destination a mystery',
+      /Saving to/.test(r.none) && /nowhere yet/.test(r.none), r.none);
+    check('with a remembered folder active it names that folder', /Saving to\s*Visuals/.test(r.atRoot), r.atRoot);
+    check('...and it still reports the destination when the active folder is a subfolder',
+      /Chapter 1/.test(r.subNoParent), r.subNoParent);
+    check('...which is exactly the case where no row in the list is highlighted at all',
+      r.noRowHighlighted === 0, r.noRowHighlighted);
+  });
+
+  await withPage(browser, async (page) => {
+    // Saving a new project makes its folder under the remembered root, so the
+    // line should read as a path: the root, then the project's own folder.
+    const r = await page.evaluate(async (fs) => {
+      eval(fs);
+      const visuals = new window.MockDirHandle('Visuals');
+      window._TEST_setProjDirs([visuals]);
+      window._TEST_state.projectName = 'Chapter 7';
+      await window._TEST_saveProject();
+      return { text: window._TEST_savingToText(), active: window._TEST_projDirPrimary() };
+    }, MOCK_FS);
+    check('after a new project makes its own folder, the line reads as a path — root then project folder',
+      /Visuals\s*\/\s*Chapter 7/.test(r.text.replace(/\s+/g, ' ')) && r.active === 'Chapter 7',
+      { text: r.text, active: r.active });
+
+    // Save As into a new folder names its parent the same way.
+    const viaSaveAs = await page.evaluate(async (fs) => {
+      eval(fs);
+      const dest = new window.MockDirHandle('Archive');
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      await window._TEST_commitSaveAs(dest, 'Chapter 8', true);
+      return window._TEST_savingToText();
+    }, MOCK_FS);
+    check('...and so does Save As when it creates a folder',
+      /Archive\s*\/\s*Chapter 8/.test(viaSaveAs.replace(/\s+/g, ' ')), viaSaveAs);
+
+    // Saving straight into a picked folder has no parent to show.
+    const flat = await page.evaluate(async (fs) => {
+      eval(fs);
+      const dest = new window.MockDirHandle('Just This One');
+      window._TEST_setProjDirs([]);
+      window._TEST_setProjDirPrimary(null);
+      await window._TEST_commitSaveAs(dest, 'Solo', false);
+      return window._TEST_savingToText();
+    }, MOCK_FS);
+    check('...while saving straight into a folder shows that folder alone, with no invented parent',
+      /Just This One/.test(flat) && !/\//.test(flat), flat);
     await page.evaluate(() => window._TEST_setProjDirs([]));
   });
 
