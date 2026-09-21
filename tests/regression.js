@@ -4445,6 +4445,106 @@ async function run() {
     check('...and running it again changes nothing', same.before === same.after, same);
   });
 
+  // ---------------- Tempo/TS map past the project end (v0.9.65) ----------------
+  await withPage(browser, async (page) => {
+    // The second half of the same report: after Fit the project read 5 minutes
+    // in MME, but both exports still imported into MMV at the original length.
+    // buildMidi and buildSyncTrack wrote the WHOLE tempo and time-signature map
+    // at its original ticks, so the last event in the file was a tempo change in
+    // empty space far beyond the end, and that set the file's duration.
+    const setup = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 2700;
+      s.notes = [];
+      s.markers = [];
+      s.tempoMap = [{ tick: 0, bpm: 120 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }];
+      for (let bar = 100; bar <= 2600; bar += 250) {
+        s.tempoMap.push({ tick: bar * 1920, bpm: 100 + (bar % 60) });
+        s.tsMap.push({ tick: bar * 1920, num: (bar % 2) ? 3 : 4, den: 4 });
+      }
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_upsertPoint(id, 0, 0);
+      window._TEST_upsertPoint(id, 150 * 1920, 100);
+      return { tempo: s.tempoMap.length, ts: s.tsMap.length };
+    });
+    check('setup: the project carries a tempo and TS map spanning the original show',
+      setup.tempo > 5 && setup.ts > 5, setup);
+
+    const lastTick = (bytes) => decodeMidiEvents(bytes).events.reduce((m, e) => Math.max(m, e.tick), 0);
+
+    const beforeMid = lastTick(await page.evaluate(() => window._TEST_buildMidi({})));
+    const beforeSync = lastTick(await page.evaluate(() => window._TEST_buildSyncTrack2()));
+
+    await page.evaluate(() => window._TEST_fitBarsToContent());
+    await page.waitForTimeout(80);
+    const total = await page.evaluate(() => window._TEST_totalTicks());
+
+    check('while it was still declared 2700 bars, both files ran far past where Fit now puts the end',
+      beforeMid > total * 5 && beforeSync > total * 5, { beforeMid, beforeSync, total });
+
+    const midBytes = await page.evaluate(() => window._TEST_buildMidi({}));
+    const syncBytes = await page.evaluate(() => window._TEST_buildSyncTrack2());
+    const midEv = decodeMidiEvents(midBytes).events;
+    const syncEv = decodeMidiEvents(syncBytes).events;
+
+    check('the exported .mid now ends within the project, not beyond it',
+      midEv.every(e => e.tick <= total), { last: midEv.reduce((m, e) => Math.max(m, e.tick), 0), total });
+    check('...and the sync track does too — the duration MMV reads back',
+      syncEv.every(e => e.tick <= total), { last: syncEv.reduce((m, e) => Math.max(m, e.tick), 0), total });
+
+    const strays = (ev) => ev.filter(e => e.kind === 'meta' && (e.meta === 0x51 || e.meta === 0x58) && e.tick > total);
+    check('no tempo or time-signature change is written past the end of the project',
+      strays(midEv).length === 0 && strays(syncEv).length === 0,
+      { mid: strays(midEv).length, sync: strays(syncEv).length });
+
+    // Nothing audible may be lost: whatever tempo governs the final bar has to
+    // still be in the file, which means the last surviving entry is the one at
+    // or before the end, not simply "the early ones".
+    const govern = await page.evaluate((t) => {
+      const m = window._TEST_state.tempoMap.slice().sort((a, b) => a.tick - b.tick);
+      let seg = m[0];
+      for (const x of m) { if (x.tick <= t) seg = x; else break; }
+      return seg;
+    }, total);
+    const tempos = midEv.filter(e => e.kind === 'meta' && e.meta === 0x51);
+    const lastTempoBpm = Math.round(60000000 / ((tempos[tempos.length - 1].data[0] << 16)
+      | (tempos[tempos.length - 1].data[1] << 8) | tempos[tempos.length - 1].data[2]));
+    check('...while the tempo governing the final bar survives — clipping drops nothing that plays',
+      lastTempoBpm === Math.round(govern.bpm), { lastTempoBpm, governing: govern });
+
+    // Clipped at export, not deleted from the project: lengthening it again has
+    // to bring the later changes back, or Fit would be quietly destructive.
+    const restored = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 2700;
+      const ev = window._TEST_buildMidi({});
+      return { bars: s.bars, mapStillThere: s.tempoMap.length, bytes: ev.length };
+    });
+    const afterGrow = lastTick(await page.evaluate(() => window._TEST_buildMidi({})));
+    check('the map itself is untouched — shortening the project never deleted the changes',
+      restored.mapStillThere === setup.tempo, restored);
+    check('...so extending the project again exports them once more',
+      afterGrow > total * 5, { afterGrow, total });
+  });
+
+  await withPage(browser, async (page) => {
+    // A project whose tempo map sits entirely inside it must be unaffected —
+    // the clip has to be a no-op in the ordinary case.
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 40; s.notes = []; s.markers = [];
+      s.tempoMap = [{ tick: 0, bpm: 120 }, { tick: 8 * 1920, bpm: 90 }, { tick: 20 * 1920, bpm: 140 }];
+      s.tsMap = [{ tick: 0, num: 4, den: 4 }, { tick: 16 * 1920, num: 3, den: 4 }];
+      return { bytes: window._TEST_buildMidi({}), total: window._TEST_totalTicks() };
+    });
+    const ev = decodeMidiEvents(r.bytes).events;
+    const nTempo = ev.filter(e => e.kind === 'meta' && e.meta === 0x51).length;
+    const nTs = ev.filter(e => e.kind === 'meta' && e.meta === 0x58).length;
+    check('a map that fits inside the project is exported whole — the clip is a no-op',
+      nTempo === 3 && nTs === 2, { nTempo, nTs, total: r.total });
+  });
+
   // ---------------- "Saving to" line (v0.9.63) ----------------
 
   await withPage(browser, async (page) => {

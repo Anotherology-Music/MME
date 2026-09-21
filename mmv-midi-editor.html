@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.64
+  MMV MIDI & CC Curve Editor v0.9.65
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1853,6 +1853,29 @@
   to bar 150, Fit lands on 151, sync track shrinks by more than 10x, undo puts
   it back), content extent following notes / markers / audio clips rather than
   notes alone, Fit growing as well as shrinking, and a second Fit being a no-op.
+
+
+  v0.9.65 Tempo and time-signature changes past the end are no longer exported.
+  The other half of the v0.9.64 report: after Fit the project read five minutes
+  in MME, but both the .mid and the sync track still imported into MMV at the
+  original length. buildMidi and buildSyncTrack wrote the WHOLE tempo and
+  time-signature map at its original ticks, with no clipping — so a chapter
+  carved out of a ninety-minute show still carried the show's entire map, the
+  last event in the file was a tempo change sitting in empty space an hour and
+  a half in, and that is the duration MMV read back. Measured: project 4m47s,
+  exported file 85m10s, final events "tempo, timesig".
+
+  Both builders now drop map entries past the project end. Nothing audible is
+  lost — the segment governing the final bar starts at or before the end and is
+  still written. The entries are clipped at export, NOT deleted: extending the
+  project again brings them back, so Fit stays non-destructive. Fit now also
+  reports how many changes have been left beyond the end, since the Tempo Map
+  and Time Signature dialogs still list them.
+
+  Nine new checks, including the end-to-end case (2700 bars of map, Fit, both
+  files ending inside the project), that the tempo governing the final bar
+  survives the clip, that the map itself is untouched and re-exports when the
+  project grows, and that a map fitting inside the project is exported whole.
 
 -->
 
@@ -7373,14 +7396,23 @@
   function buildMidi(opts){ opts=opts||{};
     const anySolo=opts.soloOnly&&state.ccLanes.some(l=>l.soloed);
     const ev=[];
-    tempoMapSorted().forEach(s=>{ const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
-    tsMapSorted().forEach(s=>{ const dd=Math.round(Math.log2(s.den)); ev.push({tick:s.tick,o:0,d:[0xFF,0x58,0x04,s.num,dd,24,8]}); });
+    const end=totalTicks(), step=Math.max(1,Math.round(state.ppq/state.ccRes));
+    // Tempo and time-signature changes past the end of the project are dropped,
+    // not exported. Shortening a project does not delete them — they are kept so
+    // that extending it again brings them back — but writing them out would make
+    // the file as long as the LONGEST entry in the map rather than as long as the
+    // project. A five-minute chapter carved out of a ninety-minute show still has
+    // the show's whole tempo map, so it exported as a ninety-minute file whose
+    // final event was a tempo change in empty space, and MMV read that duration
+    // back. Nothing audible is lost: the segment governing the final bar starts
+    // at or before the end and is still written.
+    tempoMapSorted().forEach(s=>{ if(s.tick>end) return; const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
+    tsMapSorted().forEach(s=>{ if(s.tick>end) return; const dd=Math.round(Math.log2(s.den)); ev.push({tick:s.tick,o:0,d:[0xFF,0x58,0x04,s.num,dd,24,8]}); });
     ev.push({tick:0,o:0,d:buildMmvMeta()});
     // Markers are song structure, not automation, so Solo/Mute-only export
     // (which is about which CC lanes go out) never removes them.
     (state.markers||[]).forEach(m=>{ ev.push({tick:Math.max(0,Math.round(m.tick)),o:0,d:markerMetaBytes(markerLabel(m))}); });
     for(const n of state.notes){ const ch=n.ch&15; ev.push({tick:Math.round(n.start),o:2,d:[0x90|ch,n.pitch&127,clamp(n.vel,1,127)]}); ev.push({tick:Math.round(n.start+Math.max(1,n.length)),o:1,d:[0x80|ch,n.pitch&127,0]}); }
-    const end=totalTicks(), step=Math.max(1,Math.round(state.ppq/state.ccRes));
     for(const lane of state.ccLanes){ if(!lane.points.length||lane.visible===false) continue;
       if(anySolo&&!lane.soloed) continue;
       if(opts.excludeMuted&&lane.muted) continue;
@@ -7420,7 +7452,11 @@
     // velocity is offset by +1 so it is always >= 1 (velocity 0 = Note Off in MIDI).
     // Decoder: bar = floor(beatIdx / tsNum), beat = beatIdx % tsNum
     const ev=[];
-    tempoMapSorted().forEach(s=>{ const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
+    // Clipped to the project length for the same reason as buildMidi: an
+    // out-of-range tempo change would otherwise be the last event in the file
+    // and set its duration.
+    const syncEnd=totalTicks();
+    tempoMapSorted().forEach(s=>{ if(s.tick>syncEnd) return; const mpqn=Math.round(60000000/s.bpm); ev.push({tick:s.tick,o:0,d:[0xFF,0x51,0x03,(mpqn>>16)&255,(mpqn>>8)&255,mpqn&255]}); });
     const dd=Math.round(Math.log2(state.tsDen));
     ev.push({tick:0,o:0,d:[0xFF,0x58,0x04,state.tsNum,dd,24,8]});
     const tpb=ticksPerBeat(), noteDur=Math.max(1,Math.round(tpb/8)); // 1/32-note pulse
@@ -9547,7 +9583,13 @@
     if(state.locStart!=null&&state.locStart>=total) { state.locStart=null; state.locEnd=null; }
     state.playhead=Math.min(state.playhead,total);
     syncInputs(); updateDuration(); resizeCanvases(); updateLoopStatus(); updatePlayPos(); updatePlayheadEl(); requestDraw();
-    flash('Project '+(want<was?'shortened':'extended')+' from '+was+' to '+want+' bars ('+fmtClock(songSeconds())+') to fit its content.');
+    // Tempo/TS entries beyond the new end are kept (extending the project again
+    // brings them back) and are no longer exported, but the Tempo Map and Time
+    // Signature dialogs still list them — so say so rather than let them be
+    // found later and read as the project still being long.
+    const orphans=state.tempoMap.filter(s=>s.tick>total).length+state.tsMap.filter(s=>s.tick>total).length;
+    flash('Project '+(want<was?'shortened':'extended')+' from '+was+' to '+want+' bars ('+fmtClock(songSeconds())+') to fit its content.'
+      +(orphans?' '+orphans+' tempo/time-signature '+(orphans===1?'change is':'changes are')+' now past the end — kept, but not exported.':''));
   }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
 
