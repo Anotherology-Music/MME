@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.63
+  MMV MIDI & CC Curve Editor v0.9.64
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1830,6 +1830,30 @@
   active, no row in the list is highlighted, and the line still names the
   destination.
 
+
+  v0.9.64 Project length vs content — a "Fit" button beside Bars.
+  Carving a short project out of a long one (Save As, then delete what is not
+  wanted) leaves Bars at the old value: the project length grows with content
+  but has never shrunk when content is removed. The exported .mid was already
+  correct — it only ever carries the events that exist — but the SYNC TRACK is
+  generated from the declared length, one pulse per beat for state.bars, so a
+  five-minute project carved out of a ninety-minute one still exported ninety
+  minutes of sync pulses, and MMV read the old duration back.
+
+  Fit sets Bars to just past the last thing in the project — the last note-off,
+  CC/PB/CP point, marker, or the end of the last audio clip (offset included) —
+  rounded up to the next bar. It shrinks and grows, is a single undo, clamps the
+  loop range and playhead back inside the new length, and says what it did. It
+  never runs on its own: shortening a project is a decision, not a side effect.
+  Exporting a sync track from a project more than a quarter longer than its
+  content now says so and points at Fit, rather than writing the long file
+  silently.
+
+  Eleven new checks: the carve-out case end to end (declared 2700 bars, content
+  to bar 150, Fit lands on 151, sync track shrinks by more than 10x, undo puts
+  it back), content extent following notes / markers / audio clips rather than
+  notes alone, Fit growing as well as shrinking, and a second Fit being a no-op.
+
 -->
 
 
@@ -2694,7 +2718,7 @@
         <span class="pill">BPM</span>
         <span id="tempoVarBadge" class="var-badge">◆</span>
       </div>
-      <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="100" min="1" max="9999"></div>
+      <div class="group"><span class="lbl">Bars</span><input type="number" id="bars" value="100" min="1" max="9999"><button id="barsFitBtn" style="font-size:10px;padding:2px 6px;" title="Fit the project length to what is actually in it — the last note, curve point, marker or audio clip. Deleting content never shortens the project on its own, and a stale length is exported in the sync track.">Fit</button></div>
       <div class="group">
         <span class="lbl">Sig</span>
         <input type="number" id="tsNum" value="4" min="1" max="32">
@@ -7414,7 +7438,18 @@
     const th=[0x4D,0x54,0x72,0x6B,(trk.length>>24)&255,(trk.length>>16)&255,(trk.length>>8)&255,trk.length&255];
     return new Uint8Array([...hdr,...th,...trk]);
   }
-  async function exportSyncTrack(){ await exportMidiFile(buildSyncTrack(),projFilename('-sync.mid')); }
+  // The sync track spans the project's DECLARED length (one pulse per beat for
+  // state.bars), not its content — so a project carved out of a longer one
+  // exports a sync track at the old duration until Bars is fitted. Stating the
+  // duration here is what makes that visible at the moment it matters.
+  async function exportSyncTrack(){
+    await exportMidiFile(buildSyncTrack(),projFilename('-sync.mid'));
+    const total=totalTicks(), content=contentEndTick();
+    if(content>0 && total>content*1.25){
+      flash('Sync track is '+fmtClock(songSeconds())+' long — the project is '+state.bars
+        +' bars but its content ends at '+fmtClock(tickToSeconds(content))+'. Use Fit next to Bars to shorten it.');
+    }
+  }
 
   // ---------- File System Access (recent projects, direct folder save, auto-audio) ----------
   // Chromium-only convenience layer for local use: remembering a "Projects
@@ -9482,6 +9517,38 @@
       if(sel){ sel.style.opacity=on?'1':'0.3'; sel.style.pointerEvents=on?'':'none'; }
     });
   }
+  // The last tick anything actually occupies — notes, curve points of every
+  // lane type, section markers and audio clips. Distinct from totalTicks(),
+  // which is the project's DECLARED length (the Bars field).
+  function contentEndTick(){
+    let end=0;
+    state.notes.forEach(function(n){ end=Math.max(end,n.start+Math.max(1,n.length)); });
+    state.ccLanes.forEach(function(l){ (l.points||[]).forEach(function(p){ end=Math.max(end,p.t); }); });
+    (state.markers||[]).forEach(function(m){ end=Math.max(end,m.tick); });
+    const off=state.audioOffset||0;
+    audioClips().forEach(function(c){ end=Math.max(end,clipEndTick(c)+off); });
+    return Math.max(0,Math.round(end));
+  }
+  // Shrinks (or grows) the project to fit its content. Deleting notes, lanes or
+  // audio never shortens the project on its own — deliberately, since trailing
+  // empty bars are often wanted — but a project carved out of a much longer one
+  // then keeps the old length, and the sync track is generated from that length
+  // rather than from the content, so it comes out at the old duration.
+  function fitBarsToContent(){
+    const end=contentEndTick();
+    const want=Math.max(1,Math.min(MAX_BARS,Math.ceil(end/ticksPerBar())+1));
+    if(want===state.bars){ flash('Project is already '+state.bars+' bars — that is its content.'); return; }
+    pushUndo();
+    const was=state.bars;
+    state.bars=want;
+    // A loop range or playhead left beyond the new end would be unreachable.
+    const total=totalTicks();
+    if(state.locEnd!=null&&state.locEnd>total) state.locEnd=total;
+    if(state.locStart!=null&&state.locStart>=total) { state.locStart=null; state.locEnd=null; }
+    state.playhead=Math.min(state.playhead,total);
+    syncInputs(); updateDuration(); resizeCanvases(); updateLoopStatus(); updatePlayPos(); updatePlayheadEl(); requestDraw();
+    flash('Project '+(want<was?'shortened':'extended')+' from '+was+' to '+want+' bars ('+fmtClock(songSeconds())+') to fit its content.');
+  }
   function updateDuration(){ $('durDisp').textContent = state.durMode==='secs' ? fmtSecs(songSeconds()) : fmtHMS(songSeconds()); }
 
   function populateViewCh(){
@@ -9908,6 +9975,7 @@
   $('quantIterBtn').addEventListener('click',()=>{ state.quantIterative=!state.quantIterative; $('quantIterBtn').classList.toggle('on',state.quantIterative); });
   $('bpm').addEventListener('input',e=>{ state.bpm=clamp(+e.target.value||120,20,400); state.tempoMap[0].bpm=state.bpm; updateDuration(); renderTsMapUI(); requestDraw(); flash('Tempo changed — re-export Sync Track if using Follow MMV'); });
   $('bars').addEventListener('change',e=>{ state.bars=clamp(+e.target.value||4,1,MAX_BARS); updateDuration(); resizeCanvases(); });
+  $('barsFitBtn').addEventListener('click',fitBarsToContent);
   $('tsNum').addEventListener('change',e=>{ state.tsNum=clamp(+e.target.value||4,1,32); state.tsMap[0].num=state.tsNum; updateDuration(); resizeCanvases(); renderTsMapUI(); });
   $('tsDen').addEventListener('change',e=>{ state.tsDen=+e.target.value||4; state.tsMap[0].den=state.tsDen; updateDuration(); resizeCanvases(); renderTsMapUI(); });
   $('ppq').addEventListener('change',e=>{ state.ppq=clamp(+e.target.value||480,24,1920); updateDuration(); resizeCanvases(); });

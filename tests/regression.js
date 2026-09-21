@@ -258,6 +258,9 @@ function buildTestHtml() {
       '  window._TEST_commitSaveAs = (dest, base, intoNew) => commitSaveAs(dest, base, intoNew);',
       '  window._TEST_projectAudioMoveList = (n) => projectAudioMoveList(n);',
       '  window._TEST_savingToText = () => { renderProjFolders(); const e = document.getElementById("projSavingTo"); return e ? e.textContent : null; };',
+      '  window._TEST_contentEndTick = () => contentEndTick();',
+      '  window._TEST_fitBarsToContent = () => fitBarsToContent();',
+      '  window._TEST_buildSyncTrack2 = () => Array.from(buildSyncTrack());',
       '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
       '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
@@ -4342,6 +4345,104 @@ async function run() {
     check('...while a project already in its own folder keeps saving there, not nesting deeper',
       again.active === 'Chapter 7', again);
     await page.evaluate(() => window._TEST_setProjDirs([]));
+  });
+
+  // ---------------- Project length vs content (v0.9.64) ----------------
+
+  await withPage(browser, async (page) => {
+    // Carving a short project out of a long one leaves Bars at the old value —
+    // deleting content never shortens the project. The sync track is generated
+    // from that DECLARED length (one pulse per beat for state.bars), so it came
+    // out at the original duration however little was left in the project.
+    const before = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 2700;                         // 90 min at 120bpm 4/4
+      s.notes = [];
+      s.markers = [];
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_upsertPoint(id, 0, 0);
+      window._TEST_upsertPoint(id, 150 * 1920, 100);   // content stops at bar 150
+      return {
+        bars: s.bars,
+        content: window._TEST_contentEndTick(),
+        total: window._TEST_totalTicks(),
+        syncEvents: window._TEST_buildSyncTrack2().length,
+      };
+    });
+    check('setup: the project is declared far longer than its content',
+      before.bars === 2700 && before.content === 150 * 1920 && before.total > before.content * 10, before);
+
+    await page.evaluate(() => window._TEST_fitBarsToContent());
+    await page.waitForTimeout(80);
+    const after = await page.evaluate(() => ({
+      bars: window._TEST_state.bars,
+      total: window._TEST_totalTicks(),
+      content: window._TEST_contentEndTick(),
+      syncBytes: window._TEST_buildSyncTrack2().length,
+    }));
+    check('Fit shortens the project to just past its last content',
+      after.bars === 151 && after.total >= after.content && after.total < after.content * 1.05, after);
+    check('...which is what shrinks the sync track — it is generated from the project length',
+      after.syncBytes < before.syncEvents / 10, { beforeBytes: before.syncEvents, afterBytes: after.syncBytes });
+
+    // Undoable, because it is a real edit to the project.
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(80);
+    check('...and Fit is undoable', await page.evaluate(() => window._TEST_state.bars) === 2700, null);
+  });
+
+  await withPage(browser, async (page) => {
+    // Content is every kind of thing in the project, not just notes — an audio
+    // clip or a marker past the last note has to keep the project long enough
+    // to reach it, or Fit would cut it off.
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 400; s.notes = []; s.markers = [];
+      s.ccLanes.forEach(l => { l.points = [{ t: 0, v: 0 }]; });
+      const onlyLane = window._TEST_contentEndTick();
+      s.notes = [{ id: 9001, start: 10 * 1920, pitch: 60, length: 480, vel: 100, ch: 0 }];
+      const withNote = window._TEST_contentEndTick();
+      s.markers = [{ tick: 40 * 1920, name: 'Chapter 2' }];
+      const withMarker = window._TEST_contentEndTick();
+      return { onlyLane, withNote, withMarker };
+    });
+    check('content extent follows the last note', r.withNote === 10 * 1920 + 480, r);
+    check('...and a marker beyond it extends the project so Fit cannot cut it off',
+      r.withMarker === 40 * 1920, r);
+
+    const withAudio = await page.evaluate(async (bytes) => {
+      const f = new File([new Uint8Array(bytes)], 'tail.wav', { type: 'audio/wav' });
+      await window._TEST_loadAudio(f);
+      window._TEST_setClipStart(0, 100 * 1920);
+      return { content: window._TEST_contentEndTick(), clipStart: 100 * 1920 };
+    }, makeWavBytes(2));
+    check('...and an audio clip counts as content too, so Fit keeps the project long enough to play it',
+      withAudio.content > withAudio.clipStart, withAudio);
+
+    await page.evaluate(() => window._TEST_fitBarsToContent());
+    await page.waitForTimeout(80);
+    const fitted = await page.evaluate(() => ({ bars: window._TEST_state.bars, total: window._TEST_totalTicks(), content: window._TEST_contentEndTick() }));
+    check('...with Fit then leaving room for all of it', fitted.total >= fitted.content, fitted);
+  });
+
+  await withPage(browser, async (page) => {
+    // Fit grows as well as shrinks, and says so rather than silently no-opping
+    // when there is nothing to change.
+    const grew = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 2; s.markers = []; s.notes = [{ id: 9002, start: 30 * 1920, pitch: 60, length: 480, vel: 100, ch: 0 }];
+      s.ccLanes.forEach(l => { l.points = [{ t: 0, v: 0 }]; });
+      window._TEST_fitBarsToContent();
+      return window._TEST_state.bars;
+    });
+    check('Fit also grows the project when content sits past the declared end', grew === 32, grew);
+
+    const same = await page.evaluate(() => {
+      const b = window._TEST_state.bars;
+      window._TEST_fitBarsToContent();
+      return { before: b, after: window._TEST_state.bars };
+    });
+    check('...and running it again changes nothing', same.before === same.after, same);
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------
