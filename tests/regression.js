@@ -261,6 +261,8 @@ function buildTestHtml() {
       '  window._TEST_contentEndTick = () => contentEndTick();',
       '  window._TEST_fitBarsToContent = () => fitBarsToContent();',
       '  window._TEST_buildSyncTrack2 = () => Array.from(buildSyncTrack());',
+      '  window._TEST_sendState = () => sendStateAtPlayhead();',
+      '  window._TEST_snapHeld = () => snapHeld.slice();',
       '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
       '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
@@ -4543,6 +4545,206 @@ async function run() {
     const nTs = ev.filter(e => e.kind === 'meta' && e.meta === 0x58).length;
     check('a map that fits inside the project is exported whole — the clip is a no-op',
       nTempo === 3 && nTs === 2, { nTempo, nTs, total: r.total });
+  });
+
+  // ---------------- Send State (v0.9.66) ----------------
+  await withPage(browser, async (page) => {
+    // Rapidly-changing visuals cannot be judged by stabbing Play and Stop.
+    // Send State pushes out what WOULD be in force at the playhead, held, so
+    // the frame can be looked at for as long as it takes.
+    const noOut = await page.evaluate(() => {
+      window._TEST_state.midiOut = null;
+      window._TEST_sendState();
+      return document.getElementById('stCtx').textContent;
+    });
+    check('with no MIDI Out it says so rather than doing nothing visible',
+      /MIDI Out/i.test(noOut), noOut);
+
+    const ids = await page.evaluate(() => {
+      window._TEST_fakeMidiOut();
+      const s = window._TEST_state;
+      s.bars = 16; s.notes = []; s.ccLanes.length = 0;   // drop the seeded lane
+      const cc = window._TEST_addLane(30, 0);
+      window._TEST_upsertPoint(cc, 0, 0);
+      window._TEST_upsertPoint(cc, 8 * 1920, 127);        // ramp over 8 bars
+      const flat = window._TEST_addLane(31, 2);
+      window._TEST_upsertPoint(flat, 0, 64);
+      const pb = window._TEST_addPbLane(0);
+      window._TEST_upsertPoint(pb, 0, -8192);
+      window._TEST_upsertPoint(pb, 8 * 1920, 8191);
+      const cp = window._TEST_addCpLane(3);
+      window._TEST_upsertPoint(cp, 0, 100);
+      window._TEST_addNote({ start: 2 * 1920, length: 4 * 1920, pitch: 48, vel: 110, ch: 0 });
+      return { cc, flat, pb, cp };
+    });
+
+    const sendAt = async (tick) => page.evaluate((t) => {
+      window.__midiSent = [];
+      window._TEST_seekPlayhead(t);
+      window._TEST_sendState();
+      return window.__midiSent.map(m => m.bytes);
+    }, tick);
+    const ccVal = (msgs, num) => { const m = msgs.find(b => (b[0] & 0xF0) === 0xB0 && b[1] === num); return m ? m[2] : null; };
+    const pbVal = (msgs) => { const m = msgs.find(b => (b[0] & 0xF0) === 0xE0); return m ? ((m[2] << 7) | m[1]) - 8192 : null; };
+    const cpVal = (msgs) => { const m = msgs.find(b => (b[0] & 0xF0) === 0xD0); return m ? m[1] : null; };
+    const noteOns = (msgs) => msgs.filter(b => (b[0] & 0xF0) === 0x90).map(b => b[1]);
+    const noteOffs = (msgs) => msgs.filter(b => (b[0] & 0xF0) === 0x80).map(b => b[1]);
+
+    // Bar 5 is halfway up the ramp and inside the long note.
+    const mid = await sendAt(4 * 1920);
+    check('every lane is sent at the value its curve holds at the playhead, not at its start',
+      ccVal(mid, 30) === 64 && ccVal(mid, 31) === 64, { cc30: ccVal(mid, 30), cc31: ccVal(mid, 31) });
+    check('...pitch bend and channel pressure lanes included, on their own channels',
+      pbVal(mid) === 0 && cpVal(mid) === 100, { pb: pbVal(mid), cp: cpVal(mid) });
+    check('a note sounding across the playhead is sent too — it is part of the frame',
+      noteOns(mid).join() === '48', noteOns(mid));
+    check('...and held, since there is no transport to end it',
+      (await page.evaluate(() => window._TEST_snapHeld())).length === 1,
+      await page.evaluate(() => window._TEST_snapHeld()));
+    check('the lane values are channel-correct',
+      mid.some(b => b[0] === 0xB0 && b[1] === 30) && mid.some(b => b[0] === 0xB2 && b[1] === 31),
+      mid.map(b => b.map(x => x.toString(16))));
+
+    // Past the note's end: it has to be released, or it hangs forever.
+    const past = await sendAt(8 * 1920);
+    check('moving past the note and sending again releases it — a held note never hangs',
+      noteOffs(past).join() === '48' && noteOns(past).length === 0,
+      { offs: noteOffs(past), ons: noteOns(past) });
+    check('...and the lane values follow the playhead to the top of the ramp',
+      ccVal(past, 30) === 127 && pbVal(past) === 8191, { cc30: ccVal(past, 30), pb: pbVal(past) });
+    check('...with nothing left held', (await page.evaluate(() => window._TEST_snapHeld())).length === 0, null);
+
+    // Pressing twice from the same spot must not re-trigger what is held.
+    await sendAt(3 * 1920);
+    const again = await page.evaluate(() => {
+      window.__midiSent = [];
+      window._TEST_sendState();
+      return window.__midiSent.map(m => m.bytes);
+    });
+    check('sending twice from the same position does not re-trigger the held note',
+      noteOns(again).length === 0 && noteOffs(again).length === 0,
+      { ons: noteOns(again), offs: noteOffs(again) });
+    check('...while the lane values are still re-sent, so MMV can be re-synced at will',
+      ccVal(again, 30) !== null, again.length);
+
+    // Mute/solo are honoured exactly as playback honours them, which makes
+    // Solo a way to audition one lane's effect on the visuals alone.
+    const muted = await page.evaluate((id) => {
+      window._TEST_state.ccLanes.find(l => l.id === id).muted = true;
+      window.__midiSent = [];
+      window._TEST_sendState();
+      const r = window.__midiSent.map(m => m.bytes);
+      window._TEST_state.ccLanes.find(l => l.id === id).muted = false;
+      return r;
+    }, ids.flat);
+    check('a muted lane is skipped, as it is during playback', ccVal(muted, 31) === null, ccVal(muted, 31));
+
+    const soloed = await page.evaluate((id) => {
+      window._TEST_state.ccLanes.find(l => l.id === id).soloed = true;
+      window.__midiSent = [];
+      window._TEST_sendState();
+      const r = window.__midiSent.map(m => m.bytes);
+      window._TEST_state.ccLanes.find(l => l.id === id).soloed = false;
+      return r;
+    }, ids.flat);
+    check('with one lane soloed only that lane is sent — auditioning one lane on its own',
+      ccVal(soloed, 31) === 64 && ccVal(soloed, 30) === null,
+      { cc31: ccVal(soloed, 31), cc30: ccVal(soloed, 30) });
+
+    const hidden = await page.evaluate((id) => {
+      window._TEST_state.ccLanes.find(l => l.id === id).visible = false;
+      window.__midiSent = [];
+      window._TEST_sendState();
+      const r = window.__midiSent.map(m => m.bytes);
+      window._TEST_state.ccLanes.find(l => l.id === id).visible = true;
+      return r;
+    }, ids.flat);
+    check('a hidden lane is skipped too', ccVal(hidden, 31) === null, ccVal(hidden, 31));
+
+    // During playback MME is already streaming this; a snapshot would fight
+    // the scheduler's own note on/offs.
+    const playing = await page.evaluate(() => {
+      window._TEST_state.playing = true;
+      window.__midiSent = [];
+      window._TEST_sendState();
+      const r = { n: window.__midiSent.length, flash: document.getElementById('stCtx').textContent };
+      window._TEST_state.playing = false;
+      return r;
+    });
+    check('while playing it declines instead of fighting the scheduler',
+      playing.n === 0 && /playing/i.test(playing.flash), playing);
+  });
+
+  await withPage(browser, async (page) => {
+    // The button and the shortcut, and the handoff to the transport.
+    const btn = await page.evaluate(() => {
+      const b = document.getElementById('sendStateBtn');
+      if (!b) return null;
+      const r = b.getBoundingClientRect();
+      return { inTransport: !!b.closest('.transport-grp'), visible: r.width > 0 && r.height > 0, title: b.title };
+    });
+    check('the Send State button sits in the Transport group and is visible',
+      btn && btn.inTransport && btn.visible, btn);
+    check('...and its tooltip names the shortcut', /\(Enter\)/.test(btn.title), btn.title);
+
+    await page.evaluate(() => {
+      window._TEST_fakeMidiOut();
+      const s = window._TEST_state;
+      s.bars = 16; s.notes = []; s.ccLanes.length = 0;
+      const cc = window._TEST_addLane(30, 0);
+      window._TEST_upsertPoint(cc, 0, 0);
+      window._TEST_upsertPoint(cc, 8 * 1920, 127);
+      window._TEST_addNote({ start: 2 * 1920, length: 4 * 1920, pitch: 48, ch: 0 });
+      window._TEST_seekPlayhead(3 * 1920);
+      window.__midiSent = [];
+    });
+    await page.click('#sendStateBtn');
+    await page.waitForTimeout(60);
+    check('clicking the button sends the state',
+      (await page.evaluate(() => window.__midiSent.length)) > 0,
+      await page.evaluate(() => window.__midiSent.length));
+
+    await page.evaluate(() => { window.__midiSent = []; if (document.activeElement) document.activeElement.blur(); });
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(60);
+    check('Enter sends it too, so the playhead can be stepped and re-sent one-handed',
+      (await page.evaluate(() => window.__midiSent.length)) > 0,
+      await page.evaluate(() => window.__midiSent.length));
+
+    // Enter is also how the Go-to field is committed, so it must not fire
+    // while a field has focus.
+    await page.evaluate(() => { window.__midiSent = []; document.getElementById('gotoSec').focus(); });
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(60);
+    check('...but not while typing in a field — Enter still belongs to the field',
+      (await page.evaluate(() => window.__midiSent.length)) === 0,
+      await page.evaluate(() => window.__midiSent.length));
+
+    // Starting playback has to take ownership of a note Send State is holding,
+    // or that note never receives its Note Off from the scheduler.
+    const handoff = await page.evaluate(() => {
+      if (document.activeElement) document.activeElement.blur();
+      window._TEST_seekPlayhead(3 * 1920);
+      window._TEST_sendState();
+      const heldBefore = window._TEST_snapHeld().length;
+      window.__midiSent = [];
+      window._TEST_play(3 * 1920);
+      const offs = window.__midiSent.filter(m => (m.bytes[0] & 0xF0) === 0x80).map(m => m.bytes[1]);
+      const heldAfter = window._TEST_snapHeld().length;
+      window._TEST_stop();
+      return { heldBefore, heldAfter, offs };
+    });
+    check('starting playback releases the note Send State was holding, and hands it over',
+      handoff.heldBefore === 1 && handoff.heldAfter === 0 && handoff.offs.includes(48), handoff);
+
+    const stopped = await page.evaluate(() => {
+      window._TEST_seekPlayhead(3 * 1920);
+      window._TEST_sendState();
+      const was = window._TEST_snapHeld().length;
+      window._TEST_stop();
+      return { was, after: window._TEST_snapHeld().length };
+    });
+    check('Stop clears what Send State was holding', stopped.was === 1 && stopped.after === 0, stopped);
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------

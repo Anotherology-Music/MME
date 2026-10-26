@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.65
+  MMV MIDI & CC Curve Editor v0.9.66
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1877,6 +1877,33 @@
   survives the clip, that the map itself is untouched and re-exports when the
   project grows, and that a map fitting inside the project is exported whole.
 
+
+  v0.9.66 Send State — the playhead's MIDI, without playing.
+  Visuals that change rapidly cannot be judged by stabbing Play and Stop: by
+  the time the transport is stopped the moment has gone. A new button in the
+  Transport group (and Enter) sends everything that WOULD be in force at the
+  playhead — every audible lane's value at that exact tick, plus any note
+  sounding across it — so the playhead can be parked anywhere and MMV simply
+  shows that frame, held, for as long as it takes to look at it.
+
+  This is the chase the scheduler already performed when Play started from the
+  middle of a project, lifted out and made available on its own. Mute, Solo and
+  hidden lanes are honoured exactly as playback honours them, which makes Solo
+  a way to audition one lane's effect on the visuals alone. Play-macro mode
+  suppresses macro notes here as it does everywhere else.
+
+  Notes are the part that needs bookkeeping, since there is no transport to end
+  them. A note sounding at the playhead is sent and HELD; moving the playhead
+  and sending again releases the notes that are no longer sounding, sending
+  twice from the same spot does not re-trigger what is already held, and
+  starting playback or pressing Stop hands the held notes back to the
+  transport. A held note can never be left hanging.
+
+  Twenty-two new checks, including interpolated CC/PB/CP values mid-ramp, the
+  release when the playhead moves past a note, no re-trigger on a repeat press,
+  mute/solo/hidden handling, the refusal to fire during playback, Enter not
+  firing while a field has focus, and the handoff to Play and Stop.
+
 -->
 
 
@@ -1920,6 +1947,9 @@
   .move-grp button{font-weight:700;line-height:1;padding:3px 8px;}
   .move-grp select{font-size:11px;}
   button.icon-btn{display:inline-flex;align-items:center;justify-content:center;padding:5px 7px;}
+  /* Send State is a momentary action, not a toggle, so it gets its own brief
+     flash rather than icon-btn's sticky .on state. */
+  button.icon-btn.sent{background:var(--accent);color:#0d0f14;border-color:var(--accent);}
   .view-grp .lbl2{color:#888;font-size:10px;}
   .position-grp{gap:2px;}
   /* 52px fitted "12.5" and nothing longer. A feature-length project is
@@ -2669,6 +2699,7 @@
         <button id="playBtn" title="Play / Pause (Space)">▶</button>
         <button id="stopBtn" title="Stop (return to loop start)">■</button>
         <button id="nextMarkerBtn" title="Jump to the next section marker (.)">&#x25B6;&#x25B6;|</button>
+        <button id="sendStateBtn" class="icon-btn" title="Send State (Enter) — send every lane's value at the playhead, plus any note sounding there, without playing. Park the playhead and see exactly what MMV looks like at that instant."><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v18"/><path d="M11 9a5 5 0 0 1 0 6"/><path d="M15 6a9 9 0 0 1 0 12"/></svg></button>
         <button id="loopBtn" class="icon-btn" title="Loop (Ctrl+L) — repeat the selected range, or the whole project when no range is selected. Turn it off to keep a range selected and still play straight through."><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button>
         <div id="recWrapper">
           <button id="recordBtn" title="Record incoming MIDI notes (R) — right-click to change channel, count-in, offset">
@@ -9144,7 +9175,69 @@
     try{ ts!=null?o.send(arr,ts):o.send(arr); }
     catch(e){ setMidiStatus('Send error: '+e.message); state.midiOut=null; }
   }
-  function allNotesOff(){ activeNotes=[]; if(state.midiOut){ for(let c=0;c<16;c++) mSend([0xB0|c,123,0]); } }
+  function allNotesOff(){ activeNotes=[]; snapHeld=[]; if(state.midiOut){ for(let c=0;c<16;c++) mSend([0xB0|c,123,0]); } }
+
+  // ---------- Send State: the playhead's MIDI, without playing ----------
+  // Rapidly-changing visuals are impossible to judge by stabbing Play and Stop:
+  // by the time the transport is stopped the moment has gone. Send State pushes
+  // out everything that WOULD be in force at the playhead — every audible
+  // lane's value, plus any note sounding across that instant — so the playhead
+  // can be parked anywhere and MMV simply shows that frame, held, for as long
+  // as it takes to look at it.
+  //
+  // This is the same chase the scheduler performs when Play starts from the
+  // middle of a project, lifted out and made available on its own.
+  //
+  // Notes are the part that needs bookkeeping. A note sounding at the playhead
+  // is part of the frame, so it is sent and HELD (there is no transport to end
+  // it). That held note has to be released again, or it hangs: moving the
+  // playhead and sending again releases the notes that are no longer sounding,
+  // and Stop/Play clear the lot.
+  let snapHeld=[];                            // [{ch,pitch}] held by Send State
+  const snapKey=(ch,pitch)=>ch+':'+pitch;
+  function releaseSnapNotes(){
+    if(state.midiOut) snapHeld.forEach(h=>mSend([0x80|h.ch,h.pitch,0]));
+    snapHeld=[];
+  }
+  function sendStateAtPlayhead(){
+    if(!state.midiOut){ flash('Send State needs a MIDI Out — enable Web MIDI and pick a port first.'); return; }
+    // During playback MME is already streaming this continuously, and a
+    // snapshot would fight the scheduler's own note on/offs.
+    if(state.playing){ flash('Already playing — MME is sending this continuously.'); return; }
+    const tick=Math.round(clamp(state.playhead,0,totalTicks()));
+    // Lanes: the value the curve holds at the playhead. Hidden, muted and
+    // un-soloed lanes are skipped, exactly as playback skips them, so Solo is
+    // a way to audition one lane's effect on its own.
+    let nLanes=0;
+    for(const lane of state.ccLanes){
+      if(!lane.points.length||lane.visible===false||!laneAudible(lane)) continue;
+      mSend(laneMsgBytes(lane,laneValueAt(lane,tick))); nLanes++;
+    }
+    // Notes sounding across the playhead. Same play-macro suppression as
+    // playback and Follow MMV: in that mode a macro note's gesture is already
+    // baked into the lanes and the note itself is not meant to go out.
+    const want=[];
+    for(const n of state.notes){
+      if(state.playMacroMode && n.macroId!=null) continue;
+      if(n.start<=tick && n.start+Math.max(1,n.length)>tick) want.push(n);
+    }
+    const wantKeys=new Set(want.map(n=>snapKey(n.ch&15,n.pitch&127)));
+    const heldKeys=new Set(snapHeld.map(h=>snapKey(h.ch,h.pitch)));
+    // Release what has stopped sounding, and leave what is still sounding
+    // alone — re-sending its Note On would re-trigger it in MMV.
+    snapHeld.forEach(h=>{ if(!wantKeys.has(snapKey(h.ch,h.pitch))) mSend([0x80|h.ch,h.pitch,0]); });
+    const next=[];
+    for(const n of want){
+      const ch=n.ch&15, pitch=n.pitch&127;
+      if(!heldKeys.has(snapKey(ch,pitch))) mSend([0x90|ch,pitch,clamp(n.vel,1,127)]);
+      next.push({ch,pitch});
+    }
+    snapHeld=next;
+    const btn=$('sendStateBtn');
+    if(btn){ btn.classList.add('sent'); setTimeout(()=>btn.classList.remove('sent'),180); }
+    flash('Sent the state at '+tickToBBT(tick)+' ('+fmtClockHundredths(tickToSeconds(tick))+') — '+nLanes+' lane'+(nLanes===1?'':'s')
+      +(next.length?', holding '+next.length+' note'+(next.length===1?'':'s'):', no notes sounding')+'.');
+  }
 
   // ---------- Transport: Worker clock + timestamped MIDI ----------
   let sched=null, rafVisual=null, schedWorker=null, schedTimer=null;
@@ -9269,6 +9362,7 @@
     // ticksPerBeat() — so time-signature changes need no handling here at all.
     const clockTicks=state.ppq/24;
     sched={a,b,span,t0,startTick,evs,idx,passIndex:0,clockTicks,clockIdx:0,loops};
+    releaseSnapNotes();   // hand any held snapshot notes over to the scheduler
     if(state.midiOut){
       if(!state.syncFollow) mSend([0xFA], t0);
       // Chase: send Note On for any notes already in progress at startTick
@@ -11052,6 +11146,7 @@
   });
   $('gotoSec').addEventListener('change',e=>{ const sec=Math.max(0,parseFloat(e.target.value)||0);
     state.playhead=clamp(Math.round(secondsToTicks(sec)),0,totalTicks()); updatePlayPos(); updatePlayheadEl(); e.target.value=''; });
+  $('sendStateBtn').onclick=sendStateAtPlayhead;
   $('midiEnable').onclick=initMidi; $('midiOut').addEventListener('change',e=>setMidiOutById(e.target.value));
   // Skip the manual "Enable" click on repeat launches: if this origin already
   // has MIDI permission granted (from a previous session), silently connect
@@ -11080,6 +11175,7 @@
       if(state.focus==='cc'){ const lane=activeLane(); if(lane&&lane.points.length){ clearCcSel(lane); lane.points.forEach(p=>ccSel.add(p)); lane._activePt=lane.points[lane.points.length-1]; requestDraw(); } return; }
       const {a,b}=getLoop(); state.selection.clear(); state.notes.forEach(n=>{ if(n.start>=a&&n.start<b) state.selection.add(n.id); }); state.focus='piano'; updateNoteInfo(); requestDraw(); return; }
     if(e.key===' '){ e.preventDefault(); togglePlay(); return; }
+    if(e.key==='Enter'){ e.preventDefault(); sendStateAtPlayhead(); return; }
     if(e.code==='Numpad0'){ e.preventDefault(); seekPlayhead(state.lastPlayStart||0); return; }
     if(e.key==='.'){ e.preventDefault(); seekPlayhead(0); return; }
     // < and > read like the transport's own |<< and >>| buttons. Plain , and
