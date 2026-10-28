@@ -270,6 +270,7 @@ function buildTestHtml() {
       '  window._TEST_lanePoints = (id) => state.ccLanes.find(l => l.id === id).points.map(p => ({ t: p.t, v: p.v }));',
       '  window._TEST_laneSample = (id, ts) => { const l = state.ccLanes.find(x => x.id === id); return ts.map(t => Math.round(laneValueAt(l, t))); };',
       '  window._TEST_setTagFilter = (arr) => { tagFilter.clear(); arr.forEach(x => tagFilter.add(x)); applyTagFilter(); };',
+      '  window._TEST_selectSomeLanePoints = (id, ticks) => { const l = state.ccLanes.find(x => x.id === id); ccSel.clear(); l.points.forEach(p => { if (ticks.includes(p.t)) ccSel.add(p); }); setActiveLane(id); requestDraw(); return ccSel.size; };',
       '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
       '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
@@ -4994,6 +4995,200 @@ async function run() {
     check('plain Ctrl+A still selects, rather than being swallowed by the new chord',
       (await page.evaluate(() => window._TEST_state.selection.size)) === 2,
       { before: plainA, after: await page.evaluate(() => window._TEST_state.selection.size) });
+  });
+
+  // ---------------- Vertical steps survive, Shift guards, vertical multi-drag (v0.9.68) ----------------
+  await withPage(browser, async (page) => {
+    // A stepped lane: the value JUMPS at a bar line, drawn as two points a
+    // tick apart. upsertPoint used to sweep away anything within half a
+    // CC-resolution step of a new point, so placing an anchor anywhere near
+    // a step ate one of its two points and flattened the jump into a ramp.
+    const mk = () => page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(id, [
+        { t: 0, v: 20 },
+        { t: 2 * 1920 - 1, v: 20 }, { t: 2 * 1920, v: 90 },
+        { t: 4 * 1920 - 1, v: 90 }, { t: 4 * 1920, v: 40 },
+        { t: 8 * 1920, v: 40 },
+      ]);
+      return id;
+    });
+
+    let id = await mk();
+    const before = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    await page.evaluate(() => { window._TEST_seekPlayhead(2 * 1920); window._TEST_anchorAll(); });
+    const onStep = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    check('anchoring exactly on a step leaves it completely alone — it is already pinned there',
+      JSON.stringify(onStep) === JSON.stringify(before), { before, onStep });
+    check('...and says so rather than silently doing nothing',
+      /already anchored/i.test(await page.evaluate(() => document.getElementById('stCtx').textContent)),
+      await page.evaluate(() => document.getElementById('stCtx').textContent));
+
+    id = await mk();
+    await page.evaluate(() => { window._TEST_seekPlayhead(2 * 1920 + 5); window._TEST_anchorAll(); });
+    const near = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    check('anchoring a few ticks from a step keeps BOTH of the step\'s points — the jump is not flattened',
+      near.some(p => p.t === 2 * 1920 - 1 && p.v === 20) && near.some(p => p.t === 2 * 1920 && p.v === 90),
+      near);
+    check('...and still adds the anchor that was asked for',
+      near.some(p => p.t === 2 * 1920 + 5), near);
+
+    // The jump must still read as a jump, not a ramp.
+    const sampled = await page.evaluate((id) => window._TEST_laneSample(id, [2 * 1920 - 1, 2 * 1920]), id);
+    check('...so the value still jumps from one tick to the next',
+      sampled[0] === 20 && sampled[1] === 90, sampled);
+  });
+
+  await withPage(browser, async (page) => {
+    // Two pastes close together used to collapse into one, which is what made
+    // "paste twice to bracket a flat run" impossible.
+    const id = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(id, [{ t: 0, v: 20 }, { t: 8 * 1920, v: 80 }]);
+      return id;
+    });
+    await page.evaluate(() => {
+      window._TEST_seekPlayhead(6 * 1920); window._TEST_copyColumn();
+      window._TEST_seekPlayhead(10 * 1920); window._TEST_pasteColumn();
+      window._TEST_seekPlayhead(10 * 1920 + 4); window._TEST_pasteColumn();
+    });
+    const inBar = await page.evaluate((id) => window._TEST_lanePoints(id).filter(p => p.t >= 10 * 1920 && p.t < 11 * 1920), id);
+    check('two pastes four ticks apart both survive — neither sweeps the other away',
+      inBar.length === 2, inBar);
+
+    // Pasting onto the very same tick replaces, rather than stacking an
+    // invisible duplicate that nothing could ever select.
+    await page.evaluate(() => { window._TEST_seekPlayhead(10 * 1920); window._TEST_pasteColumn(); });
+    const same = await page.evaluate((id) => window._TEST_lanePoints(id).filter(p => p.t === 10 * 1920), id);
+    check('...while pasting twice onto the SAME tick replaces rather than stacking duplicates',
+      same.length === 1, same);
+
+    // The point of it: two pastes a bar apart give a flat run to shift.
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ccLanes[0].points = [{ t: 0, v: 20 }, { t: 8 * 1920, v: 80 }];
+      window._TEST_seekPlayhead(6 * 1920); window._TEST_copyColumn();
+      window._TEST_seekPlayhead(10 * 1920); window._TEST_pasteColumn();
+      window._TEST_seekPlayhead(12 * 1920); window._TEST_pasteColumn();
+    });
+    const run = await page.evaluate((id) => window._TEST_laneSample(id, [10 * 1920, 11 * 1920, 12 * 1920]), id);
+    check('...and two pastes a bar apart leave a genuinely flat run between them',
+      run[0] === run[1] && run[1] === run[2], run);
+  });
+
+  await withPage(browser, async (page) => {
+    // Shift tool: dragging a segment used to drag the lines into and out of
+    // it as well, tilting the curve either side. Guards one tick outside each
+    // end hold the old values, so the neighbours keep both their endpoints.
+    const id = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(id, [
+        { t: 0, v: 0 }, { t: 2 * 1920, v: 60 }, { t: 4 * 1920, v: 60 }, { t: 6 * 1920, v: 10 },
+      ]);
+      return id;
+    });
+    await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id)._row.scrollIntoView({ block: 'center' }), id);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const OUT = [480, 960, 1440, 5 * 1920 + 960];
+    const outBefore = await page.evaluate(({ id, OUT }) => window._TEST_laneSample(id, OUT), { id, OUT });
+
+    const from = await page.evaluate((id) => window._TEST_laneClientPos(id, 3 * 1920, 60), id);
+    const to = await page.evaluate((id) => window._TEST_laneClientPos(id, 3 * 1920, 90), id);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+
+    const pts = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    const outAfter = await page.evaluate(({ id, OUT }) => window._TEST_laneSample(id, OUT), { id, OUT });
+    check('Shift leaves the curve before and after the dragged segment exactly where it was',
+      JSON.stringify(outBefore) === JSON.stringify(outAfter), { outBefore, outAfter, pts });
+    check('...because it drops a guard point one tick outside each end, holding the old value',
+      pts.some(p => p.t === 2 * 1920 - 1 && p.v === 60) && pts.some(p => p.t === 4 * 1920 + 1 && p.v === 60), pts);
+    check('...and the segment itself did move', (pts.find(p => p.t === 2 * 1920) || {}).v > 60, pts);
+
+    // One undo takes the guards back out along with the move.
+    await page.evaluate(() => window._TEST_undo());
+    await page.waitForTimeout(50);
+    const undone = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    check('...with a single undo removing the guards along with the move',
+      undone.length === 4 && undone.every(p => p.t % 1920 === 0), undone);
+  });
+
+  await withPage(browser, async (page) => {
+    // Alt during the drag keeps the old behaviour: no guards, neighbours tilt.
+    const id = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(id, [
+        { t: 0, v: 0 }, { t: 2 * 1920, v: 60 }, { t: 4 * 1920, v: 60 }, { t: 6 * 1920, v: 10 },
+      ]);
+      return id;
+    });
+    await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id)._row.scrollIntoView({ block: 'center' }), id);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="segShift"]');
+    const from = await page.evaluate((id) => window._TEST_laneClientPos(id, 3 * 1920, 60), id);
+    const to = await page.evaluate((id) => window._TEST_laneClientPos(id, 3 * 1920, 90), id);
+    await page.keyboard.down('Alt');
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 8 });
+    await page.mouse.up();
+    await page.keyboard.up('Alt');
+    await page.waitForTimeout(100);
+    const pts = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    check('holding Alt while shifting leaves no guards — the old tilt-along behaviour is still available',
+      pts.length === 4, pts);
+  });
+
+  await withPage(browser, async (page) => {
+    // Multi-point selection used to drag horizontally only, so raising a run
+    // of points meant dragging each one in turn.
+    const id = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_setLanePoints(id, [
+        { t: 0, v: 10 }, { t: 1920, v: 30 }, { t: 3840, v: 50 }, { t: 5760, v: 70 }, { t: 7680, v: 20 },
+      ]);
+      return id;
+    });
+    await page.evaluate((id) => window._TEST_state.ccLanes.find(l => l.id === id)._row.scrollIntoView({ block: 'center' }), id);
+    await page.waitForTimeout(50);
+    await page.click('[data-tool="select"]');
+    const n = await page.evaluate((id) => {
+      const l = window._TEST_state.ccLanes.find(x => x.id === id);
+      window._TEST_clearCcSel();
+      return window._TEST_selectSomeLanePoints(id, [1920, 3840, 5760]);
+    }, id);
+    check('setup: three of the five points are selected', n === 3, n);
+
+    const from = await page.evaluate((id) => window._TEST_laneClientPos(id, 3840, 50), id);
+    const to = await page.evaluate((id) => window._TEST_laneClientPos(id, 3840, 80), id);
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(to.x, to.y, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+
+    const pts = await page.evaluate((id) => window._TEST_lanePoints(id), id);
+    const sel = [1920, 3840, 5760].map(t => (pts.find(p => p.t === t) || {}).v);
+    const unsel = [0, 7680].map(t => (pts.find(p => p.t === t) || {}).v);
+    check('a multi-point selection now drags vertically, all points moving by the same amount',
+      sel[0] > 30 && sel[1] > 50 && sel[2] > 70
+      && (sel[0] - 30) === (sel[1] - 50) && (sel[1] - 50) === (sel[2] - 70), { sel, unsel, pts });
+    check('...leaving the points that were not selected exactly where they were',
+      unsel[0] === 10 && unsel[1] === 20, { unsel, pts });
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------
