@@ -263,6 +263,13 @@ function buildTestHtml() {
       '  window._TEST_buildSyncTrack2 = () => Array.from(buildSyncTrack());',
       '  window._TEST_sendState = () => sendStateAtPlayhead();',
       '  window._TEST_snapHeld = () => snapHeld.slice();',
+      '  window._TEST_anchorAll = () => anchorAllLanes();',
+      '  window._TEST_copyColumn = () => copyLaneColumn();',
+      '  window._TEST_pasteColumn = () => pasteLaneColumn();',
+      '  window._TEST_colClip = () => colClip;',
+      '  window._TEST_lanePoints = (id) => state.ccLanes.find(l => l.id === id).points.map(p => ({ t: p.t, v: p.v }));',
+      '  window._TEST_laneSample = (id, ts) => { const l = state.ccLanes.find(x => x.id === id); return ts.map(t => Math.round(laneValueAt(l, t))); };',
+      '  window._TEST_setTagFilter = (arr) => { tagFilter.clear(); arr.forEach(x => tagFilter.add(x)); applyTagFilter(); };',
       '  window._TEST_parseMidi = (bytes) => parseMidi(new Uint8Array(bytes).buffer);',
       '  window._TEST_applyMidiImport = (r, mode, remap, opts) => applyMidiImport(r, mode, remap, opts);',
       '  window._TEST_nearestBeatLineTick = (localX) => nearestBeatLineTick(localX);',
@@ -4745,6 +4752,248 @@ async function run() {
       return { was, after: window._TEST_snapHeld().length };
     });
     check('Stop clears what Send State was holding', stopped.was === 1 && stopped.after === 0, stopped);
+  });
+
+  // ---------------- All Lanes: anchor / copy / paste a column (v0.9.67) ----------------
+  await withPage(browser, async (page) => {
+    const ids = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 32; s.ccLanes.length = 0;
+      const ramp = window._TEST_addLane(20, 0);
+      window._TEST_upsertPoint(ramp, 0, 0); window._TEST_upsertPoint(ramp, 16 * 1920, 127);
+      const hump = window._TEST_addLane(21, 0);
+      window._TEST_upsertPoint(hump, 0, 10); window._TEST_upsertPoint(hump, 4 * 1920, 120);
+      window._TEST_upsertPoint(hump, 12 * 1920, 30);
+      const pb = window._TEST_addPbLane(0);
+      window._TEST_upsertPoint(pb, 0, -8192); window._TEST_upsertPoint(pb, 16 * 1920, 8191);
+      const cp = window._TEST_addCpLane(2);
+      window._TEST_upsertPoint(cp, 0, 100);
+      return { ramp, hump, pb, cp };
+    });
+    const keys = ['ramp', 'hump', 'pb', 'cp'];
+    const TS = []; for (let t = 0; t <= 16 * 1920; t += 240) TS.push(t);
+    const sampleAll = () => page.evaluate(({ ids, TS, keys }) => {
+      const o = {}; keys.forEach(k => { o[k] = window._TEST_laneSample(ids[k], TS); }); return o;
+    }, { ids, TS, keys });
+    const counts = () => page.evaluate(({ ids, keys }) => {
+      const o = {}; keys.forEach(k => { o[k] = window._TEST_lanePoints(ids[k]).length; }); return o;
+    }, { ids, keys });
+
+    const before = await sampleAll(), nBefore = await counts();
+    await page.evaluate(() => { window._TEST_seekPlayhead(8 * 1920); window._TEST_anchorAll(); });
+    const after = await sampleAll(), nAfter = await counts();
+
+    check('Anchor adds a point to every shown lane at once — CC, Pitch Bend and Channel Pressure alike',
+      keys.every(k => nAfter[k] === nBefore[k] + 1), { nBefore, nAfter });
+
+    const atPlayhead = await page.evaluate(({ ids, keys }) => {
+      const o = {}; keys.forEach(k => { o[k] = window._TEST_lanePoints(ids[k]).some(p => Math.abs(p.t - 8 * 1920) <= 2); }); return o;
+    }, { ids, keys });
+    check('...each one landing at the playhead', keys.every(k => atPlayhead[k]), atPlayhead);
+
+    // The anchor takes the curve's own value, so the shape must survive. It is
+    // not bit-exact: points hold integers, so a fractional value rounds and
+    // tilts the segments either side. The bound is what matters.
+    let worstCc = 0, worstPb = 0;
+    keys.forEach(k => {
+      for (let i = 0; i < TS.length; i++) {
+        const d = Math.abs(after[k][i] - before[k][i]);
+        if (k === 'pb') { if (d > worstPb) worstPb = d; } else if (d > worstCc) worstCc = d;
+      }
+    });
+    check('...and the curve it anchors is left within one step of where it was — the anchor pins, it does not reshape',
+      worstCc <= 1, { worstCc, worstPb });
+
+    await page.evaluate(() => window._TEST_undo());
+    check('a single undo takes the whole column back, not one lane at a time',
+      JSON.stringify(await counts()) === JSON.stringify(nBefore), { nBefore, after: await counts() });
+  });
+
+  await withPage(browser, async (page) => {
+    // Anchoring where the value is already whole — including right on an
+    // existing point — has to be exactly lossless, and must not duplicate it.
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 32; s.ccLanes.length = 0;
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_upsertPoint(id, 0, 0);
+      window._TEST_upsertPoint(id, 8 * 1920, 64);
+      window._TEST_upsertPoint(id, 16 * 1920, 127);
+      const TS = []; for (let t = 0; t <= 16 * 1920; t += 120) TS.push(t);
+      const before = window._TEST_laneSample(id, TS);
+      const nBefore = window._TEST_lanePoints(id).length;
+      window._TEST_seekPlayhead(8 * 1920);
+      window._TEST_anchorAll();
+      return { identical: JSON.stringify(before) === JSON.stringify(window._TEST_laneSample(id, TS)),
+               nBefore, nAfter: window._TEST_lanePoints(id).length };
+    });
+    check('anchoring straight onto an existing point changes the curve not at all',
+      r.identical, r);
+    check('...and does not leave a duplicate point behind', r.nAfter === r.nBefore, r);
+
+    // A lane with nothing in it yet starts its curve at the centre value.
+    const empty = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ccLanes.length = 0;
+      const id = window._TEST_addLane(40, 0);
+      s.ccLanes.find(l => l.id === id).points = [];
+      window._TEST_seekPlayhead(4 * 1920);
+      window._TEST_anchorAll();
+      return window._TEST_lanePoints(id);
+    });
+    check('a lane with no points at all gets its anchor at the centre value',
+      empty.length === 1 && empty[0].v === 64 && empty[0].t === 4 * 1920, empty);
+  });
+
+  await withPage(browser, async (page) => {
+    // The filter bar is how a lane subset is chosen in this app, so it is the
+    // selector for the column operations too.
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 32; s.ccLanes.length = 0;
+      const a = window._TEST_addLane(50, 0), b = window._TEST_addLane(51, 0);
+      s.ccLanes.find(l => l.id === a).tags = ['keep'];
+      s.ccLanes.find(l => l.id === b).tags = ['drop'];
+      window._TEST_setTagFilter(['keep']);
+      const pa = window._TEST_lanePoints(a).length, pb = window._TEST_lanePoints(b).length;
+      window._TEST_seekPlayhead(4 * 1920);
+      window._TEST_anchorAll();
+      const out = { aGained: window._TEST_lanePoints(a).length - pa,
+                    bGained: window._TEST_lanePoints(b).length - pb,
+                    flash: document.getElementById('stCtx').textContent };
+      window._TEST_setTagFilter([]);
+      return out;
+    });
+    check('with a tag filter active only the lanes on show are anchored',
+      r.aGained === 1 && r.bGained === 0, r);
+    check('...and the count reported is the number actually touched', /Anchored 1 lane /.test(r.flash), r.flash);
+  });
+
+  await withPage(browser, async (page) => {
+    // Copy/paste a whole column: re-state one instant's values later on.
+    const setup = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 32; s.ccLanes.length = 0;
+      const ramp = window._TEST_addLane(20, 0);
+      window._TEST_upsertPoint(ramp, 0, 0); window._TEST_upsertPoint(ramp, 16 * 1920, 127);
+      const hump = window._TEST_addLane(21, 3);
+      window._TEST_upsertPoint(hump, 0, 10); window._TEST_upsertPoint(hump, 4 * 1920, 120);
+      const pb = window._TEST_addPbLane(0);
+      window._TEST_upsertPoint(pb, 0, -8192); window._TEST_upsertPoint(pb, 16 * 1920, 8191);
+      return { ramp, hump, pb };
+    });
+    const keys = ['ramp', 'hump', 'pb'];
+    const valuesAt = (tick) => page.evaluate(({ ids, tick, keys }) => {
+      const o = {}; keys.forEach(k => { o[k] = window._TEST_laneSample(ids[k], [tick])[0]; }); return o;
+    }, { ids: setup, tick, keys });
+
+    const pasteDisabledBefore = await page.evaluate(() => document.getElementById('colPasteBtn').disabled);
+    check('Paste is disabled until something has been copied', pasteDisabledBefore === true, pasteDisabledBefore);
+
+    const nothingYet = await page.evaluate(() => {
+      window._TEST_seekPlayhead(10 * 1920);
+      const n = window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).length;
+      window._TEST_pasteColumn();
+      return { flash: document.getElementById('stCtx').textContent,
+               changed: window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).length !== n };
+    });
+    check('...and pasting with an empty clipboard says so and changes nothing',
+      /Nothing copied/i.test(nothingYet.flash) && !nothingYet.changed, nothingYet);
+
+    const atCopy = await valuesAt(4 * 1920);
+    const clip = await page.evaluate(() => { window._TEST_seekPlayhead(4 * 1920); window._TEST_copyColumn(); return window._TEST_colClip(); });
+    check('Copy captures one value per shown lane, keyed by what each lane addresses',
+      clip.items.length === 3 && clip.tick === 4 * 1920
+      && clip.items.some(i => i.key === 'cc20:0') && clip.items.some(i => i.key === 'cc21:3')
+      && clip.items.some(i => i.key === 'pb:0'), clip);
+
+    const pasteState = await page.evaluate(() => ({
+      disabled: document.getElementById('colPasteBtn').disabled,
+      title: document.getElementById('colPasteBtn').title,
+    }));
+    check('...which enables Paste and says where it will paste from',
+      pasteState.disabled === false && /3 lane values copied from 5\.1\.1\.0/.test(pasteState.title), pasteState);
+
+    await page.evaluate(() => { window._TEST_seekPlayhead(14 * 1920); window._TEST_pasteColumn(); });
+    const atPaste = await valuesAt(14 * 1920);
+    check('Paste re-states that exact moment at the new position, on every lane',
+      JSON.stringify(atCopy) === JSON.stringify(atPaste), { atCopy, atPaste });
+    check('...reporting both ends of the move',
+      /from 5\.1\.1\.0 to 15\.1\.1\.0/.test(await page.evaluate(() => document.getElementById('stCtx').textContent)),
+      await page.evaluate(() => document.getElementById('stCtx').textContent));
+
+    // Pasting repeatedly is the point — the same moment at several places.
+    await page.evaluate(() => { window._TEST_seekPlayhead(20 * 1920); window._TEST_pasteColumn(); });
+    const atThird = await valuesAt(20 * 1920);
+    check('...and the clipboard survives, so one moment can be stamped down repeatedly',
+      JSON.stringify(atCopy) === JSON.stringify(atThird), { atCopy, atThird });
+
+    // A lane deleted since the copy must not take the paste down with it.
+    const gone = await page.evaluate((ids) => {
+      const s = window._TEST_state;
+      s.ccLanes = s.ccLanes.filter(l => l.id !== ids.hump);
+      window._TEST_seekPlayhead(24 * 1920);
+      window._TEST_pasteColumn();
+      return { flash: document.getElementById('stCtx').textContent,
+               rampHasPoint: window._TEST_lanePoints(ids.ramp).some(p => p.t === 24 * 1920) };
+    }, setup);
+    check('a lane deleted since the copy is reported, and the rest still paste',
+      gone.rampHasPoint && /1 copied lane no longer exists/.test(gone.flash), gone);
+  });
+
+  await withPage(browser, async (page) => {
+    // Buttons and shortcuts. The chords sit above the plain Ctrl+A/C/V in the
+    // key handler, which do not test Shift — so both have to be checked.
+    const btns = await page.evaluate(() => ['colAnchorBtn', 'colCopyBtn', 'colPasteBtn'].map(id => {
+      const b = document.getElementById(id);
+      if (!b) return null;
+      const r = b.getBoundingClientRect();
+      return { id, visible: r.width > 0 && r.height > 0, inToolbar: !!b.closest('.toolbar') };
+    }));
+    check('the three All Lanes buttons are present and visible in the toolbar',
+      btns.every(b => b && b.visible && b.inToolbar), btns);
+
+    await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 32; s.ccLanes.length = 0; s.notes = [];
+      const id = window._TEST_addLane(20, 0);
+      window._TEST_upsertPoint(id, 0, 0); window._TEST_upsertPoint(id, 16 * 1920, 127);
+      window._TEST_seekPlayhead(6 * 1920);
+      if (document.activeElement) document.activeElement.blur();
+    });
+    const n0 = await page.evaluate(() => window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).length);
+    await page.keyboard.press('Control+Shift+KeyA');
+    await page.waitForTimeout(60);
+    check('Ctrl+Shift+A anchors every shown lane',
+      (await page.evaluate(() => window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).length)) === n0 + 1,
+      { n0, now: await page.evaluate(() => window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).length) });
+
+    await page.keyboard.press('Control+Shift+KeyC');
+    await page.waitForTimeout(60);
+    check('Ctrl+Shift+C copies the column', (await page.evaluate(() => window._TEST_colClip())) !== null,
+      await page.evaluate(() => window._TEST_colClip()));
+
+    await page.evaluate(() => window._TEST_seekPlayhead(12 * 1920));
+    await page.keyboard.press('Control+Shift+KeyV');
+    await page.waitForTimeout(60);
+    check('Ctrl+Shift+V pastes it at the playhead',
+      await page.evaluate(() => window._TEST_lanePoints(window._TEST_state.ccLanes[0].id).some(p => p.t === 12 * 1920)),
+      await page.evaluate(() => window._TEST_lanePoints(window._TEST_state.ccLanes[0].id)));
+
+    // The plain chords must still do what they always did.
+    const plainA = await page.evaluate(async () => {
+      const s = window._TEST_state;
+      s.notes = [];
+      window._TEST_addNote({ start: 0, pitch: 60 });
+      window._TEST_addNote({ start: 1920, pitch: 62 });
+      s.selection.clear(); s.focus = 'piano';
+      return s.selection.size;
+    });
+    await page.keyboard.press('Control+KeyA');
+    await page.waitForTimeout(60);
+    check('plain Ctrl+A still selects, rather than being swallowed by the new chord',
+      (await page.evaluate(() => window._TEST_state.selection.size)) === 2,
+      { before: plainA, after: await page.evaluate(() => window._TEST_state.selection.size) });
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------

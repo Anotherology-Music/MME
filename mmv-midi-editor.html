@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.66
+  MMV MIDI & CC Curve Editor v0.9.67
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1904,6 +1904,42 @@
   mute/solo/hidden handling, the refusal to fire during playback, Enter not
   firing while a field has focus, and the handoff to Play and Stop.
 
+
+  v0.9.67 All Lanes — anchor, copy and paste a whole column at the playhead.
+  Ctrl+Shift+double-click has long dropped an anchor on ONE lane: a point
+  taking whatever value the curve already holds there, so it pins the shape
+  rather than tilting it the way a hand-placed point does. On a show with 37
+  lanes, doing that lane by lane to pin a single instant is not realistic.
+
+  A new "All Lanes" group in the second toolbar row does it to every lane at
+  once, and lets that instant be re-stated elsewhere:
+    Anchor (Ctrl+Shift+A) — a point on every shown lane at the playhead, each
+      taking its own curve's current value.
+    Copy   (Ctrl+Shift+C) — capture every shown lane's value at the playhead.
+    Paste  (Ctrl+Shift+V) — write those values as points at the playhead.
+  All three are a single undo. Paste stays loaded, so one moment can be
+  stamped down at as many places as wanted, and it matches lanes by what they
+  address (CC number / PB / CP, plus channel) rather than by position in the
+  list — so it still lands correctly if lanes have been reordered since, and
+  says so if a copied lane has since been deleted.
+
+  Which lanes: the ones the filter bar is showing. Filtering is how a lane
+  subset gets chosen in this app, so it is the selector here too; with no
+  filter active that is simply every lane.
+
+  Exactness, stated plainly because it is not quite nothing: points hold
+  integers, so an anchor at a tick whose interpolated value is fractional
+  rounds, which tilts the two segments either side. The error is bounded at
+  half a step, so the value actually sent can differ by at most 1 of 127 —
+  measured across every eighth-note of the steepest possible ramp. Anchoring
+  where the value is already whole, including straight onto an existing point,
+  is exactly lossless and adds no duplicate.
+
+  Twenty-two new checks, including the shape bound above, the single undo
+  across all lanes, filter scoping, repeated pasting, a lane deleted between
+  copy and paste, an empty lane, and that plain Ctrl+A/C/V still behave (the
+  new chords sit above them in the key handler, which does not test Shift).
+
 -->
 
 
@@ -3071,6 +3107,12 @@
         <option value="snap">Snap</option>
       </select>
       <button id="moveAllR" title="Shift EVERYTHING right by the step — all notes, every CC/PB/CP curve, and the audio track — locked together. Right by a bar = insert a bar at the start.">▶</button>
+    </div>
+    <div class="move-grp">
+      <span class="lbl">All Lanes</span>
+      <button id="colAnchorBtn" title="Anchor every lane shown in the list with a point at the playhead, each taking the value its curve already holds there — so the shape is pinned without being changed (Ctrl+Shift+A). Same as Ctrl+Shift+double-click on one lane, done to all of them at once.">&#9679; Anchor</button>
+      <button id="colCopyBtn" title="Copy every shown lane's value at the playhead (Ctrl+Shift+C) — capture this instant so it can be re-stated later in the song.">Copy</button>
+      <button id="colPasteBtn" disabled title="Paste copied lane values at the playhead (Ctrl+Shift+V) — nothing copied yet">Paste</button>
     </div>
     <div class="view-grp">
       <span class="lbl">View</span>
@@ -10186,7 +10228,90 @@
     syncInputs(); updateDuration(); resizeCanvases(); requestDraw();
     flash('Moved everything '+(delta>0?'right':'left')+' by '+Math.abs(delta)+' ticks');
   }
+  // ---------- All Lanes: anchor / copy / paste a whole column ----------
+  // Ctrl+Shift+double-click drops an anchor on ONE lane: a point whose value
+  // is whatever the curve already plays there, so it pins the shape in place
+  // of a hand-placed point that would tilt it. On a show with 37 lanes, doing
+  // that lane by lane to pin one instant is not realistic. These three do the
+  // same thing to every lane at the playhead at once, and let that instant's
+  // values be re-stated later.
+  //
+  // Exactness: points hold integers, so an anchor at a tick whose interpolated
+  // value is fractional rounds, and that tilts the two segments either side.
+  // The error is bounded at half a step, so the value actually sent can differ
+  // by at most 1 of 127 — measured over every eighth-note of the steepest
+  // possible ramp (see the regression test). Anchoring on a tick that already
+  // holds a whole value, including on an existing point, is exactly lossless.
+  //
+  // Which lanes: the ones the filter bar is currently showing. Filtering is
+  // how a lane subset gets chosen in this app, so it is the selector here too
+  // — with no filter active that is simply every lane. Minimised (rolled-up)
+  // lanes are still in the list, so they are included.
+  function lanesForColumnOps(){ return state.ccLanes.filter(laneMatchesFilter); }
+  // Identifies a lane across a copy/paste by what it addresses rather than by
+  // its object identity, so the paste lands on the same CC/PB/CP + channel.
+  function laneColKey(l){ return (laneIsPb(l)?'pb':laneIsCp(l)?'cp':'cc'+l.cc)+':'+l.ch; }
+  function anchorValueAt(lane,t){
+    const r=laneRange(lane);
+    return clamp(Math.round(laneValueAt(lane,t)),r.min,r.max);
+  }
+  function columnTick(){ return Math.round(clamp(state.playhead,0,totalTicks())); }
+
+  function anchorAllLanes(){
+    const lanes=lanesForColumnOps();
+    if(!lanes.length){ flash('No lanes to anchor — the lane list is empty or everything is filtered out.'); return; }
+    const t=columnTick();
+    pushUndo();
+    lanes.forEach(l=>upsertPoint(l,t,anchorValueAt(l,t)));
+    requestDraw();
+    flash('Anchored '+lanes.length+' lane'+(lanes.length===1?'':'s')+' at '+tickToBBT(t)
+      +' — each took the value its curve already holds there.');
+  }
+
+  // The copied column is values, not points: re-stating "everything as it was
+  // at bar 12" is the job. Reading laneValueAt rather than hunting for an
+  // existing point means Copy works whether or not the column was anchored
+  // first, and gives the same answer when it was.
+  let colClip=null;   // {tick, items:[{key,label,v}]}
+  function copyLaneColumn(){
+    const lanes=lanesForColumnOps();
+    if(!lanes.length){ flash('No lanes to copy from.'); return; }
+    const t=columnTick();
+    colClip={tick:t, items:lanes.map(l=>({key:laneColKey(l), label:laneLabelFor(l), v:anchorValueAt(l,t)}))};
+    updateColClipUi();
+    flash('Copied '+lanes.length+' lane value'+(lanes.length===1?'':'s')+' from '+tickToBBT(t)
+      +' — move the playhead and paste to bring that moment back.');
+  }
+  function pasteLaneColumn(){
+    if(!colClip){ flash('Nothing copied yet — use Copy to capture every lane value at the playhead first.'); return; }
+    const t=columnTick();
+    // By key, not by the current filter: the clipboard names specific lanes,
+    // and a lane filtered out of view since the copy is still that lane.
+    const byKey=new Map();
+    state.ccLanes.forEach(l=>{ const k=laneColKey(l); if(!byKey.has(k)) byKey.set(k,l); });
+    const hits=colClip.items.filter(it=>byKey.has(it.key));
+    if(!hits.length){ flash('None of the copied lanes still exist — nothing to paste onto.'); return; }
+    pushUndo();
+    hits.forEach(it=>{ const l=byKey.get(it.key); const r=laneRange(l); upsertPoint(l,t,clamp(Math.round(it.v),r.min,r.max)); });
+    requestDraw();
+    const missing=colClip.items.length-hits.length;
+    flash('Pasted '+hits.length+' lane value'+(hits.length===1?'':'s')+' from '+tickToBBT(colClip.tick)+' to '+tickToBBT(t)
+      +(missing?' — '+missing+' copied lane'+(missing===1?'':'s')+' no longer exist'+(missing===1?'s':'')+'.':'.'));
+  }
+  function updateColClipUi(){
+    const b=$('colPasteBtn');
+    if(!b) return;
+    b.disabled=!colClip;
+    b.title=colClip
+      ? 'Paste the '+colClip.items.length+' lane value'+(colClip.items.length===1?'':'s')+' copied from '
+        +tickToBBT(colClip.tick)+' as points at the playhead (Ctrl+Shift+V)'
+      : 'Paste copied lane values at the playhead (Ctrl+Shift+V) — nothing copied yet';
+  }
+
   function moveAllStepTicks(){ const v=$('moveAllStep').value; return v==='bar'?ticksPerBar():v==='beat'?ticksPerBeat():snapTicks(); }
+  $('colAnchorBtn').addEventListener('click',anchorAllLanes);
+  $('colCopyBtn').addEventListener('click',copyLaneColumn);
+  $('colPasteBtn').addEventListener('click',pasteLaneColumn);
   $('moveAllL').addEventListener('click',()=>shiftAll(-moveAllStepTicks()));
   $('moveAllR').addEventListener('click',()=>shiftAll(+moveAllStepTicks()));
   // Section-visibility toggles in the top-left corner cell — flip a body
@@ -11166,6 +11291,12 @@
     const ctrl=e.ctrlKey||e.metaKey;
     if(ctrl && e.key.toLowerCase()==='z'){ e.preventDefault(); e.shiftKey?redo():undo(); return; }
     if(ctrl && e.key.toLowerCase()==='y'){ e.preventDefault(); redo(); return; }
+    // Ctrl+Shift+A/C/V operate on EVERY shown lane at the playhead. These sit
+    // above the plain Ctrl+A/C/V below, which do not test Shift and would
+    // otherwise swallow the chord.
+    if(ctrl && e.shiftKey && e.key.toLowerCase()==='a'){ e.preventDefault(); anchorAllLanes(); return; }
+    if(ctrl && e.shiftKey && e.key.toLowerCase()==='c'){ e.preventDefault(); copyLaneColumn(); return; }
+    if(ctrl && e.shiftKey && e.key.toLowerCase()==='v'){ e.preventDefault(); pasteLaneColumn(); return; }
     if(ctrl && e.key.toLowerCase()==='l'){ e.preventDefault(); toggleLoop(); return; }
     if(ctrl && e.key.toLowerCase()==='c'){ e.preventDefault(); copySel(); return; }
     if(ctrl && e.key.toLowerCase()==='v'){ e.preventDefault(); paste(); return; }
