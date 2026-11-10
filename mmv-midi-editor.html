@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.68
+  MMV MIDI & CC Curve Editor v0.9.69
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -1990,6 +1990,39 @@
   Shift being bit-identical afterwards, Alt still tilting, and a three-point
   selection rising by an equal amount while its neighbours stay put.
 
+
+  v0.9.69 GENERATE works in the lane's own range — Pitch Bend included.
+  Clearing the known limitation left open since v0.9.23, reported as "drawing
+  curves on a PB lane just gives straight lines". It did. Every generator
+  clamped its output to 0-127 whatever the lane was, so a curve drawn on a
+  Pitch Bend lane (-8192..8191) came out as a nearly flat line sitting just
+  above centre. Measured on the shipped build, asking for the full range on a
+  PB lane: sine, ramp, triangle and step all returned 0..127 — 0.8% of the
+  lane. The Lo/Hi controls could not be given a PB value either; number boxes
+  and sliders alike were capped at 0-127.
+
+  The output clamp in every generator (uniform sampler, square, step, saw) now
+  reads the lane's own range, as do "add" output mode, Reshape, Scale to Range
+  and the A/B preview. The Lo/Hi boxes, the dual slider, the scale marks under
+  it and the four sweep-amplitude fields all follow the active lane, so -8192
+  can be typed where it means something. The percent toggle is now a
+  percentage OF THAT RANGE: 0% is the lane's minimum, 100% its maximum.
+
+  Switching the active lane between ranges rescales Lo/Hi (and the sweep
+  amplitudes) by position rather than leaving the numbers where they were: a
+  middle-half 32..96 on a CC lane becomes -4064..4192 on a PB lane, the same
+  half of the range, and comes back to 32..96. Without that, selecting a PB
+  lane after a CC one left a setting that clamped flat.
+
+  On a CC lane nothing changes at all — the scale marks still read
+  0/32/64/96/127 (computed with ceil, which reproduces them exactly), and
+  every generator still returns 0..127. Channel Pressure is a 0-127 lane and
+  is likewise untouched.
+
+  Sixteen new checks: five shapes on a PB lane each using the full range with
+  the matching CC case still exactly 0-127, the control bounds per lane type,
+  the rescale both ways, "add" mode staying in PB units, and CP unchanged.
+
 -->
 
 
@@ -3305,7 +3338,7 @@
             <div>
               <div class="adv-sec">VALUE RANGE
                 <button type="button" id="advPctToggle" style="font-weight:400;font-size:9px;letter-spacing:0;padding:0 5px;margin-left:4px;vertical-align:1px;"
-                  title="Show Lo/Hi as a percentage of the 0-127 range instead of the raw MIDI numbers. Display only — the values sent and exported are identical either way.">0-127</button>
+                  title="Show Lo/Hi as a percentage of the active lane's value range instead of its raw numbers (0-127 on a CC lane, -8192 to 8191 on Pitch Bend). Display only — the values sent and exported are identical either way.">0-127</button>
               </div>
               <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
                 <span class="adv-lbl">Lo</span>
@@ -4627,6 +4660,37 @@
   // per MIDI channel rather than a numbered CC.
   function laneIsCp(lane){ return lane.type==='cp'; }
   function laneRange(lane){ return laneIsPb(lane)?{min:-8192,max:8191,center:0}:{min:0,max:127,center:64}; }
+  // ---------- GENERATE works in the active lane's own units ----------
+  // A CC lane is 0..127; a Pitch Bend lane is -8192..8191 — 16,384 steps, which
+  // is the whole reason to reach for PB instead of CC. Every generator used to
+  // clamp its output to 0..127 whatever the lane was, so a curve drawn on a PB
+  // lane came out as a nearly flat line sitting just above centre, and the
+  // Lo/Hi controls could not be given a PB value in the first place.
+  //
+  // Lo/Hi (and the four sweep amplitude fields) are stored raw, in the units of
+  // whichever lane was active when they were set. When the active lane's range
+  // changes — picking a PB lane after a CC one — they are rescaled by position
+  // within the range, so the shape that was set up carries over instead of
+  // collapsing to a sliver or clamping flat.
+  function genRange(){ return laneRange(activeLane()||{type:'cc',cc:1}); }
+  const GEN_VAL_KEYS=['genLo','genHi','sweepAmpLoStart','sweepAmpLoEnd','sweepAmpHiStart','sweepAmpHiEnd'];
+  let genValRange={min:0,max:127};   // the range state's generate values are in
+  function rescaleGenValues(from,to){
+    if(from.min===to.min&&from.max===to.max) return false;
+    const span=(from.max-from.min)||1;
+    GEN_VAL_KEYS.forEach(function(k){
+      const f=(clamp(state[k],from.min,from.max)-from.min)/span;
+      state[k]=Math.round(to.min+f*(to.max-to.min));
+    });
+    return true;
+  }
+  function syncGenRange(){
+    const r=genRange();
+    const changed=rescaleGenValues(genValRange,r);
+    genValRange={min:r.min,max:r.max};
+    if(changed&&typeof window.__advRefreshUnits==='function') window.__advRefreshUnits();
+    return changed;
+  }
   // Whether a lane actually plays right now: while any lane in the project
   // is soloed, only soloed lanes are audible (everyone else is suppressed
   // regardless of their own Mute state); otherwise a lane plays unless it's
@@ -6355,7 +6419,7 @@
     dlg.showModal();
   }
 
-  function setActiveLane(id){ state.activeLaneId=id; refreshActive(); }
+  function setActiveLane(id){ state.activeLaneId=id; refreshActive(); syncGenRange(); }
   function refreshActive(){
     const hasActive=state.ccLanes.some(l=>l.id===state.activeLaneId);
     state.ccLanes.forEach(l=>{
@@ -7251,8 +7315,8 @@
         const eTickRaw=Math.round(cStart+(s+1)*stepTicks);
         const eTick=s<Ns-1 ? eTickRaw-1 : (c<nCyc-1 ? cEnd-1 : cEnd);
         if(sTick>=cEnd) continue;
-        pts.push({t:sTick, v:clamp(v,0,127)});
-        if(eTick>sTick) pts.push({t:eTick, v:clamp(v,0,127)});
+        pts.push({t:sTick, v:clamp(v,r.min,r.max)});
+        if(eTick>sTick) pts.push({t:eTick, v:clamp(v,r.min,r.max)});
       }
       if(c===nCyc-1) pts.push({t:cEnd, v:pts[pts.length-1]?.v??lo});
     }
@@ -7285,13 +7349,13 @@
         const xRaw=applyTension(f,tension);
         const x=isExp?applyTension(xRaw,50):xRaw;
         const v=isDown?(hi-x*(hi-lo)):(lo+x*(hi-lo));
-        pts.push({t, v:clamp(Math.round(v),0,127)});
+        pts.push({t, v:clamp(Math.round(v),r.min,r.max)});
       }
       // Explicit cycle-end point: exactly reaches vEnd
       // Non-final: place at cEnd-1 so the next cycle's cStart=cEnd creates a 1-tick edge
       // Final: place at cEnd (the exact end of the generated range)
       const endTick=c<nCyc-1?cEnd-1:cEnd;
-      pts.push({t:endTick, v:clamp(Math.round(vEnd),0,127)});
+      pts.push({t:endTick, v:clamp(Math.round(vEnd),r.min,r.max)});
     }
     pts.sort((a,b)=>a.t-b.t);
     return pts.filter((p,i)=>i===pts.length-1||p.t!==pts[i+1].t);
@@ -7342,7 +7406,7 @@
         case 'step':     { const xp=(cycFrac+state.genPhase/360)%1; const Ns=Math.max(2,state.genSteps||4); const si=Math.min(Ns-1,Math.floor(xp*Ns)); v=lo+Math.round(si/(Ns-1)*(hi-lo)); break; }
         case 'stepDown': { const xp=(cycFrac+state.genPhase/360)%1; const Ns=Math.max(2,state.genSteps||4); const si=Math.min(Ns-1,Math.floor(xp*Ns)); v=hi-Math.round(si/(Ns-1)*(hi-lo)); break; }
         default: v=mid; }
-      points.push({t, v:clamp(Math.round(v),0,127)});
+      points.push({t, v:clamp(Math.round(v),r.min,r.max)});
     }
     if(sweep) window._lastChirpCycles=totalChirpCycles;
     return points;
@@ -7375,7 +7439,7 @@
     pts.forEach(pt=>{
       let t=pt.t, v=pt.v;
       if(outputMode==='blend'){ const existing=laneValueAt(lane,t); v=Math.round(existing*(1-blendAmt)+v*blendAmt); }
-      else if(outputMode==='add'){ v=clamp(Math.round(laneValueAt(lane,t)+v),0,127); }
+      else if(outputMode==='add'){ v=clamp(Math.round(laneValueAt(lane,t)+v),r.min,r.max); }
       if(outputMode==='replace') lane.points.push({t,v});
       else upsertPoint(lane,t,v);
     });
@@ -7436,6 +7500,7 @@
     const minT=pts[0].t, maxT=pts[pts.length-1].t, span=maxT-minT;
     if(span===0) return;
     const cyc=detectCycles(pts);
+    const rr=laneRange(lane);
     const lo=state.genLo, hi=state.genHi, mid=(lo+hi)/2;
     const tension=state.genTension, phaseRad=(state.genPhase/360)*2*Math.PI;
     const isLast=idx=>idx===pts.length-1;
@@ -7459,7 +7524,7 @@
         case 'step':      { const xp=(xRaw+state.genPhase/360)%1; const Ns=Math.max(2,state.genSteps||4); const si=Math.min(Ns-1,Math.floor(xp*Ns)); v=lo+Math.round(si/(Ns-1)*(hi-lo)); break; }
         case 'stepDown':  { const xp=(xRaw+state.genPhase/360)%1; const Ns=Math.max(2,state.genSteps||4); const si=Math.min(Ns-1,Math.floor(xp*Ns)); v=hi-Math.round(si/(Ns-1)*(hi-lo)); break; }
         default: v=mid; }
-      pt.v=clamp(Math.round(v),0,127);
+      pt.v=clamp(Math.round(v),rr.min,rr.max);
     });
   }
   function transformScaleToRange(lane){
@@ -7468,7 +7533,8 @@
     const curMin=Math.min(...pts.map(p=>p.v)), curMax=Math.max(...pts.map(p=>p.v));
     const lo=state.genLo, hi=state.genHi;
     if(curMax===curMin){ pts.forEach(p=>p.v=Math.round((lo+hi)/2)); return; }
-    pts.forEach(p=>{ p.v=clamp(Math.round(lo+(p.v-curMin)/(curMax-curMin)*(hi-lo)),0,127); });
+    const sr=laneRange(lane);
+    pts.forEach(p=>{ p.v=clamp(Math.round(lo+(p.v-curMin)/(curMax-curMin)*(hi-lo)),sr.min,sr.max); });
   }
   // Smart quantise: snap only peaks/troughs + endpoints to grid,
   // then redistribute intermediate points proportionally between those anchors.
@@ -14463,10 +14529,13 @@
         });
         window.addEventListener('mouseup',()=>{ rDrag=null; }); })();
 
-      // Dual-handle Lo/Hi range
+      // Dual-handle Lo/Hi range. Positions are a fraction of the ACTIVE LANE's
+      // range, not of 0-127, so the handles sit where they look on a Pitch Bend
+      // lane (-8192..8191) as readily as on a CC lane.
       function updateDualTrack(){
+        const g=genRange(), gspan=(g.max-g.min)||1;
         const lo=parseInt($('advLoR').value), hi=parseInt($('advHiR').value);
-        const plo=lo/127*100, phi=hi/127*100;
+        const plo=(lo-g.min)/gspan*100, phi=(hi-g.min)/gspan*100;
         $('advTrack').style.left=plo+'%'; $('advTrack').style.width=(phi-plo)+'%';
       }
       // ── Percent display for Lo/Hi ────────────────────────────────
@@ -14482,18 +14551,41 @@
       // 0-127 spans 128 values but only 101 whole percentages, so 27 of them
       // would print as a duplicate of their neighbour. One decimal keeps every
       // raw value distinguishable from the next.
-      function advRawToPct(raw){ return raw/127*100; }
-      function advPctToRaw(pct){ return pct/100*127; }
+      // Percent is of the active lane's own range: 0% is its minimum (centre-
+      // negative on PB, zero on CC) and 100% its maximum.
+      function advRawToPct(raw){ const g=genRange(); return (raw-g.min)/((g.max-g.min)||1)*100; }
+      function advPctToRaw(pct){ const g=genRange(); return g.min+pct/100*(g.max-g.min); }
       function advFmt(raw){ return advPct?advRawToPct(raw).toFixed(1):String(raw); }
       function advRefreshUnits(){
-        const btn=$('advPctToggle'); if(btn){ btn.textContent=advPct?'%':'0-127'; btn.classList.toggle('on',advPct); }
+        const g=genRange();
+        const btn=$('advPctToggle');
+        if(btn){ btn.textContent=advPct?'%':(g.min+'-'+g.max); btn.classList.toggle('on',advPct); }
+        // The sliders and boxes follow the lane: a PB lane needs to accept
+        // -8192, which a control capped at 0 simply cannot express.
+        [['advLoR','genLo'],['advHiR','genHi']].forEach(function(pair){
+          const el=$(pair[0]); if(!el) return;
+          el.min=String(g.min); el.max=String(g.max);
+          el.value=String(clamp(state[pair[1]],g.min,g.max));
+        });
         [['advLo',state.genLo],['advHi',state.genHi]].forEach(function(pair){
           const el=$(pair[0]); if(!el) return;
-          el.min='0'; el.max=advPct?'100':'127'; el.step=advPct?'any':'1';
-          el.value=advFmt(pair[1]);
+          el.min=advPct?'0':String(g.min); el.max=advPct?'100':String(g.max);
+          el.step=advPct?'any':'1';
+          el.value=advFmt(clamp(pair[1],g.min,g.max));
         });
         const sc=$('advScaleMarks');
-        if(sc) [0,32,64,96,127].forEach(function(m,i){ if(sc.children[i]) sc.children[i].textContent=advFmt(m); });
+        // ceil, not round: on a CC lane that reproduces the long-standing
+        // 0/32/64/96/127 labels exactly (round turns 95.25 into 95), and on a
+        // PB lane it lands on -8192/-4096/0/4096/8191.
+        if(sc) [0,0.25,0.5,0.75,1].forEach(function(f,i){
+          if(sc.children[i]) sc.children[i].textContent=advFmt(Math.ceil(g.min+f*(g.max-g.min)));
+        });
+        // The sweep amplitude envelope is in the same units, so its four
+        // boxes have to move with the lane as well.
+        ['advAmpLoStart','advAmpLoEnd','advAmpHiStart','advAmpHiEnd'].forEach(function(id){
+          const el=$(id); if(!el) return;
+          el.min=String(g.min); el.max=String(g.max);
+        });
       }
       // Typed text is in whatever the toggle says; the sliders always hand
       // over raw. Rounding to a whole raw value happens in syncLo/syncHi, so
@@ -14503,18 +14595,18 @@
         if(!isFinite(n)) return fallback;
         return advPct?advPctToRaw(n):n;
       }
-      function syncLo(v){ v=clamp(Math.round(v),0,parseInt($('advHiR').value)); state.genLo=v; $('advLoR').value=v; $('advLo').value=advFmt(v); updateDualTrack(); drawAbPreview(); }
-      function syncHi(v){ v=clamp(Math.round(v),parseInt($('advLoR').value),127); state.genHi=v; $('advHiR').value=v; $('advHi').value=advFmt(v); updateDualTrack(); drawAbPreview(); }
+      function syncLo(v){ const g=genRange(); v=clamp(Math.round(v),g.min,parseInt($('advHiR').value)); state.genLo=v; $('advLoR').value=v; $('advLo').value=advFmt(v); updateDualTrack(); drawAbPreview(); }
+      function syncHi(v){ const g=genRange(); v=clamp(Math.round(v),parseInt($('advLoR').value),g.max); state.genHi=v; $('advHiR').value=v; $('advHi').value=advFmt(v); updateDualTrack(); drawAbPreview(); }
       $('advLoR').addEventListener('input',e=>syncLo(+e.target.value));
-      $('advLo').addEventListener('change',e=>syncLo(advTypedToRaw(e.target.value,0)));
+      $('advLo').addEventListener('change',e=>syncLo(advTypedToRaw(e.target.value,genRange().min)));
       $('advHiR').addEventListener('input',e=>syncHi(+e.target.value));
-      $('advHi').addEventListener('change',e=>syncHi(advTypedToRaw(e.target.value,127)));
+      $('advHi').addEventListener('change',e=>syncHi(advTypedToRaw(e.target.value,genRange().max)));
       $('advPctToggle').addEventListener('click',function(){
         advPct=!advPct;
         try{ localStorage.setItem(ADV_PCT_KEY,advPct?'1':'0'); }catch(e){}
         advRefreshUnits();
-        flash(advPct?'Value Range shown as 0-100% — sent values are unchanged'
-                    :'Value Range shown as raw MIDI 0-127');
+        flash(advPct?'Value Range shown as 0-100% of the lane\'s range — sent values are unchanged'
+                    :'Value Range shown as raw lane values ('+genRange().min+' to '+genRange().max+')');
       });
       window.__advRefreshUnits=advRefreshUnits;
       advRefreshUnits();
@@ -14830,7 +14922,7 @@
               const ev=lane?laneValueAt(lane,pt.t):0;
               let v;
               if(state.genOutputMode==='blend') v=Math.round(ev*(1-blendAmt)+pt.v*blendAmt);
-              else if(state.genOutputMode==='add') v=clamp(Math.round(ev+pt.v),0,127);
+              else if(state.genOutputMode==='add'){ const pr=genRange(); v=clamp(Math.round(ev+pt.v),pr.min,pr.max); }
               else v=pt.v;
               return {t:pt.t,v};
             });
@@ -14874,7 +14966,7 @@
     $('advFreqEnd').addEventListener('change',e=>{ state.sweepFreqEnd=e.target.value; drawAbPreview(); });
     [['advAmpLoStart','sweepAmpLoStart'],['advAmpLoEnd','sweepAmpLoEnd'],['advAmpHiStart','sweepAmpHiStart'],['advAmpHiEnd','sweepAmpHiEnd']].forEach(([id,key])=>{
       const el=$(id); if(!el) return;
-      el.addEventListener('input',e=>{ state[key]=clamp(+e.target.value||0,0,127); drawAbPreview(); });
+      el.addEventListener('input',e=>{ const g=genRange(); state[key]=clamp(+e.target.value||0,g.min,g.max); drawAbPreview(); });
     });
 
     ensureChPopover(); ensureCcPopover(); ensureTsMarkerPopover(); ensureTempoMarkerPopover();

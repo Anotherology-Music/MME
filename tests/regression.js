@@ -225,6 +225,9 @@ function buildTestHtml() {
       '  window._TEST_laneAudible = (id) => laneAudible(state.ccLanes.find(l => l.id === id));',
       '  window._TEST_buildPassEvents = (a, b) => buildPassEvents(a, b);',
       '  window._TEST_generate = (kind) => generate(kind);',
+      '  window._TEST_setActiveLane = (id) => setActiveLane(id);',
+      '  window._TEST_genRange = () => genRange();',
+      '  window._TEST_advRefreshUnits = () => { if (window.__advRefreshUnits) window.__advRefreshUnits(); };',
       '  window._TEST_autosaveTick = () => autosaveTick();',
       '  window._TEST_autosaveMarkClean = () => autosaveMarkClean();',
       '  window._TEST_checkAutosaveRestore = () => checkAutosaveRestore();',
@@ -5189,6 +5192,128 @@ async function run() {
       && (sel[0] - 30) === (sel[1] - 50) && (sel[1] - 50) === (sel[2] - 70), { sel, unsel, pts });
     check('...leaving the points that were not selected exactly where they were',
       unsel[0] === 10 && unsel[1] === 20, { unsel, pts });
+  });
+
+  // ---------------- GENERATE in the lane's own range (v0.9.69) ----------------
+  await withPage(browser, async (page) => {
+    // Every generator clamped its output to 0-127 whatever the lane was, so a
+    // curve drawn on a Pitch Bend lane (-8192..8191) came out as a nearly flat
+    // line sitting just above centre — 0.8% of the range. PB is the whole
+    // reason to reach for 16,384 steps instead of 128.
+    await page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find(x => /Advanced/.test(x.textContent));
+      if (b) b.click();
+    });
+    await page.waitForTimeout(150);
+
+    const spanOf = async (kind, mk) => page.evaluate(({ kind, mk }) => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = mk === 'pb' ? window._TEST_addPbLane(7)
+               : mk === 'cp' ? window._TEST_addCpLane(3)
+               : window._TEST_addLane(20, 0);
+      s.ccLanes.find(l => l.id === id).points = [];
+      window._TEST_setActiveLane(id);
+      window._TEST_seekPlayhead(0);
+      s.locStart = 0; s.locEnd = 8 * 1920; s.genCycles = 2;
+      const g = window._TEST_genRange();
+      s.genLo = g.min; s.genHi = g.max;
+      window._TEST_advRefreshUnits();
+      window._TEST_generate(kind);
+      const vs = window._TEST_lanePoints(id).map(p => p.v);
+      return { range: g, min: Math.min(...vs), max: Math.max(...vs), n: vs.length };
+    }, { kind, mk });
+
+    for (const kind of ['sine', 'rampUp', 'tri', 'step', 'square']) {
+      const pb = await spanOf(kind, 'pb');
+      check('"' + kind + '" on a Pitch Bend lane uses the whole PB range, not a sliver of it',
+        pb.min <= -8000 && pb.max >= 8000 && pb.n > 4, pb);
+      const cc = await spanOf(kind, 'cc');
+      check('..."' + kind + '" on a CC lane is unchanged — still exactly 0-127',
+        cc.min === 0 && cc.max === 127, cc);
+    }
+
+    // Channel Pressure is 0-127 like CC, so it must not have moved.
+    const cp = await spanOf('sine', 'cp');
+    check('Channel Pressure stays a 0-127 lane', cp.range.min === 0 && cp.range.max === 127
+      && cp.min === 0 && cp.max === 127, cp);
+  });
+
+  await withPage(browser, async (page) => {
+    // The Lo/Hi controls could not be given a PB value at all: capped at 0-127.
+    await page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find(x => /Advanced/.test(x.textContent));
+      if (b) b.click();
+    });
+    await page.waitForTimeout(150);
+    const bounds = async (mk) => page.evaluate((mk) => {
+      const s = window._TEST_state;
+      s.ccLanes.length = 0;
+      const id = mk === 'pb' ? window._TEST_addPbLane(7) : window._TEST_addLane(20, 0);
+      window._TEST_setActiveLane(id);
+      window._TEST_advRefreshUnits();
+      const rd = (i) => { const e = document.getElementById(i); return e ? { min: e.min, max: e.max } : null; };
+      return { box: rd('advLo'), slider: rd('advLoR'), hiBox: rd('advHi'), hiSlider: rd('advHiR') };
+    }, mk);
+
+    const cc = await bounds('cc');
+    check('on a CC lane the Lo/Hi controls still run 0-127',
+      cc.box.min === '0' && cc.box.max === '127' && cc.slider.max === '127', cc);
+    const pb = await bounds('pb');
+    check('on a Pitch Bend lane they run the PB range, so a PB value can actually be typed',
+      pb.box.min === '-8192' && pb.box.max === '8191'
+      && pb.slider.min === '-8192' && pb.slider.max === '8191'
+      && pb.hiBox.max === '8191' && pb.hiSlider.max === '8191', pb);
+
+    // Switching lane type carries the SHAPE over by position in the range,
+    // rather than leaving a CC-sized setting to collapse into a PB sliver.
+    const carried = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.ccLanes.length = 0;
+      const ccId = window._TEST_addLane(20, 0);
+      window._TEST_setActiveLane(ccId);
+      s.genLo = 32; s.genHi = 96;                 // middle half of a CC lane
+      const pbId = window._TEST_addPbLane(7);
+      window._TEST_setActiveLane(pbId);
+      return { lo: s.genLo, hi: s.genHi };
+    });
+    const expLo = Math.round(-8192 + (32 / 127) * 16383);
+    const expHi = Math.round(-8192 + (96 / 127) * 16383);
+    check('a half-range setting on a CC lane becomes the same half of the PB range',
+      carried.lo === expLo && carried.hi === expHi, { carried, expLo, expHi });
+
+    // ...and back again, so the round trip is not one-way.
+    const back = await page.evaluate(() => {
+      const s = window._TEST_state;
+      const ccId = s.ccLanes.find(l => l.type !== 'pb' && l.type !== 'cp').id;
+      window._TEST_setActiveLane(ccId);
+      return { lo: s.genLo, hi: s.genHi };
+    });
+    check('...and switching back to a CC lane lands within a step of where it started',
+      Math.abs(back.lo - 32) <= 1 && Math.abs(back.hi - 96) <= 1, back);
+  });
+
+  await withPage(browser, async (page) => {
+    // "Add" output mode had its own hardcoded clamp, so adding onto a PB
+    // curve pulled every value back into 0-127.
+    const r = await page.evaluate(() => {
+      const s = window._TEST_state;
+      s.bars = 16; s.ccLanes.length = 0;
+      const id = window._TEST_addPbLane(7);
+      const lane = s.ccLanes.find(l => l.id === id);
+      lane.points = [{ t: 0, v: 4000 }, { t: 8 * 1920, v: 4000 }];
+      window._TEST_setActiveLane(id);
+      window._TEST_seekPlayhead(0);
+      s.locStart = 0; s.locEnd = 8 * 1920; s.genCycles = 1;
+      s.genOutputMode = 'add';
+      s.genLo = 0; s.genHi = 3000;
+      window._TEST_generate('rampUp');
+      const vs = window._TEST_lanePoints(id).map(p => p.v);
+      s.genOutputMode = 'replace';
+      return { min: Math.min(...vs), max: Math.max(...vs) };
+    });
+    check('"add" mode on a PB lane keeps the sum in PB units instead of clamping it to 127',
+      r.max > 6000 && r.max <= 8191, r);
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------
