@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.69
+  MMV MIDI & CC Curve Editor v0.9.70
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -2022,6 +2022,44 @@
   Sixteen new checks: five shapes on a PB lane each using the full range with
   the matching CC case still exactly 0-127, the control bounds per lane type,
   the rescale both ways, "add" mode staying in PB units, and CP unchanged.
+
+
+  v0.9.70 The Magic project request names a channel per assignment.
+  Decoding a .magic that MMV itself wrote, with one control connected to each
+  message type by hand, settled two things that had only been guessed at.
+
+  The feature numbers: Pitch Bend is feature="1", MIDI CC is "3", Channel
+  Pressure is "5". And the channel is not on the control at all — it is on the
+  Layer (what MMV calls a Source) that the control's layerID points at, which
+  in turn points at a Track carrying the device and channel:
+
+      layerID=2  "Laser Yaw PB + CC"  -> Track 281  Out to Visuals  channel 7
+      layerID=3  "Laser Tilt PB"      -> Track 282  Out to Visuals  channel 8
+      layerID=4  "Laser Roll PB"      -> Track 283  Out to Visuals  channel 9
+
+  That matters because Pitch Bend and Channel Pressure carry no number: there
+  is one stream of each PER CHANNEL, so the channel is the whole address. Three
+  independent Pitch Bend controls — a laser's yaw, tilt and roll — are three
+  channels and therefore three Sources. The request carried a single
+  project-wide source taken from the first wired row, so two of those three
+  would have been wired to a stream that was not theirs.
+
+  Each assignment now names its own channel, 1-based as MMV counts them.
+  source.channel stays as the request's default for a reader that only
+  understands one channel per project, and still matches the first assignment,
+  so a CC-only request is unchanged but for the added key.
+
+  The other half of this shipped in the ISF Catalogue at the same time: it
+  reads the per-assignment channel, maps the type to the right feature number,
+  and creates one Source per distinct channel, auto-named after the project.
+  Its own test covers the Laser case end to end against the decoded output.
+  Note the catalogue's page is generated, so it needs a rebuild to pick up the
+  dialog change.
+
+  Seven new checks here: a channel on every assignment, three Pitch Bends
+  landing on three channels, PB/CP still carrying no CC number, the CC row
+  keeping its number alongside its channel, and a CC-only project reporting
+  one channel on every row.
 
 -->
 
@@ -13993,6 +14031,13 @@
       const req={
         shader:magicShaderPath(entry.filename),
         project_name:((state.projectName||entry.label||entry.filename.replace(/\.[^.]+$/,''))+' - MME'),
+        // source.channel is the request's default, kept for readers that only
+        // understand one channel per project. Each assignment names its own
+        // channel as well, because Pitch Bend and Channel Pressure have no
+        // number — there is one stream of each PER CHANNEL — so a shader with
+        // Yaw, Tilt and Roll on PB genuinely spans three channels, and one
+        // project-wide channel would silently wire two of them to the wrong
+        // stream.
         source:{
           device:(state.midiOut&&state.midiOut.name)?state.midiOut.name:'Out to Visuals',
           channel:firstLane?(firstLane.ch+1):1,
@@ -14003,7 +14048,7 @@
           // label is the catalogue's job — that rule expands a colour into four
           // rows and a point2D into two, and re-deriving it here would be a
           // second implementation to keep in step.
-          const a={input:r.row.srcName||r.row.name, type:k.type};
+          const a={input:r.row.srcName||r.row.name, type:k.type, channel:(r.lane.ch+1)};
           if(k.numbered) a.number=r.lane.cc;
           return a;
         }),

@@ -5316,6 +5316,64 @@ async function run() {
       r.max > 6000 && r.max <= 8191, r);
   });
 
+  // ---------------- Per-assignment channel in the Magic request (v0.9.70) ----------------
+  await withPage(browser, async (page) => {
+    // Pitch Bend and Channel Pressure carry no number: there is one stream of
+    // each PER MIDI CHANNEL, so the channel is the whole address. A Laser with
+    // Yaw, Tilt and Roll on Pitch Bend therefore spans three channels, and the
+    // single project-wide source the request used to carry would have wired two
+    // of the three to a stream that is not theirs.
+    await page.evaluate(() => {
+      window._TEST_state.projectName = 'Laser';
+      window._TEST_state.midiOut = { state: 'connected', name: 'Out to Visuals', send: () => {} };
+      document.getElementById('isfShaderFolder').value = 'D:\\Visuals';
+    });
+    const req = await page.evaluate(() => {
+      const entry = { filename: 'Laser.fs', label: 'Volumetric Laser' };
+      const refs = [
+        { row: { name: 'screenX', srcName: 'screenX' },     lane: { type: 'cc', ch: 6, cc: 14 } },
+        { row: { name: 'yaw', srcName: 'yaw' },             lane: { type: 'pb', ch: 6 } },
+        { row: { name: 'tilt', srcName: 'tilt' },           lane: { type: 'pb', ch: 7 } },
+        { row: { name: 'roll', srcName: 'roll' },           lane: { type: 'pb', ch: 8 } },
+        { row: { name: 'intensity', srcName: 'intensity' }, lane: { type: 'cp', ch: 6 } },
+      ];
+      return JSON.parse(window._TEST_buildMagicRequest(entry, refs));
+    });
+
+    check('every assignment names its own channel, 1-based as MMV counts them',
+      req.assignments.map(a => a.channel).join(',') === '7,7,8,9,7',
+      req.assignments.map(a => ({ input: a.input, type: a.type, channel: a.channel })));
+    check('...so three Pitch Bends on three lanes come out on three channels',
+      [...new Set(req.assignments.filter(a => a.type === 'Pitch Bend').map(a => a.channel))]
+        .sort().join(',') === '7,8,9', req.assignments);
+    check('Pitch Bend and Channel Pressure still carry no CC number',
+      req.assignments.every(a => (a.type === 'CC') === ('number' in a)), req.assignments);
+    check('the CC row keeps its number alongside its channel',
+      req.assignments[0].type === 'CC' && req.assignments[0].number === 14
+      && req.assignments[0].channel === 7, req.assignments[0]);
+
+    // The project-wide source stays, as the default for a reader that only
+    // understands one channel — and it must agree with the first row.
+    check('the project-wide source is still there, matching the first assignment',
+      req.source.channel === 7 && req.source.device === 'Out to Visuals'
+      && req.source.channel === req.assignments[0].channel, req.source);
+    check('still no Scale or Offset — the catalogue derives those from the shader',
+      !/scale|offset/i.test(JSON.stringify(req)), JSON.stringify(req).slice(0, 160));
+
+    // A single-channel project must look exactly as it did before, bar the
+    // added key, so nothing regresses for the ordinary CC-only case.
+    const plain = await page.evaluate(() => {
+      const entry = { filename: 'Plain.fs', label: 'Plain' };
+      const refs = [
+        { row: { name: 'a', srcName: 'a' }, lane: { type: 'cc', ch: 1, cc: 20 } },
+        { row: { name: 'b', srcName: 'b' }, lane: { type: 'cc', ch: 1, cc: 21 } },
+      ];
+      return JSON.parse(window._TEST_buildMagicRequest(entry, refs));
+    });
+    check('a CC-only project reports one channel on every row',
+      plain.assignments.every(a => a.channel === 2) && plain.source.channel === 2, plain);
+  });
+
   // ---------------- "Saving to" line (v0.9.63) ----------------
 
   await withPage(browser, async (page) => {
