@@ -5374,6 +5374,84 @@ async function run() {
       plain.assignments.every(a => a.channel === 2) && plain.source.channel === 2, plain);
   });
 
+  // ---------------- ISF import: a Pitch Bend row uses up no CC number (v0.9.71) ----------------
+  await withPage(browser, async (page) => {
+    // Every row was pre-assigned a sequential CC. Ticking PB greyed the box but
+    // left the number in it and left it RESERVED, so the rows after a PB row
+    // skipped over a number nothing would ever send, and Auto-fill handed PB
+    // rows a CC of their own. The lane created was always correct (a PB lane
+    // carries no CC) — it was the numbering around it that was wrong.
+    const header = { INPUTS: [
+      { NAME: 'screenX', TYPE: 'float', MIN: -1, MAX: 1, DEFAULT: 0 },
+      { NAME: 'yaw', TYPE: 'float', MIN: -180, MAX: 180, DEFAULT: 0 },
+      { NAME: 'tilt', TYPE: 'float', MIN: -90, MAX: 90, DEFAULT: 0 },
+      { NAME: 'width', TYPE: 'float', MIN: 0, MAX: 1, DEFAULT: 0.5 },
+    ] };
+    await page.evaluate((h) => window._TEST_showISFDialog(h, 'laser.fs'), header);
+    await page.waitForTimeout(100);
+    const cell = (name, col, sel) => `Array.from(document.querySelectorAll('#isfDialog tbody tr')).find(tr => tr.querySelector('td[data-col="param"]').textContent === '${name}').querySelector('td[data-col="${col}"] ${sel}')`;
+    const ccOf = (name) => page.evaluate(new Function(`return ${cell(name, 'cc', 'input')}.value`));
+    const tick = (name, col) => page.evaluate(new Function(`${cell(name, col, 'input')}.click()`));
+
+    const start = [await ccOf('screenX'), await ccOf('yaw'), await ccOf('tilt'), await ccOf('width')];
+    check('setup: four rows start numbered in sequence', start.join(',') === '14,15,16,17', start);
+
+    for (const n of ['screenX', 'yaw', 'tilt', 'width']) await tick(n, 'import');
+    await tick('yaw', 'pb');
+    await page.waitForTimeout(60);
+    check('ticking PB empties that row\'s CC box rather than leaving a greyed number in it',
+      (await ccOf('yaw')) === '', await ccOf('yaw'));
+
+    // Renumber: the sequence is dealt only to the rows that will send a CC.
+    await page.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('#isfDialog button')).find(x => /renumber/i.test(x.textContent));
+      b.click();
+    });
+    await page.waitForTimeout(60);
+    const renum = [await ccOf('screenX'), await ccOf('yaw'), await ccOf('tilt'), await ccOf('width')];
+    check('renumbering skips the PB row, so the CC rows stay contiguous with no wasted number',
+      renum.join(',') === '14,,15,16', renum);
+
+    // Auto-fill must not hand the PB row a CC either.
+    await page.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('#isfDialog button')).find(x => /auto/i.test(x.textContent) && /cc/i.test(x.textContent));
+      if (b) b.click();
+    });
+    await page.waitForTimeout(60);
+    check('Auto-fill leaves the PB row without a CC', (await ccOf('yaw')) === '', await ccOf('yaw'));
+
+    // Unticking PB after a renumber has nothing to restore, so it takes the
+    // next free number instead of silently importing as CC 0.
+    await tick('yaw', 'pb');
+    await page.waitForTimeout(60);
+    const back = await ccOf('yaw');
+    const others = [await ccOf('screenX'), await ccOf('tilt'), await ccOf('width')];
+    check('unticking PB gives the row a real, unused CC number again',
+      back !== '' && back !== '0' && !others.includes(back), { back, others });
+
+    // And the straightforward case: tick then untick restores what it had.
+    const before = await ccOf('tilt');
+    await tick('tilt', 'pb'); await page.waitForTimeout(40);
+    await tick('tilt', 'pb'); await page.waitForTimeout(40);
+    check('tick-then-untick puts back exactly the number the row had',
+      (await ccOf('tilt')) === before, { before, after: await ccOf('tilt') });
+
+    // The import itself: one PB lane with no CC, the rest CC lanes.
+    await tick('yaw', 'pb'); await page.waitForTimeout(40);
+    const n0 = await page.evaluate(() => window._TEST_state.ccLanes.length);
+    await page.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('#isfDialog button')).find(x => /^import/i.test(x.textContent.trim()));
+      b.click();
+    });
+    await page.waitForTimeout(150);
+    const lanes = await page.evaluate((n0) => window._TEST_state.ccLanes.slice(n0).map(l => ({ name: l.name, type: l.type, cc: l.cc })), n0);
+    const yaw = lanes.find(l => l.name === 'yaw');
+    check('the PB row imports as a Pitch Bend lane carrying no CC number at all',
+      yaw && yaw.type === 'pb' && yaw.cc === null, lanes);
+    check('...and the CC rows import with distinct numbers',
+      new Set(lanes.filter(l => l.type === 'cc').map(l => l.cc)).size === 3, lanes);
+  });
+
   // ---------------- "Saving to" line (v0.9.63) ----------------
 
   await withPage(browser, async (page) => {

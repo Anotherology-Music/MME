@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.70
+  MMV MIDI & CC Curve Editor v0.9.71
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -2060,6 +2060,24 @@
   landing on three channels, PB/CP still carrying no CC number, the CC row
   keeping its number alongside its channel, and a CC-only project reporting
   one channel on every row.
+
+
+  v0.9.71 ISF import: a Pitch Bend row no longer uses up a CC number.
+  Reported as "it still tries to allocate a CC value even if I select PB". The
+  lane created was always right — a PB row imports as a Pitch Bend lane with no
+  CC — but the numbering around it was not. Every row is pre-assigned a
+  sequential CC; ticking PB greyed the box and left the number in it, still
+  reserved, so the rows after a PB row skipped a number nothing would ever
+  send. Renumber dealt a number to every row and merely declined to write it
+  into PB rows, and Auto-fill gave PB rows a CC of their own and marked it used.
+
+  Ticking PB now empties the row's CC box and hands the number back. Renumber
+  deals the sequence only to rows that will send a CC, so they stay contiguous
+  however many PB rows sit between them, and Auto-fill skips PB rows. Unticking
+  PB restores the number the row had; if the table was renumbered in between,
+  it takes the next number free on that channel rather than importing as CC 0.
+
+  Eight new checks.
 
 -->
 
@@ -13189,6 +13207,33 @@
           checkConflict();
         });
         pbCb.addEventListener('change',function(){
+          // A Pitch Bend row has no CC number at all — it is addressed by its
+          // channel alone. Leaving the pre-assigned number sitting greyed in
+          // the box read as "a CC is still being allocated", and it was in one
+          // sense: the number stayed reserved, so the rows after it skipped
+          // over it. Blank the box and hand the number back; unticking PB
+          // restores the number the row had.
+          if(pbCb.checked){
+            if(ccInput.value!=='') ccInput.dataset.prevCc=ccInput.value;
+            ccInput.value=''; ccInput.placeholder='\u2014';
+          } else {
+            if(ccInput.value===''){
+              if(ccInput.dataset.prevCc) ccInput.value=ccInput.dataset.prevCc;
+              else {
+                // Nothing to restore (the table was renumbered while this row
+                // was Pitch Bend) — take the next number free on its channel,
+                // counting both existing lanes and the other rows in this table.
+                const ch=(parseInt(chInput.value)||1)-1;
+                const used=usedCCSet();
+                rowRefs.forEach(function(r){
+                  if(r===thisRef||r.pbCb.checked||r.ccInput.value==='') return;
+                  used.add(((parseInt(r.chInput.value)||1)-1)+'_'+(parseInt(r.ccInput.value)||0));
+                });
+                ccInput.value=String(nextFreeCC(ch,used));
+              }
+            }
+            ccInput.placeholder='';
+          }
           checkConflict();
           // A PB row's channel is exclusive to it — recheck every OTHER
           // ticked row too, since this one just became a conflict (or
@@ -13433,10 +13478,17 @@
       // whatever the channel used to be.
       function applyNumbering(){
         const ch0=numCh0();
-        const seq=computeSeqCCs(numStart(),ch0,skipCb.checked,rowRefs.length);
-        rowRefs.forEach(function(ref,i){
+        // Pitch Bend rows take no CC number, so they must not use one up:
+        // the sequence is dealt only to the rows that will send a CC, and
+        // stays contiguous however many PB rows sit between them.
+        const ccRows=rowRefs.filter(function(r){ return !r.pbCb.checked; });
+        const seq=computeSeqCCs(numStart(),ch0,skipCb.checked,ccRows.length);
+        let k=0;
+        rowRefs.forEach(function(ref){
           ref.chInput.value=String(ch0+1);
-          if(!ref.pbCb.checked) ref.ccInput.value=String(seq[i]);
+          if(!ref.pbCb.checked) ref.ccInput.value=String(seq[k++]);
+          // A PB row's remembered number may now belong to another row.
+          delete ref.ccInput.dataset.prevCc;
           ref.checkConflict();
         });
       }
@@ -13450,6 +13502,7 @@
         const used=usedCCSet();
         rowRefs.forEach(function(ref){
           if(!ref.importCb.checked) return;
+          if(ref.pbCb.checked) return;   // Pitch Bend: no CC number to fill
           const ch=(parseInt(ref.chInput.value)||1)-1;
           const cc=nextFreeCC(ch,used);
           ref.ccInput.value=String(cc);
