@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.72
+  MMV MIDI & CC Curve Editor v0.9.73
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -2117,6 +2117,35 @@
   MIDI Range column was added — the failure CLAUDE.md warns about.
 
   Fifteen new checks.
+
+
+  v0.9.73 Step, settled — and the MMV project now writes it.
+  A project with a Step modifier added by hand, and one control carrying all
+  23 of MMV's modifiers, confirmed the full modifier table (types 0..22) and
+  that Step is type 15. The ISF Catalogue now writes Step into generated
+  projects, and MME's own advice is aligned with what it writes:
+
+  ORDER. Step is stacked BETWEEN Scale and Offset: Scale, Step, Offset. The
+  rounding then happens while the range still starts at 0, so a control
+  running 1..8 lands on 1, 2 ... 8 rather than on 0..7 shifted up — and that
+  holds whether MMV rounds to the nearest step or always down. The advice
+  used to say "then Offset ..., Step ..."; the wiring sheet's columns and its
+  note now read Scale, Step, Offset, in stacking order.
+
+  WHICH CONTROLS. Only those whose meaning is not in doubt get a Step: on/off
+  switches, integer ranges, and value lists of exactly 0, 1, 2 ... A list of
+  anything else — Beam Count's 1..10, Quality Steps' 32, 48, 64 ... 160 —
+  gives a different answer depending on whether MMV drives it by value or by
+  its position in the list, and that has not been observed. Those now get no
+  Step and a plain note to set them by hand, where MME used to suggest one.
+  In the library that is 22 controls; the ~580 others are covered.
+
+  Two smaller fixes. An on/off switch was advised "no modifiers needed" beside
+  a Step column of 1; it now reads Step=1. And a 0, 1, 2 ... list defines its
+  own range: it is no longer flagged "range assumed", and a float carrying
+  such a list now spans 0..7 instead of falling back to a bare float's 0..1.
+
+  Nine new checks.
 
 -->
 
@@ -12829,11 +12858,12 @@
           // falling back to 0..1. The modifier advice is only as good as the
           // MIN/MAX it is derived from, so a guessed range has to be called
           // out rather than printed as though it were fact.
-          const minGiven=inp.MIN!=null||inp.min!=null, maxGiven=inp.MAX!=null||inp.max!=null;
-          const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
-          const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:1);
-          const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
           const vals=inp.VALUES||inp.values||null;
+          const idxList=isIndexList(vals);
+          const minGiven=inp.MIN!=null||inp.min!=null||idxList, maxGiven=inp.MAX!=null||inp.max!=null||idxList;
+          const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
+          const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:(idxList?vals.length-1:1));
+          const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
           const labs=inp.LABELS||inp.labels||null;
           // A handful of real-world ISF shaders (this app's own gem shaders
           // among them) declare a discrete/enum control as TYPE "float" with
@@ -12851,7 +12881,8 @@
           // A VALUES list defines the range as surely as MIN/MAX would; a bare
           // long with neither falls back to 0..10, which is invented and has
           // to be flagged as such rather than dressed up as the real range.
-          const minGiven=inp.MIN!=null||inp.min!=null, maxGiven=inp.MAX!=null||inp.max!=null||!!vals;
+          const idxList=isIndexList(vals);
+          const minGiven=inp.MIN!=null||inp.min!=null||idxList, maxGiven=inp.MAX!=null||inp.max!=null||idxList;
           const mn=inp.MIN!=null?inp.MIN:(inp.min!=null?inp.min:0);
           const mx=inp.MAX!=null?inp.MAX:(inp.max!=null?inp.max:(vals?vals.length-1:10));
           const dv=inp.DEFAULT!=null?inp.DEFAULT:(inp.default!=null?inp.default:mn);
@@ -13995,6 +14026,7 @@
     // irregular VALUES array can't be represented by a single "round to
     // nearest multiple of N" modifier, so that case is flagged rather than
     // guessed.
+    function isIndexList(v){ return Array.isArray(v)&&v.length>0&&v.every(function(x,i){ return x===i; }); }
     function computeModifiers(row){
       const scale=row.max-row.min, offset=row.min;
       // A range MME had to invent because the shader declared no MIN/MAX
@@ -14019,10 +14051,15 @@
       if(!discrete) return out(null,null);
       if(row.type==='bool') return out(1,null);
       if(hasValues){
-        const diffs=[]; for(let i=1;i<row.values.length;i++) diffs.push(row.values[i]-row.values[i-1]);
-        const d0=diffs[0], even=diffs.every(function(d){ return Math.abs(d-d0)<1e-6; });
-        if(!even) return out(null,'Irregular VALUES spacing — set Step manually in MMV.');
-        return out(d0,null);
+        // A list of exactly 0, 1, 2 ... means the same thing whether MMV drives
+        // the control by value or by position in the list, so Step 1 is safe.
+        // Any other list (1..10, or 32, 48, 64 ...) gives a different answer
+        // each way, and which one MMV uses has not been observed — so no Step
+        // is suggested, and the generated MMV project leaves it alone too.
+        if(isIndexList(row.values)) return out(1,null);
+        return {scale,offset,step:null,guessedRange:true,
+          warning:'Lists its own values ('+row.values.slice(0,4).join(', ')+(row.values.length>4?' \u2026':'')
+            +'): MMV may drive it by value or by position in the list, which has not been checked — set its modifiers by hand in MMV.'};
       }
       return out(1,null);
     }
@@ -14030,12 +14067,16 @@
     // user does not need is noise in a Help panel they are reading to find out
     // what to set up, so an all-zero Offset or an already-0..1 range is said
     // rather than printed as a number they would have to recognise as a no-op.
+    // In the order to stack them in MMV: Scale, then Step, then Offset. Step
+    // goes before Offset so the rounding happens while the range still starts
+    // at 0 — a 1..8 control then lands on 1..8, not on 0..7 shifted up — and
+    // that holds whether MMV rounds to the nearest step or always down.
     function modifierAdvice(mods){
-      if(mods.scale===1&&mods.offset===0) return 'no modifiers needed (already 0.00-1.00)';
-      let s=(mods.offset===0)
-        ? 'Scale='+fmtNum(mods.scale)
-        : 'Scale='+fmtNum(mods.scale)+', then Offset='+fmtNum(mods.offset);
+      if(mods.scale===1&&mods.offset===0&&mods.step==null) return 'no modifiers needed (already 0.00-1.00)';
+      if(mods.scale===1&&mods.offset===0) return 'Step='+fmtNum(mods.step);
+      let s='Scale='+fmtNum(mods.scale);
       if(mods.step!=null) s+=', Step='+fmtNum(mods.step);
+      if(mods.offset!==0) s+=', then Offset='+fmtNum(mods.offset);
       return s;
     }
 
@@ -14293,9 +14334,9 @@
       lines.push('Source: '+entry.filename);
       lines.push('Generated: '+new Date().toLocaleString());
       lines.push('');
-      const cols=['Parameter','Feature','Scale','Offset','Step'];
+      const cols=['Parameter','Feature','Scale','Step','Offset'];
       const rowsOut=wireRefs.map(function(r){
-        return [r.row.name, wireFeatureLabel(r), fmtNum(r.mods.scale), fmtNum(r.mods.offset), r.mods.step==null?'—':fmtNum(r.mods.step)];
+        return [r.row.name, wireFeatureLabel(r), fmtNum(r.mods.scale), r.mods.step==null?'—':fmtNum(r.mods.step), fmtNum(r.mods.offset)];
       });
       const widths=cols.map(function(c,i){ return Math.max(c.length,...rowsOut.map(function(r){ return r[i].length; }))+2; });
       function padRow(cells){ return cells.map(function(c,i){ return c.padEnd(widths[i]); }).join(''); }
@@ -14303,10 +14344,11 @@
       lines.push(widths.map(function(w){ return ''.padEnd(w-1,'-')+' '; }).join(''));
       rowsOut.forEach(function(r){ lines.push(padRow(r)); });
       lines.push('');
-      lines.push('For every row above: in MMV, add a Scale modifier ABOVE an Offset');
-      lines.push('modifier (Scale applies first, then Offset) — reversing the stacking');
-      lines.push('order changes the result. See MMV\'s Modifiers > Order of Modifier');
-      lines.push('Operations for why.');
+      lines.push('For every row above: in MMV, stack the modifiers Scale ABOVE Step ABOVE Offset');
+      lines.push('(left to right as listed; a dash means that one is not needed). Modifiers');
+      lines.push('apply top to bottom and the order changes the result — Step before Offset');
+      lines.push('is what makes a range like 1..8 land on whole numbers. See MMV\'s');
+      lines.push('Modifiers > Order of Modifier Operations.');
       const warns=wireRefs.filter(function(r){ return r.mods.warning; });
       if(warns.length){
         lines.push('');

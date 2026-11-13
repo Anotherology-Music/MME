@@ -3221,6 +3221,9 @@ async function run() {
         sheetText.includes('GirdleRadius') && !sheetText.includes('CutType'), sheetText.slice(0, 200));
       check('Wiring sheet states the Scale-before-Offset stacking requirement',
         /Scale.*ABOVE.*Offset/.test(sheetText), sheetText.includes('ABOVE'));
+      check('...with Step between them, and its columns in that same order',
+        /Scale ABOVE Step ABOVE Offset/.test(sheetText) && /Parameter\s+Feature\s+Scale\s+Step\s+Offset/.test(sheetText),
+        sheetText.split('\n').slice(4, 6).join(' | '));
     } else {
       check('Wiring sheet download present', false, downloads.map(d => d.suggestedFilename()));
     }
@@ -5585,6 +5588,38 @@ async function run() {
     const lbl = await page.evaluate(() => document.getElementById('isfMagicReqCb').parentElement.textContent.trim());
     check('opened anywhere but the catalogue helper, the tickbox still offers the request file',
       lbl === 'Create Magic project', lbl);
+  });
+
+  // ---------------- Step, aligned with the generated MMV project (v0.9.73) ----------------
+  await withPage(browser, async (page) => {
+    // MMV's Step is modifier type 15 (from a Step added by hand). The MMV
+    // project now writes it, so MME's own advice has to agree with it on
+    // three things: stacking order, which controls get one, and the switch case.
+    const advice = (row) => page.evaluate((r) => window._TEST_modifierAdvice(window._TEST_computeModifiers(r)), row);
+    check('an on/off switch is advised Step=1, not "no modifiers needed" beside a Step column of 1',
+      await advice({ name: 'fog', type: 'bool', min: 0, max: 1, minGiven: true, maxGiven: true }) === 'Step=1',
+      await advice({ name: 'fog', type: 'bool', min: 0, max: 1, minGiven: true, maxGiven: true }));
+    check('Step is advised BETWEEN Scale and Offset, so 1..8 lands on 1..8',
+      await advice({ name: 'beams', type: 'long', min: 1, max: 8, minGiven: true, maxGiven: true }) === 'Scale=7, Step=1, then Offset=1',
+      await advice({ name: 'beams', type: 'long', min: 1, max: 8, minGiven: true, maxGiven: true }));
+    check('a continuous range is advised as before',
+      await advice({ name: 'yaw', type: 'float', min: -180, max: 180, minGiven: true, maxGiven: true }) === 'Scale=360, then Offset=-180', null);
+
+    const rows = await page.evaluate(() => window._TEST_buildMappingRows([
+      { NAME: 'mode', TYPE: 'long', VALUES: [0, 1, 2, 3], DEFAULT: 0 },
+      { NAME: 'count', TYPE: 'long', VALUES: [1, 2, 3, 4], DEFAULT: 1 },
+      { NAME: 'cut', TYPE: 'float', VALUES: [0, 1, 2, 3, 4, 5, 6, 7], DEFAULT: 0 },
+    ]));
+    const by = (n) => rows.find(r => r.name === n);
+    check('a 0,1,2... list defines its own range — no longer flagged as assumed',
+      by('mode').minGiven && by('mode').maxGiven && by('mode').max === 3, by('mode'));
+    check('a float carrying a 0..7 list gets 0..7, not the 0..1 a bare float would fall back to',
+      by('cut').max === 7 && by('cut').maxGiven, by('cut'));
+    const countMods = await page.evaluate((r) => window._TEST_computeModifiers(r), by('count'));
+    check('a list of other values (1..4) gets no Step and says why: by value or by position is unchecked',
+      countMods.step === null && /by value or by position/.test(countMods.warning) && countMods.guessedRange, countMods);
+    const modeMods = await page.evaluate((r) => window._TEST_computeModifiers(r), by('mode'));
+    check('...while a 0,1,2... list gets Step 1 and no warning', modeMods.step === 1 && !modeMods.warning, modeMods);
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------
