@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.73
+  MMV MIDI & CC Curve Editor v0.9.74
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -2146,6 +2146,15 @@
   such a list now spans 0..7 instead of falling back to a bare float's 0..1.
 
   Nine new checks.
+
+v0.9.74
+  Building the MMV project in one step was easy to miss. It only works when
+  MME is opened from the ISF Catalogue helper; opened from a file or the web,
+  the Export ISF sheet's tickbox reads "Create Magic project", only writes a
+  request file, and nothing said there was a better way. Now, when MME cannot
+  reach the helper, a line beside that tickbox says to open MME from the ISF
+  Catalogue (whose header gains an Open MME button), and its tooltip explains
+  why.
 
 -->
 
@@ -14616,7 +14625,18 @@
       try{ magicCb.checked=localStorage.getItem(MAGIC_CB_KEY)==='1'; }catch(e){}
       magicCb.addEventListener('change',function(){ try{ localStorage.setItem(MAGIC_CB_KEY,magicCb.checked?'1':'0'); }catch(e){} });
       catalogueHelperCan('mme').then(function(ok){
-        if(!ok) return;
+        if(!ok){
+          // Say so where the tickbox is: without the helper this only writes a
+          // request file, and nothing else on screen hints at the one-step way.
+          const hint=document.createElement('span');
+          hint.id='isfMagicHint';
+          hint.style.cssText='font-size:10.5px;color:#d9a441;max-width:34ch;line-height:1.3;';
+          hint.textContent='For a ready-made MMV project in one step, open MME from the ISF Catalogue (its Open MME button).';
+          hint.title='Opened from a file or the web, MME cannot reach the ISF Catalogue helper, so this tickbox only writes a request file for the catalogue\'s Create project dialog. '
+            +'Start the ISF Catalogue from its Desktop shortcut, click Open MME at the top right (or go to http://127.0.0.1:8770/mme/), and this tickbox becomes Create MMV project.';
+          magicLbl.after(hint);
+          return;
+        }
         magicLbl.lastChild.textContent='Create MMV project';
         magicLbl.style.color='#c8cdd8';
         magicLbl.title='Build the MMV project now, with every wire-ticked control connected and its Scale/Offset set. '

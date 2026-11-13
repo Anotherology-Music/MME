@@ -5588,6 +5588,14 @@ async function run() {
     const lbl = await page.evaluate(() => document.getElementById('isfMagicReqCb').parentElement.textContent.trim());
     check('opened anywhere but the catalogue helper, the tickbox still offers the request file',
       lbl === 'Create Magic project', lbl);
+    // ...and says, beside it, how to get the one-step version (v0.9.74).
+    await page.waitForFunction(() => !!document.getElementById('isfMagicHint'), null, { timeout: 3000 }).catch(() => {});
+    const hint = await page.evaluate(() => {
+      const h = document.getElementById('isfMagicHint');
+      return h ? { text: h.textContent, nextToBox: h.previousElementSibling === document.getElementById('isfMagicReqCb').parentElement } : null;
+    });
+    check('...with a note beside it saying to open MME from the ISF Catalogue for the one-step MMV project',
+      !!hint && /open MME from the ISF Catalogue/.test(hint.text) && hint.nextToBox, hint);
   });
 
   // ---------------- Step, aligned with the generated MMV project (v0.9.73) ----------------
