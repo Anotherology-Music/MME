@@ -143,9 +143,12 @@ inject a `window._TEST_*` bridge.
   anchored outside the owning scope throws `ReferenceError` and takes the
   whole suite down mid-run.
 - **Never locate a table cell by numeric index.** Use the `data-col`
-  attributes (`param|type|min|max|default|effect|import|pb|midiDefault|cc|ch`).
-  Positional lookups have broken twice, both times when a column was added
-  in the middle.
+  attributes. Import dialog: `param|type|min|max|default|effect|import|pb|midiDefault|cc|ch`
+  (`min`/`max` hold an `<input>` for continuous rows — the working range — and
+  text for stepped ones). Export ISF sheet:
+  `param|isfDefault|playhead|range|automated|update|wire|scale|offset|step`.
+  Positional lookups have broken three times, each time when a column was
+  added in the middle.
 - Add tests for the new behaviour *and* run the whole suite — the regressions
   that actually bite are in code you did not touch (a CSS specificity change
   once clipped an unrelated field, and a pre-existing test caught it).

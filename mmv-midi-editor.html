@@ -1,6 +1,6 @@
 <meta charset="utf-8">
 <!--
-  MMV MIDI & CC Curve Editor v0.9.71
+  MMV MIDI & CC Curve Editor v0.9.72
   Standalone editor for notes + CC automation curves.
   Virtualised rendering (unlimited zoom on long songs), Worker scheduler + timestamped Web MIDI.
   Modifiers: Shift=select, Alt=erase, double-click=delete. Ctrl+wheel=X zoom, Alt+wheel=Y zoom (per pane).
@@ -2078,6 +2078,45 @@
   it takes the next number free on that channel rather than importing as CC 0.
 
   Eight new checks.
+
+
+  v0.9.72 Working ranges, and one-step MMV projects from the ISF Catalogue helper.
+
+  WORKING RANGE. A parameter's declared MIN..MAX is often far wider than the
+  movement a piece needs: a laser's yaw declared -180..180 but only ever swept
+  -20..20. Driven across the declared range, all of that movement sits in a
+  flat sliver of the curve, so Scale and Offset were being narrowed by hand in
+  MMV after every import (Scale 40, Offset -20). The import table's Min/Max are
+  now editable for continuous parameters and colour channels, and turn amber
+  once narrowed; the Export ISF sheet has a MIDI Range column so the range can
+  be changed later, with a reset back to the declared one. The range lives on
+  the lane, and everything that maps a MIDI value to a shader value follows
+  it: the MIDI default, the value at the playhead, the default baked back into
+  the shader, Scale/Offset, the wiring sheet and the MMV project. The shader's
+  own MIN/MAX are never touched; the notes written into it say "MIDI range
+  -20 .. 20, shader declares -180 .. 180". Stepped parameters (bool, long,
+  VALUES lists) move through their own values and are not narrowed.
+
+  ONE STEP TO MMV. Opened from the ISF Catalogue helper (http://127.0.0.1:8770/
+  mme/), MME shares its address and can ask it to build the MMV project during
+  Export ISF: the tickbox reads "Create MMV project", and the project is
+  written next to the shader in the project's "MME - ISF" folder, ready for
+  File > Import Project. No request file, no round trip through the catalogue,
+  and no typed shader path — the helper runs on the computer, so it finds the
+  shader MME has just written by looking for <project>/MME - ISF/<shader>
+  under its locations and accepts it only if the contents match what MME sent.
+  An existing project file is replaced only after asking. Opened any other
+  way, MME cannot reach the helper and writes the request file as before.
+
+  The request also names which component of a colour (R/G/B/A) or point2D
+  (X/Y) a row drives. Without it the catalogue refused the whole project the
+  moment one colour channel was wired.
+
+  The Export ISF sheet's cells are now named (data-col), like the import
+  table's. Four older tests found them by position and broke the moment the
+  MIDI Range column was added — the failure CLAUDE.md warns about.
+
+  Fifteen new checks.
 
 -->
 
@@ -13105,8 +13144,12 @@
 
       thr.appendChild(th('Parameter','left','padding-left:14px;'));
       thr.appendChild(th('Type'));
-      thr.appendChild(th('Min','right'));
-      thr.appendChild(th('Max','right'));
+      const thMin=th('Min','right'), thMax=th('Max','right');
+      thMin.title=thMax.title='The range the MIDI curve covers. Starts at the shader\'s own MIN/MAX; '
+        +'narrow it to spend the whole curve on the part of the range you actually use. '
+        +'Scale/Offset follow it, and the shader\'s declared MIN/MAX are left as they are.';
+      thr.appendChild(thMin);
+      thr.appendChild(thMax);
       thr.appendChild(th('Default','right'));
       const thImpact=th('Effect','left','min-width:74px;');
       thImpact.title='How much the picture changes when this parameter moves, measured by rendering the shader. Run "Scan effect" to fill this in.';
@@ -13265,12 +13308,48 @@
         const tdMin=document.createElement('td');
         tdMin.dataset.col='min';
         tdMin.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
-        tdMin.textContent=fmtNum(row.min);
-
         const tdMax=document.createElement('td');
         tdMax.dataset.col='max';
         tdMax.style.cssText='padding:5px 6px;color:#7a8099;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;';
-        tdMax.textContent=fmtNum(row.max);
+        // For a continuous parameter, Min/Max are editable: the range the MIDI
+        // curve will cover. They start at the shader's own MIN/MAX and turn
+        // amber once narrowed, so a changed range is never mistaken for the
+        // declared one. Discrete parameters (bool, long, VALUES lists) are
+        // stepped through their own values and keep plain text.
+        const rangeBoxes=canHaveWorkingRange(row)?[row.min,row.max].map(function(v,ix){
+          const b=document.createElement('input');
+          b.type='number'; b.step='any'; b.value=String(v);
+          b.dataset.range=ix?'max':'min';
+          b.style.cssText='width:58px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:2px 4px;text-align:right;font-variant-numeric:tabular-nums;';
+          return b;
+        }):null;
+        if(rangeBoxes){ tdMin.appendChild(rangeBoxes[0]); tdMax.appendChild(rangeBoxes[1]); }
+        else { tdMin.textContent=fmtNum(row.min); tdMax.textContent=fmtNum(row.max); }
+        // The row as MIDI will see it: declared, or the working range typed here.
+        function effRow(){
+          if(!rangeBoxes) return row;
+          const lo=parseFloat(rangeBoxes[0].value), hi=parseFloat(rangeBoxes[1].value);
+          if(!isFinite(lo)||!isFinite(hi)||lo===hi||(lo===row.min&&hi===row.max)) return row;
+          return Object.assign({},row,{min:lo,max:hi,minGiven:true,maxGiven:true,working:true});
+        }
+        function onRangeEdit(){
+          const e=effRow(), changed=!!e.working;
+          rangeBoxes.forEach(function(b){
+            const lo=parseFloat(rangeBoxes[0].value), hi=parseFloat(rangeBoxes[1].value);
+            const bad=!isFinite(lo)||!isFinite(hi)||lo===hi;
+            b.style.borderColor=bad?'#ff6b6b':(changed?'#ffb454':'#2c313b');
+            b.style.color=changed?'#ffb454':'#c8cdd8';
+            b.title=bad?'A range needs two different numbers.'
+              :('Declared by the shader: '+fmtNum(row.min)+' to '+fmtNum(row.max)+'.'
+                +(changed?' The MIDI curve will cover '+fmtNum(e.min)+' to '+fmtNum(e.max)
+                  +' only, and Scale/Offset follow it.':' Narrow it to give the curve finer control over just the part you use.'));
+            if(!bad&&changed&&(e.min<row.min||e.max>row.max))
+              b.title+=' This goes beyond what the shader declares, and MMV may stop the value at the declared limit.';
+          });
+          defCV=defaultCCVal(e); defPV=defaultPbVal(e);
+          thisRef.defCCVal=defCV; thisRef.defPbVal=defPV;
+          checkConflict();
+        }
 
         const tdDef=document.createElement('td');
         tdDef.dataset.col='default';
@@ -13331,15 +13410,20 @@
         // quantizes by exactly the same path as a file-derived one.
         function applyNativeDefault(v){
           row.defaultVal=v;
-          defCV=defaultCCVal(row); defPV=defaultPbVal(row);
+          const e=effRow();
+          defCV=defaultCCVal(e); defPV=defaultPbVal(e);
           thisRef.defCCVal=defCV; thisRef.defPbVal=defPV;
           tdDef.textContent=fmtNum(v);
           checkConflict();
         }
 
         const thisRef={importCb, pbCb, ccInput, chInput, defCCVal:defCV, defPbVal:defPV, row, setDimmed, checkConflict, tr,
-          impactFill, impactLbl, tdDefCC, impact:null, applyNativeDefault};
+          impactFill, impactLbl, tdDefCC, impact:null, applyNativeDefault, effRow, rangeBoxes};
         rowRefs.push(thisRef);
+        if(rangeBoxes){
+          rangeBoxes.forEach(function(b){ b.addEventListener('change',onRangeEdit); b.addEventListener('input',onRangeEdit); });
+          onRangeEdit();
+        }
       });
 
       tbl.appendChild(tbody);
@@ -13538,6 +13622,8 @@
           const isf={batchId, name:ref.row.name, type:ref.row.type, min:ref.row.min, max:ref.row.max,
             steps:ref.row.steps||0, values:ref.row.values||null,
             isColor:!!ref.row.isColor, colorCh:ref.row.colorCh!=null?ref.row.colorCh:null};
+          const eff=ref.effRow?ref.effRow():ref.row;
+          if(eff.working){ isf.wmin=eff.min; isf.wmax=eff.max; }
           const startVal=isPb?ref.defPbVal:ref.defCCVal;
           const lane={id, type:isPb?'pb':'cc', cc, ch, color, name:ref.row.name, visible:true, tags:[...importTags],
             steps:ref.row.steps||0, points:[{t:0, v:startVal}], _preview:null, isf};
@@ -13863,6 +13949,36 @@
     // normalizes both CC and Pitch Bend to 0-1 before applying Scale/Offset
     // (confirmed in its own guide), so computeModifiers' Scale/Offset math
     // is identical either way — only the raw-value-to-0-1 step differs here.
+    // ── Working range ────────────────────────────────────────────
+    // The part of a parameter's declared MIN..MAX that its MIDI curve covers.
+    // A laser's yaw declared -180..180 but only ever swept -20..20 is better
+    // driven across -20..20: the whole curve then means something, instead of
+    // the useful movement sitting in a flat sliver of it. That is what Scale
+    // and Offset were being set to by hand in MMV (Scale 40, Offset -20); with
+    // a working range MME works them out, and everything that maps a MIDI
+    // value to a shader value — playhead values, baked defaults, the wiring
+    // sheet, the MMV project — uses it.
+    //
+    // Stored on the lane (lane.isf.wmin/wmax), never written into the shader:
+    // its own MIN/MAX stay as the author declared them.
+    function canHaveWorkingRange(row){
+      if(!row) return false;
+      if(row.type==='color') return true;
+      return row.type==='float'&&!(Array.isArray(row.values)&&row.values.length>1);
+    }
+    function laneWorkingRange(lane){
+      const i=lane&&lane.isf;
+      if(!i||typeof i.wmin!=='number'||typeof i.wmax!=='number'||!isFinite(i.wmin)||!isFinite(i.wmax)||i.wmin===i.wmax) return null;
+      return {min:i.wmin,max:i.wmax};
+    }
+    // The row as MIDI actually sees it: declared, or narrowed by the lane.
+    function effectiveRow(row,lane){
+      const w=canHaveWorkingRange(row)?laneWorkingRange(lane):null;
+      if(!w) return row;
+      return Object.assign({},row,{min:w.min,max:w.max,minGiven:true,maxGiven:true,
+        declMin:row.min,declMax:row.max,working:true});
+    }
+
     function midiToNative(row,lane,rawVal){
       const r=laneRange(lane);
       const frac=(clamp(rawVal,r.min,r.max)-r.min)/(r.max-r.min);
@@ -13988,7 +14104,13 @@
           // Spelling out the native range is what makes this readable inside
           // MMV's right-click > Help, months later, with no MME project open:
           // "Scale=6.28" means nothing on its own, "range 0 .. 6.28" explains it.
-          const rng='range '+fmtNum(r.row.min)+' .. '+fmtNum(r.row.max)+(r.mods.guessedRange?' (assumed)':'');
+          // A working range is said as one, so months later nobody reads the
+          // narrowed numbers as the shader's own limits.
+          const rng=(r.row.working
+              ? 'MIDI range '+fmtNum(r.row.min)+' .. '+fmtNum(r.row.max)
+                +', shader declares '+fmtNum(r.row.declMin)+' .. '+fmtNum(r.row.declMax)
+              : 'range '+fmtNum(r.row.min)+' .. '+fmtNum(r.row.max))
+            +(r.mods.guessedRange?' (assumed)':'');
           let line='  '+r.row.name+' ['+rng+']: '+wireFeatureLabel(r)+', '+modifierAdvice(r.mods);
           if(r.mods.warning) line+='  ['+r.mods.warning+']';
           lines.push(line);
@@ -14069,9 +14191,58 @@
     // place; two implementations of it would eventually disagree, and the one
     // that mattered would be whichever the user was not looking at.
     const MAGIC_REQ_SUFFIX='.magic-request.json';
+
+    // ── Served by the ISF Catalogue helper ──────────────────────────
+    // When MME is opened from the helper (http://127.0.0.1:8770/mme/) it shares
+    // the helper's address, so it can ask for the MMV project to be built on
+    // the spot — no request file, no catalogue round trip, and no typed shader
+    // path, because the helper runs on the computer and finds the shader MME
+    // has just written by itself. Opened from a file or from the web it cannot
+    // reach the helper, and Create Magic project writes the request file as
+    // before.
+    let catalogueCaps=null;     // null: not asked yet
+    async function catalogueHelperCan(cap){
+      if(catalogueCaps===null){
+        catalogueCaps=[];
+        const local=location.protocol==='http:'&&/^(127\.0\.0\.1|localhost)$/.test(location.hostname);
+        if(local){
+          try{
+            const ctl=new AbortController(), t=setTimeout(function(){ ctl.abort(); },1500);
+            const r=await fetch('/api/ping',{cache:'no-store',signal:ctl.signal});
+            clearTimeout(t);
+            const j=await r.json();
+            if(j&&Array.isArray(j.caps)) catalogueCaps=j.caps;
+          }catch(e){ /* not served by the helper */ }
+        }
+      }
+      return catalogueCaps.indexOf(cap)>=0;
+    }
+    async function postCatalogue(path,body){
+      try{
+        const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        return await r.json();
+      }catch(e){ return {error:'the ISF Catalogue helper did not answer ('+e.message+') — is its window still open?'}; }
+    }
+    function mmeProjectPayload(entry,wireRefs,shaderText,wroteInPlace){
+      const req=JSON.parse(buildMagicRequest(entry,wireRefs));
+      return {
+        shader_name:entry.filename,
+        shader_text:shaderText,
+        // By name only — a browser never learns a folder's real path. The
+        // helper finds <project>/MME - ISF/<shader> and checks its contents.
+        project_folder:(wroteInPlace&&projDirHandle)?projDirHandle.name:null,
+        root_folder:(wroteInPlace&&projDirRoot)?projDirRoot.name:null,
+        project_name:req.project_name,
+        source_name:(state.projectName||'').trim()||null,
+        device:req.source.device,
+        channel:req.source.channel,
+        assignments:req.assignments,
+      };
+    }
     // MMV's own MIDI feature names. Note "Pitch Bend" is the bipolar one —
     // 16,384 steps centred on zero rather than 0..127 rising from it — so its
     // modifier maths is NOT the CC formula and the catalogue handles it apart.
+    const MAGIC_CB_KEY='mmv-create-magic';
     function magicSourceType(lane){
       if(laneIsPb(lane)) return {type:'Pitch Bend', numbered:false};
       if(laneIsCp(lane)) return {type:'Channel Pressure', numbered:false};
@@ -14103,6 +14274,13 @@
           // second implementation to keep in step.
           const a={input:r.row.srcName||r.row.name, type:k.type, channel:(r.lane.ch+1)};
           if(k.numbered) a.number=r.lane.cc;
+          // A colour is four controls in MMV and a point2D two; say which one.
+          const comp=r.row.isColor?r.row.colorCh:(r.row.isPoint2D?r.row.pointAxis:null);
+          if(comp!=null) a.component=comp;
+          // The range is sent only when MME knows something the shader file
+          // alone does not: a working range, or one axis of a per-axis range.
+          // Otherwise the catalogue reads MIN/MAX from the shader itself.
+          if(r.row.working||(r.row.isPoint2D&&r.row.minGiven&&r.row.maxGiven)){ a.min=r.row.min; a.max=r.row.max; }
           return a;
         }),
       };
@@ -14144,14 +14322,23 @@
       if(!rows){ flash('Could not re-parse the retained ISF source for '+entry.filename+'.'); return; }
 
       const refs=[];
+      // Everything MIDI-shaped in a ref is worked out from the EFFECTIVE row:
+      // the declared range, or the lane's working range when it has one. The
+      // declared row is kept beside it, because the exported shader's own
+      // MIN/MAX must stay exactly as declared (see buildUpdatedHeader, which
+      // works from `rows`, never from these).
+      function deriveRef(ref){
+        const r=laneRange(ref.lane);
+        ref.row=effectiveRow(ref.declRow,ref.lane);
+        const rawAtPlayhead=Math.round(clamp(laneValueAt(ref.lane,state.playhead),r.min,r.max));
+        ref.playheadNative=midiToNative(ref.row,ref.lane,rawAtPlayhead);
+        ref.mods=computeModifiers(ref.row);
+        return ref;
+      }
       rows.forEach(function(row){
         const lane=findRowLane(entry.id,row);
         if(!lane) return; // param wasn't imported, or its lane was later deleted — nothing to migrate
-        const r=laneRange(lane);
-        const rawAtPlayhead=Math.round(clamp(laneValueAt(lane,state.playhead),r.min,r.max));
-        const playheadNative=midiToNative(row,lane,rawAtPlayhead);
-        refs.push({row:row, lane:lane, automated:isLaneAutomated(lane),
-          playheadNative:playheadNative, mods:computeModifiers(row)});
+        refs.push(deriveRef({declRow:row, lane:lane, automated:isLaneAutomated(lane)}));
       });
       if(!refs.length){ flash('No lanes from this import remain — nothing to migrate.'); return; }
 
@@ -14201,6 +14388,11 @@
       thr.appendChild(th('Parameter','left','padding-left:14px;'));
       thr.appendChild(th('ISF Default','right'));
       thr.appendChild(th('Value @ Playhead','right'));
+      const thRange=th('MIDI Range','center');
+      thRange.title='The part of the parameter\'s range the MIDI curve covers. Narrow it to spend the whole curve on '
+        +'the movement you actually use; Scale/Offset, the playhead value and the MMV project all follow it. '
+        +'The shader\'s own MIN/MAX are not changed.';
+      thr.appendChild(thRange);
       thr.appendChild(th('Automated?','center'));
       thr.appendChild(thEl(hdrUpdate.wrap));
       thr.appendChild(thEl(hdrWire.wrap));
@@ -14263,7 +14455,64 @@
         tdStep.textContent=ref.mods.step==null?'—':fmtNum(ref.mods.step);
         if(ref.mods.warning) tdStep.title=ref.mods.warning;
 
-        tr.appendChild(tdName); tr.appendChild(tdDef); tr.appendChild(tdPh); tr.appendChild(tdAuto);
+        // MIDI Range: editable for continuous parameters. Changing it is an
+        // edit to the project (undoable), and redraws the numbers it drives.
+        const tdRange=document.createElement('td');
+        tdRange.dataset.col='range';
+        tdRange.style.cssText='padding:5px 6px;text-align:center;white-space:nowrap;';
+        if(canHaveWorkingRange(ref.declRow)){
+          const mk=function(v,which){
+            const b=document.createElement('input');
+            b.type='number'; b.step='any'; b.value=String(v); b.dataset.range=which;
+            b.style.cssText='width:58px;background:#0d0f14;color:#c8cdd8;border:1px solid #2c313b;border-radius:3px;padding:2px 4px;text-align:right;font-variant-numeric:tabular-nums;';
+            return b;
+          };
+          const lo=mk(ref.row.min,'min'), hi=mk(ref.row.max,'max');
+          const reset=document.createElement('button');
+          reset.textContent='\u21BA'; reset.dataset.range='reset';
+          reset.title='Back to the shader\'s declared range ('+fmtNum(ref.declRow.min)+' to '+fmtNum(ref.declRow.max)+')';
+          reset.style.cssText='background:none;border:none;color:#7a8099;cursor:pointer;font-size:12px;padding:0 2px;';
+          const paint=function(){
+            const on=!!ref.row.working;
+            [lo,hi].forEach(function(b){ b.style.borderColor=on?'#ffb454':'#2c313b'; b.style.color=on?'#ffb454':'#c8cdd8';
+              b.title='Declared by the shader: '+fmtNum(ref.declRow.min)+' to '+fmtNum(ref.declRow.max)+'.'; });
+            reset.style.visibility=on?'visible':'hidden';
+          };
+          const apply=function(newLo,newHi){
+            if(!isFinite(newLo)||!isFinite(newHi)||newLo===newHi){
+              lo.style.borderColor=hi.style.borderColor='#ff6b6b';
+              return;
+            }
+            pushUndo();
+            if(newLo===ref.declRow.min&&newHi===ref.declRow.max){ delete ref.lane.isf.wmin; delete ref.lane.isf.wmax; }
+            else { ref.lane.isf.wmin=newLo; ref.lane.isf.wmax=newHi; }
+            deriveRef(ref);
+            lo.value=String(ref.row.min); hi.value=String(ref.row.max);
+            tdPh.textContent=fmtNum(ref.playheadNative);
+            tdScale.textContent=fmtNum(ref.mods.scale);
+            tdOffset.textContent=fmtNum(ref.mods.offset);
+            paint();
+          };
+          lo.addEventListener('change',function(){ apply(parseFloat(lo.value),parseFloat(hi.value)); });
+          hi.addEventListener('change',function(){ apply(parseFloat(lo.value),parseFloat(hi.value)); });
+          reset.addEventListener('click',function(){ apply(ref.declRow.min,ref.declRow.max); });
+          tdRange.appendChild(lo);
+          tdRange.appendChild(document.createTextNode(' \u2013 '));
+          tdRange.appendChild(hi);
+          tdRange.appendChild(reset);
+          paint();
+        } else {
+          tdRange.style.color='#5a6075';
+          tdRange.textContent=fmtNum(ref.declRow.min)+' \u2013 '+fmtNum(ref.declRow.max);
+          tdRange.title='A stepped parameter moves through its own values, so its range is not narrowed here.';
+        }
+
+        // Named cells, so nothing has to find them by position — a column added
+        // in the middle (as MIDI Range was) would otherwise shift every index.
+        tdName.dataset.col='param'; tdDef.dataset.col='isfDefault'; tdPh.dataset.col='playhead';
+        tdAuto.dataset.col='automated'; tdUpdate.dataset.col='update'; tdWire.dataset.col='wire';
+        tdScale.dataset.col='scale'; tdOffset.dataset.col='offset'; tdStep.dataset.col='step';
+        tr.appendChild(tdName); tr.appendChild(tdDef); tr.appendChild(tdPh); tr.appendChild(tdRange); tr.appendChild(tdAuto);
         tr.appendChild(tdUpdate); tr.appendChild(tdWire);
         tr.appendChild(tdScale); tr.appendChild(tdOffset); tr.appendChild(tdStep);
         tbody.appendChild(tr);
@@ -14322,6 +14571,16 @@
       magicLbl.appendChild(document.createTextNode('Create Magic project'));
       magicLbl.title='Also write a request file the ISF Catalogue turns into a .magic project, with every wired parameter already connected. '
         +'Import that project into your live MMV project — a .magic file cannot safely be edited while MMV has it open, because MMV rewrites the whole project from memory on its next save and would discard the edit.';
+      try{ magicCb.checked=localStorage.getItem(MAGIC_CB_KEY)==='1'; }catch(e){}
+      magicCb.addEventListener('change',function(){ try{ localStorage.setItem(MAGIC_CB_KEY,magicCb.checked?'1':'0'); }catch(e){} });
+      catalogueHelperCan('mme').then(function(ok){
+        if(!ok) return;
+        magicLbl.lastChild.textContent='Create MMV project';
+        magicLbl.style.color='#c8cdd8';
+        magicLbl.title='Build the MMV project now, with every wire-ticked control connected and its Scale/Offset set. '
+          +'It is written next to the shader in this project\'s "MME - ISF" folder; in MMV, use File \u25B8 Import Project. '
+          +'(Available because MME is open from the ISF Catalogue helper.)';
+      });
 
       const closeBtn=document.createElement('button');
       closeBtn.textContent='Cancel';
@@ -14368,7 +14627,26 @@
         // same route: into the projects folder when there is one, otherwise a
         // download for the user to file themselves.
         let magicNote='';
-        if(magicCb.checked){
+        if(magicCb.checked&&wireRefs.length&&await catalogueHelperCan('mme')){
+          const payload=mmeProjectPayload(entry,wireRefs,newSource,wroteInPlace);
+          let res=await postCatalogue('/api/mme/project',payload);
+          if(res&&res.needs_overwrite){
+            if(confirm(res.error+'.\n\nReplace it with a newly built one? Anything already imported into MMV from it is unaffected.')){
+              payload.overwrite=true;
+              res=await postCatalogue('/api/mme/project',payload);
+            } else res={skipped:true};
+          }
+          if(res&&res.ok){
+            const out=String(res.out||'').split(/[\\/]/).pop();
+            magicNote=' + MMV project "'+out+'" — in MMV, File \u25B8 Import Project';
+            try{ localStorage.setItem(MAGIC_CB_KEY,'1'); }catch(e){}
+          } else if(res&&res.skipped){
+            magicNote=' — the existing MMV project was left as it was';
+          } else {
+            magicNote=' — MMV project NOT created: '+((res&&(res.error||(res.problems||[]).join('; ')))||'no answer')
+              +(res&&res.hint?' ('+res.hint+')':'');
+          }
+        } else if(magicCb.checked){
           if(!wireRefs.length){
             magicNote=' — no Magic project written, nothing was wire-ticked';
           } else {

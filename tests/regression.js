@@ -3165,7 +3165,8 @@ async function run() {
     await page.waitForTimeout(150);
     const rowsInfo = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => {
       const tds = tr.querySelectorAll('td');
-      return { name: tds[0].textContent, automated: tds[3].textContent.trim(), updateChecked: tds[4].querySelector('input').checked, wireChecked: tds[5].querySelector('input').checked };
+      const c = (k) => tr.querySelector('td[data-col="' + k + '"]');
+      return { name: c('param').textContent, automated: c('automated').textContent.trim(), updateChecked: c('update').querySelector('input').checked, wireChecked: c('wire').querySelector('input').checked };
     }));
     const girdleRow = rowsInfo.find(r => r.name === 'GirdleRadius');
     const cutRow = rowsInfo.find(r => r.name === 'CutType');
@@ -3331,8 +3332,7 @@ async function run() {
     const readState = () => page.evaluate(() => {
       const dlg = document.querySelector('#isfMigrateDialog');
       const rows = Array.from(dlg.querySelectorAll('tbody tr')).map(tr => {
-        const tds = tr.querySelectorAll('td');
-        return { update: tds[4].querySelector('input').checked, wire: tds[5].querySelector('input').checked };
+        return { update: tr.querySelector('td[data-col="update"] input').checked, wire: tr.querySelector('td[data-col="wire"] input').checked };
       });
       const heads = dlg.querySelectorAll('thead input[type=checkbox]');
       return { rows, hdrUpdate: heads[0].checked, hdrWire: heads[1].checked };
@@ -3356,7 +3356,7 @@ async function run() {
     check('Re-ticking the Default master restores every row to its prior (ticked) state', afterRetick.rows.every(r => r.update === true), afterRetick.rows);
 
     // Hand-untick just one row's Default, then use the master to untick+restore
-    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog tbody tr')[0].querySelectorAll('td')[4].querySelector('input').click(); });
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog tbody tr')[0].querySelector('td[data-col="update"] input').click(); });
     await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[0].click(); }); // untick all
     await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog thead input[type=checkbox]')[0].click(); }); // restore
     const restored = await readState();
@@ -3396,7 +3396,9 @@ async function run() {
 
     const rows = await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog tbody tr')).map(tr => {
       const tds = tr.querySelectorAll('td');
-      return { name: tds[0].textContent, min: tds[2].textContent, max: tds[3].textContent, def: tds[4].textContent };
+      // Min/Max are input boxes for continuous rows (the working range), text otherwise.
+      const val = (k) => { const td = tr.querySelector('td[data-col="' + k + '"]'); const i = td.querySelector('input'); return i ? i.value : td.textContent; };
+      return { name: val('param'), min: val('min'), max: val('max'), def: val('default') };
     }));
     const aspectX = rows.find(r => r.name === 'AspectXZ X');
     const rangeX = rows.find(r => r.name === 'RangePoint X');
@@ -3480,7 +3482,7 @@ async function run() {
     const entry = await page.evaluate(() => { const h = window._TEST_state.isfHistory; return h[h.length - 1]; });
     await page.evaluate((e) => window._TEST_openMigrateSheet(e), entry);
     await page.waitForTimeout(150);
-    const migRows = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => tr.querySelectorAll('td')[0].textContent));
+    const migRows = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => tr.querySelector('td[data-col="param"]').textContent));
     check('Migrate sheet also lists the previously-missing point2D-derived rows', ['AspectXZ X', 'AspectXZ Y', 'GemScreenOffset X', 'GemScreenOffset Y'].every(n => migRows.includes(n)), migRows);
 
     const downloads = [];
@@ -3613,7 +3615,8 @@ async function run() {
 
     const rowsInfo = await page.evaluate(() => Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).map(tr => {
       const tds = tr.querySelectorAll('td');
-      return { name: tds[0].textContent, hasPbTag: !!tds[0].querySelector('span'), automated: tds[3].textContent.trim(), playheadVal: tds[2].textContent };
+      const c = (k) => tr.querySelector('td[data-col="' + k + '"]');
+      return { name: c('param').textContent, hasPbTag: !!c('param').querySelector('span'), automated: c('automated').textContent.trim(), playheadVal: c('playhead').textContent };
     }));
     const rotRow = rowsInfo.find(r => r.name.startsWith('RotManualZ'));
     check('Migrate sheet tags a PB-linked row with a "PB" badge next to its name', rotRow && rotRow.hasPbTag === true, rotRow);
@@ -3623,8 +3626,8 @@ async function run() {
     check('Migrate sheet computes the PB lane\'s playhead value through the real -8192..8191 range', rotRow && rotRow.playheadVal === '0', rotRow);
 
     await page.evaluate((id) => { window._TEST_state.ccLanes.find(l => l.id === id).points = [{ t: 0, v: -8192 }, { t: 10000, v: -8000 }]; }, rotId);
-    // tick RotManualZ's Wiring Sheet checkbox (row 0, column index 5)
-    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog tbody tr')[0].querySelectorAll('td')[5].querySelector('input').checked = true; });
+    // tick RotManualZ's Wiring Sheet checkbox (row 0)
+    await page.evaluate(() => { document.querySelectorAll('#isfMigrateDialog tbody tr')[0].querySelector('td[data-col="wire"] input').checked = true; });
 
     const downloads = [];
     page.on('download', (d) => downloads.push(d));
@@ -5450,6 +5453,138 @@ async function run() {
       yaw && yaw.type === 'pb' && yaw.cc === null, lanes);
     check('...and the CC rows import with distinct numbers',
       new Set(lanes.filter(l => l.type === 'cc').map(l => l.cc)).size === 3, lanes);
+  });
+
+  // ---------------- Working range (v0.9.72) ----------------
+  await withPage(browser, async (page) => {
+    // A laser's yaw is declared -180..180 but only ever swept -20..20. Driving
+    // it across the full declared range squeezes the whole movement into a
+    // flat sliver of the curve, so Scale/Offset were being narrowed by hand in
+    // MMV. A working range on the lane does that, and everything that maps a
+    // MIDI value to a shader value follows it.
+    const header = { INPUTS: [
+      { NAME: 'yaw', TYPE: 'float', MIN: -180, MAX: 180, DEFAULT: 0 },
+      { NAME: 'tilt', TYPE: 'float', MIN: -90, MAX: 90, DEFAULT: 0 },
+      { NAME: 'mode', TYPE: 'long', VALUES: [0, 1, 2], LABELS: ['a', 'b', 'c'], DEFAULT: 0 },
+      { NAME: 'tint', TYPE: 'color', DEFAULT: [1, 0.5, 0, 1] },
+      { NAME: 'pos', TYPE: 'point2D', MIN: [-2, 0], MAX: [2, 10], DEFAULT: [0, 5] },
+    ] };
+    const src = '/*\n' + JSON.stringify(header) + '\n*/\nvoid main(){gl_FragColor=vec4(1.0);}\n';
+    await page.evaluate(({ h, src }) => window._TEST_showISFDialog(h, 'laser.fs', src), { h: header, src });
+    await page.waitForTimeout(100);
+    const row = (name) => `Array.from(document.querySelectorAll('#isfDialog tbody tr')).find(tr => tr.querySelector('td[data-col="param"]').textContent === '${name}')`;
+
+    const editable = await page.evaluate(new Function(`return {
+      yaw: !!${row('yaw')}.querySelector('td[data-col="min"] input'),
+      mode: !!${row('mode')}.querySelector('td[data-col="min"] input'),
+      tintR: !!${row('tint.R')}.querySelector('td[data-col="min"] input') };`));
+    check('Min/Max are editable for continuous parameters and colour channels, not for stepped ones',
+      editable.yaw && editable.tintR && !editable.mode, editable);
+
+    const r = await page.evaluate(new Function(`
+      const tr = ${row('yaw')};
+      tr.querySelector('td[data-col="import"] input').click();
+      tr.querySelector('td[data-col="pb"] input').click();
+      const lo = tr.querySelector('td[data-col="min"] input'), hi = tr.querySelector('td[data-col="max"] input');
+      lo.value = '-20'; lo.dispatchEvent(new Event('change'));
+      hi.value = '20'; hi.dispatchEvent(new Event('change'));
+      const t = ${row('tilt')};
+      t.querySelector('td[data-col="import"] input').click();
+      const tlo = t.querySelector('td[data-col="min"] input'), thi = t.querySelector('td[data-col="max"] input');
+      tlo.value = '10'; tlo.dispatchEvent(new Event('change'));
+      thi.value = '60'; thi.dispatchEvent(new Event('change'));
+      ${row('pos X')}.querySelector('td[data-col="import"] input').click();
+      ${row('tint.G')}.querySelector('td[data-col="import"] input').click();
+      return { amber: lo.style.color, tiltDefault: t.querySelector('td[data-col="midiDefault"]').textContent };`));
+    check('a narrowed range is shown amber, so it is never mistaken for the declared one',
+      r.amber === 'rgb(255, 180, 84)', r);
+    check('...and the MIDI default follows it: a default below the working range starts at the bottom',
+      r.tiltDefault === '0', r);
+
+    const n0 = await page.evaluate(() => window._TEST_state.ccLanes.length);
+    await page.evaluate(() => Array.from(document.querySelectorAll('#isfDialog button')).find(b => /^Import Lanes/.test(b.textContent.trim())).click());
+    await page.waitForTimeout(150);
+    const lanes = await page.evaluate((n0) => window._TEST_state.ccLanes.slice(n0).map(l =>
+      ({ name: l.name, type: l.type, isf: l.isf, start: l.points[0].v })), n0);
+    const yaw = lanes.find(l => l.name === 'yaw'), tilt = lanes.find(l => l.name === 'tilt'), posX = lanes.find(l => l.name === 'pos X');
+    check('the working range is kept on the lane, beside the declared range it narrows',
+      yaw.isf.wmin === -20 && yaw.isf.wmax === 20 && yaw.isf.min === -180 && yaw.isf.max === 180, yaw.isf);
+    check('...a lane left at the declared range carries no working range at all',
+      posX.isf.wmin === undefined && posX.isf.wmax === undefined, posX.isf);
+    check('the yaw default of 0 sits mid-range in -20..20, so its Pitch Bend lane starts at centre',
+      yaw.start === 0, yaw);
+
+    // ---- The Export ISF sheet ----
+    const entryId = await page.evaluate(() => window._TEST_state.isfHistory.slice(-1)[0].id);
+    await page.evaluate((id) => window._TEST_openMigrateSheetById(id), entryId);
+    await page.waitForTimeout(150);
+    const sheetRow = (name) => `Array.from(document.querySelectorAll('#isfMigrateDialog tbody tr')).find(tr => tr.querySelector('td[data-col="param"]').firstChild.textContent === '${name}')`;
+    const mods = (name) => page.evaluate(new Function(`const tr = ${sheetRow(name)};
+      return { scale: tr.querySelector('td[data-col="scale"]').textContent, offset: tr.querySelector('td[data-col="offset"]').textContent };`));
+    const yawMods = await mods('yaw');
+    check('the sheet computes Scale/Offset from the working range — exactly what was being set by hand (40 / -20)',
+      yawMods.scale === '40' && yawMods.offset === '-20', yawMods);
+    const tiltMods = await mods('tilt');
+    check('...and for a working range that does not start at zero (10..60 -> 50 / 10)',
+      tiltMods.scale === '50' && tiltMods.offset === '10', tiltMods);
+
+    // Narrow pos X after import, in the sheet.
+    await page.evaluate(new Function(`const [lo, hi] = ${sheetRow('pos X')}.querySelectorAll('td[data-col="range"] input');
+      lo.value = '-1'; lo.dispatchEvent(new Event('change')); hi.value = '1'; hi.dispatchEvent(new Event('change'));`));
+    const posMods = await mods('pos X');
+    const posLane = await page.evaluate(() => window._TEST_state.ccLanes.find(l => l.name === 'pos X').isf);
+    check('the range can be changed after import, from the sheet, and Scale/Offset update with it',
+      posMods.scale === '2' && posMods.offset === '-1' && posLane.wmin === -1 && posLane.wmax === 1, { posMods, posLane });
+    // Each box is its own edit, as with any other field: undo steps back one
+    // box at a time, to -1..2 (declared max still in place), then to declared.
+    const isfOf = () => page.evaluate(() => { const i = window._TEST_state.ccLanes.find(l => l.name === 'pos X').isf; return { wmin: i.wmin, wmax: i.wmax }; });
+    await page.evaluate(() => window._TEST_undo());
+    const undo1 = await isfOf();
+    await page.evaluate(() => window._TEST_undo());
+    const undo2 = await isfOf();
+    check('...which is a project edit, so it undoes, one box at a time',
+      undo1.wmin === -1 && undo1.wmax === 2 && undo2.wmin === undefined && undo2.wmax === undefined, { undo1, undo2 });
+    await page.evaluate(() => { window._TEST_redo(); window._TEST_redo(); });
+    const stepped = await page.evaluate(new Function(`return !${sheetRow('yaw')}.querySelector('td[data-col="range"] input') ? 'no' : 'yes';`));
+    check('a continuous row offers the range boxes in the sheet', stepped === 'yes', stepped);
+
+    // The request: the range only when MME knows something the shader does not.
+    const req = await page.evaluate((id) => {
+      const entry = window._TEST_state.isfHistory.find(e => e.id === id);
+      const lanes = window._TEST_state.ccLanes.filter(l => l.isf && l.isf.batchId === id);
+      const rows = window._TEST_buildMappingRows(JSON.parse(entry.source.match(/\/\*\s*([\s\S]*?)\s*\*\//)[1]).INPUTS);
+      const refs = lanes.map(l => {
+        const declRow = rows.find(r => r.name === l.isf.name);
+        const eff = (l.isf.wmin !== undefined) ? Object.assign({}, declRow, { min: l.isf.wmin, max: l.isf.wmax, working: true,
+          declMin: declRow.min, declMax: declRow.max, minGiven: true, maxGiven: true }) : declRow;
+        return { row: eff, lane: l };
+      });
+      return JSON.parse(window._TEST_buildMagicRequest(entry, refs));
+    }, entryId);
+    const yawA = req.assignments.find(a => a.input === 'yaw');
+    const tintA = req.assignments.find(a => a.input === 'tint');
+    const posA = req.assignments.find(a => a.input === 'pos');
+    check('the MMV request carries the working range for a narrowed row',
+      yawA.min === -20 && yawA.max === 20, yawA);
+    check('...names which component of a colour it drives, and leaves its range to the shader',
+      tintA.component === 1 && tintA.min === undefined, tintA);
+    check('...and sends one axis of a point2D as its own component with that axis\'s range',
+      posA.component === 0 && posA.min === -1 && posA.max === 1, posA);
+
+    const notes = await page.evaluate((id) => {
+      const entry = window._TEST_state.isfHistory.find(e => e.id === id);
+      const lane = window._TEST_state.ccLanes.find(l => l.name === 'yaw');
+      const declRow = { name: 'yaw', srcName: 'yaw', type: 'float', min: -180, max: 180, minGiven: true, maxGiven: true, defaultVal: 0 };
+      const row = Object.assign({}, declRow, { min: -20, max: 20, working: true, declMin: -180, declMax: 180 });
+      return window._TEST_buildMigrationNotesText(entry, [], [{ row, lane, mods: window._TEST_computeModifiers(row) }]);
+    }, entryId);
+    check('the notes written into the shader call it a MIDI range and still name the declared one',
+      /MIDI range -20 \.\. 20, shader declares -180 \.\. 180/.test(notes), notes.split('\n').find(l => /yaw/.test(l)));
+
+    // Not served by the catalogue helper here, so the tickbox keeps its old meaning.
+    const lbl = await page.evaluate(() => document.getElementById('isfMagicReqCb').parentElement.textContent.trim());
+    check('opened anywhere but the catalogue helper, the tickbox still offers the request file',
+      lbl === 'Create Magic project', lbl);
   });
 
   // ---------------- "Saving to" line (v0.9.63) ----------------
